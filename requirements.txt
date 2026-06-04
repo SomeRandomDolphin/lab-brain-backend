@@ -1,0 +1,23 @@
+# Streaming ASR
+# Install with: pip install -r requirements.txt
+# Works on Windows, macOS, and Linux — no system-level audio library needed.
+
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+websockets>=12.0
+faster-whisper>=1.0.0
+numpy>=1.26.0
+
+# NOTE: pyaudio is NOT required for this PoC.
+# Mic capture happens entirely in the browser via the Web Audio API.
+# The server only receives raw PCM over WebSocket — no OS audio driver needed.
+
+# If you later want server-side mic capture (e.g. for a CLI recording tool),
+# use sounddevice instead of pyaudio — it works on Windows without extra setup:
+#   pip install sounddevice
+# sounddevice bundles its own PortAudio binary on Windows/macOS via the wheel,
+# so no separate apt/brew/choco install is required.
+
+# Month 2 additions (not needed yet):
+# pyannote.audio>=3.3   # speaker diarization
+# whisperx              # word-level timestamps (builds on faster-whisper)

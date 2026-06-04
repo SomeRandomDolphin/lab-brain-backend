@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lab Brain — Streaming ASR PoC</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Syne:wght@400;700;800&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #0a0c0f;
+    --surface: #111418;
+    --surface2: #181d23;
+    --border: #1f2730;
+    --accent: #00e5a0;
+    --accent-dim: #00e5a018;
+    --accent-glow: #00e5a040;
+    --warn: #ff6b35;
+    --text: #e2e8f0;
+    --text-muted: #4a5568;
+    --text-dim: #718096;
+    --speaker-a: #00e5a0;
+    --speaker-b: #7c6af7;
+    --font-mono: 'JetBrains Mono', monospace;
+    --font-display: 'Syne', sans-serif;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-mono);
+    min-height: 100vh;
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    grid-template-columns: 1fr 320px;
+    grid-template-areas:
+      "header header"
+      "transcript sidebar"
+      "controls controls";
+    gap: 0;
+  }
+
+  /* ── Header ── */
+  header {
+    grid-area: header;
+    border-bottom: 1px solid var(--border);
+    padding: 16px 28px;
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    background: var(--surface);
+  }
+
+  .logo {
+    font-family: var(--font-display);
+    font-weight: 800;
+    font-size: 18px;
+    letter-spacing: -0.5px;
+    color: var(--accent);
+  }
+
+  .logo span { color: var(--text-dim); font-weight: 400; }
+
+  .badge {
+    font-size: 10px;
+    padding: 3px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-dim);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .badge.live {
+    border-color: var(--accent);
+    color: var(--accent);
+    position: relative;
+  }
+
+  .badge.live::before {
+    content: '';
+    width: 6px; height: 6px;
+    background: var(--accent);
+    border-radius: 50%;
+    display: inline-block;
+    margin-right: 5px;
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.4; transform: scale(0.7); }
+  }
+
+  .session-id {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .session-id strong { color: var(--text-dim); }
+
+  /* ── Transcript area ── */
+  #transcript-panel {
+    grid-area: transcript;
+    padding: 28px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    max-height: calc(100vh - 130px);
+  }
+
+  .empty-state {
+    margin: auto;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 13px;
+    line-height: 2;
+  }
+
+  .empty-state .big {
+    font-family: var(--font-display);
+    font-size: 36px;
+    font-weight: 800;
+    color: var(--border);
+    display: block;
+    margin-bottom: 8px;
+  }
+
+  .segment {
+    display: grid;
+    grid-template-columns: 90px 1fr;
+    gap: 0 16px;
+    padding: 14px 0;
+    border-bottom: 1px solid var(--border);
+    animation: fadein 0.3s ease;
+  }
+
+  @keyframes fadein {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  .seg-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding-top: 2px;
+  }
+
+  .speaker-tag {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--speaker-a);
+    font-family: var(--font-display);
+  }
+
+  .speaker-tag.b { color: var(--speaker-b); }
+
+  .seg-time {
+    font-size: 10px;
+    color: var(--text-muted);
+  }
+
+  .seg-lang {
+    font-size: 10px;
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 1px 5px;
+    width: fit-content;
+  }
+
+  .seg-text {
+    font-size: 15px;
+    line-height: 1.7;
+    color: var(--text);
+    padding-top: 1px;
+  }
+
+  .seg-latency {
+    font-size: 10px;
+    color: var(--text-muted);
+    margin-top: 4px;
+  }
+
+  /* interim / streaming text */
+  .interim-line {
+    padding: 14px 0;
+    border-bottom: 1px solid var(--border);
+    display: grid;
+    grid-template-columns: 90px 1fr;
+    gap: 0 16px;
+    opacity: 0.5;
+  }
+
+  .interim-text {
+    font-size: 15px;
+    line-height: 1.7;
+    color: var(--accent);
+    padding-top: 1px;
+  }
+
+  .interim-text::after {
+    content: '▋';
+    animation: blink 0.8s step-end infinite;
+  }
+
+  @keyframes blink {
+    50% { opacity: 0; }
+  }
+
+  /* ── Sidebar ── */
+  #sidebar {
+    grid-area: sidebar;
+    border-left: 1px solid var(--border);
+    background: var(--surface);
+    padding: 20px;
+    overflow-y: auto;
+    max-height: calc(100vh - 130px);
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  .panel-title {
+    font-family: var(--font-display);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 10px;
+  }
+
+  /* Stats grid */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+
+  .stat-card {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+  }
+
+  .stat-label { font-size: 10px; color: var(--text-muted); margin-bottom: 4px; }
+  .stat-value { font-size: 20px; font-weight: 600; color: var(--accent); font-family: var(--font-display); }
+  .stat-unit  { font-size: 10px; color: var(--text-muted); }
+
+  /* Waveform viz */
+  #waveform {
+    width: 100%;
+    height: 56px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface2);
+  }
+
+  /* LKC entries */
+  .lkc-entry {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-size: 11px;
+    color: var(--text-dim);
+    animation: fadein 0.3s ease;
+  }
+
+  .lkc-entry .lkc-text { color: var(--text); font-size: 12px; margin-top: 4px; }
+  .lkc-entry .lkc-ts   { font-size: 10px; color: var(--text-muted); margin-top: 3px; }
+
+  #lkc-entries { display: flex; flex-direction: column; gap: 6px; max-height: 240px; overflow-y: auto; }
+
+  /* ── Controls ── */
+  #controls {
+    grid-area: controls;
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+    padding: 16px 28px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+
+  #status-text {
+    font-size: 12px;
+    color: var(--text-muted);
+    flex: 1;
+  }
+
+  #status-text strong { color: var(--text-dim); }
+
+  .btn {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 600;
+    padding: 10px 24px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    cursor: pointer;
+    transition: all 0.15s;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .btn-primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #000;
+  }
+
+  .btn-primary:hover { background: #00ffb0; box-shadow: 0 0 20px var(--accent-glow); }
+
+  .btn-stop {
+    background: transparent;
+    border-color: var(--warn);
+    color: var(--warn);
+  }
+
+  .btn-stop:hover { background: #ff6b3510; }
+
+  .btn-secondary {
+    background: transparent;
+    color: var(--text-dim);
+  }
+
+  .btn-secondary:hover { background: var(--surface2); color: var(--text); }
+
+  .btn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+  /* VU meter */
+  #vu-bar {
+    height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    width: 120px;
+    overflow: hidden;
+  }
+
+  #vu-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--accent);
+    border-radius: 2px;
+    transition: width 0.05s linear;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">Lab Brain <span>/ ASR</span></div>
+  <div id="live-badge" class="badge" style="display:none">● live</div>
+  <div class="session-id">session: <strong id="session-display">—</strong></div>
+</header>
+
+<main id="transcript-panel">
+  <div class="empty-state" id="empty-state">
+    <span class="big">▶ Ready</span>
+    Press <strong>Start Recording</strong> to begin streaming transcription.<br>
+    Segments will appear here tagged by speaker and written to the LKC.
+  </div>
+</main>
+
+<aside id="sidebar">
+  <div>
+    <div class="panel-title">Audio input</div>
+    <canvas id="waveform"></canvas>
+  </div>
+
+  <div>
+    <div class="panel-title">Session stats</div>
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-label">Segments</div>
+        <div class="stat-value" id="stat-segs">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Avg latency</div>
+        <div class="stat-value" id="stat-lat">—</div>
+        <div class="stat-unit">ms</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Language</div>
+        <div class="stat-value" id="stat-lang" style="font-size:14px">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Words</div>
+        <div class="stat-value" id="stat-words">0</div>
+      </div>
+    </div>
+  </div>
+
+  <div>
+    <div class="panel-title">LKC stream</div>
+    <div id="lkc-entries">
+      <div style="font-size:11px;color:var(--text-muted)">No entries yet — start recording.</div>
+    </div>
+  </div>
+</aside>
+
+<div id="controls">
+  <div id="vu-bar"><div id="vu-fill"></div></div>
+  <div id="status-text">Idle — <strong>not connected</strong></div>
+  <button class="btn btn-secondary" id="btn-clear" onclick="clearSession()">Clear</button>
+  <button class="btn btn-primary" id="btn-start" onclick="startRecording()">Start Recording</button>
+  <button class="btn btn-stop" id="btn-stop" onclick="stopRecording()" disabled>Stop</button>
+</div>
+
+<script>
+const WS_URL = `ws://${location.host}/ws/asr`;
+const SAMPLE_RATE = 16000;
+const CHUNK_MS = 500;
+
+// FIX 1: ScriptProcessor bufferSize MUST be a power of 2.
+// 16000 * 0.5 = 8000 is not a power of 2 → browser silently drops the node.
+// Use 4096 (~256ms) and accumulate chunks until we reach ~500ms worth.
+const SCRIPT_BUFFER_SIZE = 4096;  // power of 2, valid for createScriptProcessor
+const SAMPLES_PER_CHUNK = SAMPLE_RATE * CHUNK_MS / 1000;  // 8000 samples = target send size
+
+let ws = null;
+let audioCtx = null;
+let mediaStream = null;
+let scriptNode = null;
+let isRecording = false;
+let segmentCount = 0;
+let latencies = [];
+let wordCount = 0;
+let lastLang = '—';
+
+// FIX 2: Accumulation buffer — collect 4096-sample callbacks until we have
+// a full 8000-sample (500ms) chunk to send to the server.
+let accumBuffer = new Float32Array(SAMPLES_PER_CHUNK);
+let accumOffset = 0;
+
+// Waveform
+const canvas = document.getElementById('waveform');
+const ctx2d = canvas.getContext('2d');
+canvas.width = canvas.offsetWidth * window.devicePixelRatio;
+canvas.height = canvas.offsetHeight * window.devicePixelRatio;
+ctx2d.scale(window.devicePixelRatio, window.devicePixelRatio);
+const W = canvas.offsetWidth, H = canvas.offsetHeight;
+let waveData = new Float32Array(128);
+
+function drawWave() {
+  ctx2d.clearRect(0, 0, W, H);
+  if (!isRecording) {
+    ctx2d.strokeStyle = '#1f2730';
+    ctx2d.lineWidth = 1;
+    ctx2d.beginPath();
+    ctx2d.moveTo(0, H/2); ctx2d.lineTo(W, H/2);
+    ctx2d.stroke();
+    requestAnimationFrame(drawWave);
+    return;
+  }
+  ctx2d.strokeStyle = '#00e5a0';
+  ctx2d.lineWidth = 1.5;
+  ctx2d.beginPath();
+  const step = W / waveData.length;
+  for (let i = 0; i < waveData.length; i++) {
+    const x = i * step;
+    const y = H/2 + waveData[i] * H * 0.45;
+    i === 0 ? ctx2d.moveTo(x, y) : ctx2d.lineTo(x, y);
+  }
+  ctx2d.stroke();
+  requestAnimationFrame(drawWave);
+}
+drawWave();
+
+function setStatus(msg) {
+  document.getElementById('status-text').innerHTML = msg;
+}
+
+function updateStats() {
+  document.getElementById('stat-segs').textContent = segmentCount;
+  document.getElementById('stat-words').textContent = wordCount;
+  document.getElementById('stat-lang').textContent = lastLang;
+  if (latencies.length > 0) {
+    const avg = Math.round(latencies.reduce((a,b)=>a+b,0)/latencies.length);
+    document.getElementById('stat-lat').textContent = avg;
+  }
+}
+
+function addSegment(data) {
+  document.getElementById('empty-state')?.remove();
+  document.getElementById('interim-row')?.remove();
+
+  segmentCount++;
+  latencies.push(data.latency_ms);
+  wordCount += data.text.split(/\s+/).filter(Boolean).length;
+  lastLang = (data.language || '—').toUpperCase();
+  updateStats();
+
+  const panel = document.getElementById('transcript-panel');
+  const time = new Date(data.timestamp).toLocaleTimeString();
+
+  const seg = document.createElement('div');
+  seg.className = 'segment';
+  seg.innerHTML = `
+    <div class="seg-meta">
+      <div class="speaker-tag">${data.speaker}</div>
+      <div class="seg-time">${time}</div>
+      <div class="seg-lang">${lastLang}</div>
+    </div>
+    <div>
+      <div class="seg-text">${escHtml(data.text)}</div>
+      <div class="seg-latency">↳ ${data.latency_ms}ms inference</div>
+    </div>
+  `;
+  panel.appendChild(seg);
+  seg.scrollIntoView({ behavior: 'smooth', block: 'end' });
+
+  // LKC sidebar
+  const lkcBox = document.getElementById('lkc-entries');
+  if (lkcBox.querySelector('div[style]')) lkcBox.innerHTML = '';
+  const entry = document.createElement('div');
+  entry.className = 'lkc-entry';
+  entry.innerHTML = `
+    <div>${data.session_id} · ${data.speaker}</div>
+    <div class="lkc-text">${escHtml(data.text.length > 60 ? data.text.slice(0,60)+'…' : data.text)}</div>
+    <div class="lkc-ts">${time}</div>
+  `;
+  lkcBox.insertBefore(entry, lkcBox.firstChild);
+}
+
+function showInterim() {
+  document.getElementById('interim-row')?.remove();
+  const panel = document.getElementById('transcript-panel');
+  const row = document.createElement('div');
+  row.className = 'interim-line';
+  row.id = 'interim-row';
+  row.innerHTML = `
+    <div class="seg-meta"><div class="speaker-tag">listening</div></div>
+    <div class="interim-text">processing</div>
+  `;
+  panel.appendChild(row);
+  row.scrollIntoView({ behavior: 'smooth', block: 'end' });
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+async function startRecording() {
+  if (isRecording) return;
+
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+  } catch(e) {
+    setStatus(`<strong style="color:var(--warn)">Mic access denied:</strong> ${e.message}`);
+    return;
+  }
+
+  // FIX 3: Create AudioContext AFTER getUserMedia resolves (Chrome autoplay policy).
+  // Explicitly request 16kHz so no resampling is needed between browser and server.
+  audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
+  await audioCtx.resume();
+
+  ws = new WebSocket(WS_URL);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    setStatus('Connected — <strong style="color:var(--accent)">streaming</strong>');
+    document.getElementById('btn-start').disabled = true;
+    document.getElementById('btn-stop').disabled = false;
+    document.getElementById('live-badge').style.display = 'inline-flex';
+    isRecording = true;
+    setupAudioPipeline();
+  };
+
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === 'session') {
+      document.getElementById('session-display').textContent = msg.session_id;
+    } else if (msg.type === 'transcript') {
+      addSegment(msg);
+    } else if (msg.type === 'listening') {
+      showInterim();
+    } else if (msg.type === 'error') {
+      setStatus(`<strong style="color:var(--warn)">Server error:</strong> ${msg.message}`);
+    }
+  };
+
+  ws.onclose = () => {
+    setStatus('Disconnected');
+    isRecording = false;
+    document.getElementById('live-badge').style.display = 'none';
+  };
+
+  ws.onerror = () => {
+    setStatus('<strong style="color:var(--warn)">WebSocket error</strong> — is the server running?');
+  };
+}
+
+function setupAudioPipeline() {
+  const source = audioCtx.createMediaStreamSource(mediaStream);
+
+  // FIX 1 (applied): Use a valid power-of-2 buffer size.
+  // onaudioprocess fires every 4096/16000 = ~256ms.
+  // We accumulate two callbacks (~512ms ≈ CHUNK_MS) then send.
+  scriptNode = audioCtx.createScriptProcessor(SCRIPT_BUFFER_SIZE, 1, 1);
+
+  // Reset accumulator on each new session
+  accumBuffer = new Float32Array(SAMPLES_PER_CHUNK);
+  accumOffset = 0;
+
+  scriptNode.onaudioprocess = (e) => {
+    const input = e.inputBuffer.getChannelData(0);
+
+    // Update waveform viz (use the raw 4096-sample callback directly)
+    // Downsample to 128 points for the canvas
+    const step = Math.floor(input.length / 128);
+    for (let i = 0; i < 128; i++) waveData[i] = input[i * step];
+
+    // VU meter
+    let sumSq = 0;
+    for (let i = 0; i < input.length; i++) sumSq += input[i] * input[i];
+    const rms = Math.sqrt(sumSq / input.length);
+    document.getElementById('vu-fill').style.width = Math.min(100, rms * 800) + '%';
+
+    // FIX 2 (applied): Accumulate samples into a 500ms buffer before sending.
+    let srcOffset = 0;
+    while (srcOffset < input.length) {
+      const space = SAMPLES_PER_CHUNK - accumOffset;
+      const toCopy = Math.min(space, input.length - srcOffset);
+      accumBuffer.set(input.subarray(srcOffset, srcOffset + toCopy), accumOffset);
+      accumOffset += toCopy;
+      srcOffset  += toCopy;
+
+      if (accumOffset >= SAMPLES_PER_CHUNK) {
+        // We have a full 500ms chunk — send it
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(accumBuffer.buffer.slice(0));
+        }
+        // Reset for next chunk
+        accumBuffer = new Float32Array(SAMPLES_PER_CHUNK);
+        accumOffset = 0;
+      }
+    }
+  };
+
+  // FIX 4: scriptNode MUST be connected to destination to fire in Chrome/Firefox.
+  // The output goes nowhere audible (we create a GainNode at 0 to avoid echo).
+  const silentGain = audioCtx.createGain();
+  silentGain.gain.value = 0;
+  source.connect(scriptNode);
+  scriptNode.connect(silentGain);
+  silentGain.connect(audioCtx.destination);
+}
+
+function stopRecording() {
+  isRecording = false;
+  scriptNode?.disconnect();
+  mediaStream?.getTracks().forEach(t => t.stop());
+  ws?.close();
+  audioCtx?.close();
+  accumOffset = 0;
+  document.getElementById('btn-start').disabled = false;
+  document.getElementById('btn-stop').disabled = true;
+  document.getElementById('live-badge').style.display = 'none';
+  document.getElementById('vu-fill').style.width = '0%';
+  document.getElementById('interim-row')?.remove();
+  setStatus('Stopped — <strong>session saved to LKC</strong>');
+}
+
+function clearSession() {
+  document.getElementById('transcript-panel').innerHTML =
+    `<div class="empty-state" id="empty-state">
+      <span class="big">▶ Ready</span>
+      Press <strong>Start Recording</strong> to begin streaming transcription.<br>
+      Segments will appear here tagged by speaker and written to the LKC.
+    </div>`;
+  document.getElementById('lkc-entries').innerHTML =
+    `<div style="font-size:11px;color:var(--text-muted)">No entries yet — start recording.</div>`;
+  segmentCount = 0; latencies = []; wordCount = 0; lastLang = '—';
+  document.getElementById('session-display').textContent = '—';
+  fetch('/lkc', { method: 'DELETE' });
+  updateStats();
+}
+</script>
+</body>
+</html>
