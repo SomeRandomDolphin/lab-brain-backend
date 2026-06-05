@@ -1,0 +1,47 @@
+{
+  "_comment": "Lab Brain — Module 5 configuration. Edit this file, then restart the server.",
+
+  "gemini": {
+    "api_key": "",
+    "vision_model":   "gemini-2.0-flash",
+    "dialogue_model": "gemini-2.0-flash"
+  },
+
+  "whisper": {
+    "model_size":    "small",
+    "device":        "cpu",
+    "compute_type":  "int8",
+    "beam_size":     1,
+    "language":      null,
+    "cpu_threads":   8,
+    "num_workers":   2
+  },
+
+  "vad": {
+    "sample_rate":        16000,
+    "silence_threshold":  0.01,
+    "silence_chunks":     4,
+    "max_segment_chunks": 30
+  },
+
+  "vision": {
+    "frame_interval": 5,
+    "camera_fps":     5,
+    "camera_quality": 0.6
+  },
+
+  "lkc": {
+    "log_file": "lkc_stream.jsonl",
+    "retrieval_top_k": 4
+  },
+
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8000
+  },
+
+  "dialogue": {
+    "context_window": 12,
+    "tts_auto_hide_ms": 8000
+  }
+}

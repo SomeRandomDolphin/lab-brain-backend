@@ -8,7 +8,7 @@ Part of **Lab Brain / TEEP 2026**.
 - Opens a WebSocket between your browser and the server
 - Streams raw 16kHz PCM audio from your microphone in 500ms chunks
 - Applies a simple energy-based VAD to detect speech segments
-- Runs **faster-whisper** (tiny model, int8) on each segment — ~300–600ms latency
+- Runs **faster-whisper** (turbo model, int8) on each segment
 - Tags every segment with `session_id`, `speaker` placeholder, `timestamp`, `language`
 - Writes each segment to `lkc_stream.jsonl` — simulating LKC ingestion
 - Displays a live transcript in the browser with speaker tags and latency info

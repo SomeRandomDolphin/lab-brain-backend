@@ -3,376 +3,328 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Lab Brain — Streaming ASR PoC</title>
+<title>Lab Brain — Module 5 Month 2</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Syne:wght@400;700;800&display=swap" rel="stylesheet">
 <style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-  :root {
-    --bg: #0a0c0f;
-    --surface: #111418;
-    --surface2: #181d23;
-    --border: #1f2730;
-    --accent: #00e5a0;
-    --accent-dim: #00e5a018;
-    --accent-glow: #00e5a040;
-    --warn: #ff6b35;
-    --text: #e2e8f0;
-    --text-muted: #4a5568;
-    --text-dim: #718096;
-    --speaker-a: #00e5a0;
-    --speaker-b: #7c6af7;
-    --font-mono: 'JetBrains Mono', monospace;
-    --font-display: 'Syne', sans-serif;
-  }
+:root {
+  --bg:           #0a0c0f;
+  --surface:      #111418;
+  --surface2:     #181d23;
+  --border:       #1f2730;
+  --accent:       #00e5a0;
+  --accent-glow:  #00e5a040;
+  --warn:         #ff6b35;
+  --purple:       #7c6af7;
+  --blue:         #38bdf8;
+  --text:         #e2e8f0;
+  --text-muted:   #4a5568;
+  --text-dim:     #718096;
+  --font-mono:    'JetBrains Mono', monospace;
+  --font-display: 'Syne', sans-serif;
+}
 
-  body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: var(--font-mono);
-    min-height: 100vh;
-    display: grid;
-    grid-template-rows: auto 1fr auto;
-    grid-template-columns: 1fr 320px;
-    grid-template-areas:
-      "header header"
-      "transcript sidebar"
-      "controls controls";
-    gap: 0;
-  }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-mono);
+  min-height: 100vh;
+  display: grid;
+  grid-template-rows: 52px 1fr 56px;
+  grid-template-columns: 1fr 340px;
+  grid-template-areas:
+    "header  header"
+    "main    sidebar"
+    "controls controls";
+}
 
-  /* ── Header ── */
-  header {
-    grid-area: header;
-    border-bottom: 1px solid var(--border);
-    padding: 16px 28px;
-    display: flex;
-    align-items: center;
-    gap: 20px;
-    background: var(--surface);
-  }
+/* ── Header ── */
+header {
+  grid-area: header;
+  border-bottom: 1px solid var(--border);
+  padding: 0 24px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  background: var(--surface);
+}
 
-  .logo {
-    font-family: var(--font-display);
-    font-weight: 800;
-    font-size: 18px;
-    letter-spacing: -0.5px;
-    color: var(--accent);
-  }
+.logo { font-family: var(--font-display); font-weight: 800; font-size: 17px; color: var(--accent); }
+.logo span { color: var(--text-dim); font-weight: 400; }
 
-  .logo span { color: var(--text-dim); font-weight: 400; }
+.badge {
+  font-size: 10px; padding: 2px 7px;
+  border: 1px solid var(--border); border-radius: 3px;
+  color: var(--text-dim); letter-spacing: .07em; text-transform: uppercase;
+}
+.badge.live { border-color: var(--accent); color: var(--accent); }
+.badge.live::before {
+  content:''; width:5px; height:5px; background:var(--accent);
+  border-radius:50%; display:inline-block; margin-right:5px;
+  animation: pulse 1.4s infinite;
+}
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
 
-  .badge {
-    font-size: 10px;
-    padding: 3px 8px;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    color: var(--text-dim);
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-  }
+.mode-pill {
+  margin-left: auto;
+  font-size: 11px; padding: 3px 10px;
+  border-radius: 20px; border: 1px solid var(--border);
+  color: var(--text-dim); text-transform: uppercase; letter-spacing:.06em;
+  transition: all .3s;
+}
+.mode-pill.greeting       { border-color:#fbbf24; color:#fbbf24; }
+.mode-pill.meeting_capture{ border-color:var(--accent); color:var(--accent); }
+.mode-pill.qa             { border-color:var(--purple); color:var(--purple); }
+.mode-pill.ambient        { border-color:var(--text-muted); color:var(--text-muted); }
 
-  .badge.live {
-    border-color: var(--accent);
-    color: var(--accent);
-    position: relative;
-  }
+.session-id { font-size:11px; color:var(--text-muted); }
+.session-id strong { color:var(--text-dim); }
 
-  .badge.live::before {
-    content: '';
-    width: 6px; height: 6px;
-    background: var(--accent);
-    border-radius: 50%;
-    display: inline-block;
-    margin-right: 5px;
-    animation: pulse 1.4s ease-in-out infinite;
-  }
+/* ── Main area: transcript left, camera top-right ── */
+main {
+  grid-area: main;
+  display: grid;
+  grid-template-rows: 200px 1fr;
+  overflow: hidden;
+}
 
-  @keyframes pulse {
-    0%, 100% { opacity: 1; transform: scale(1); }
-    50% { opacity: 0.4; transform: scale(0.7); }
-  }
+/* ── Camera strip ── */
+#camera-strip {
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  padding: 12px 20px;
+  gap: 16px;
+}
 
-  .session-id {
-    margin-left: auto;
-    font-size: 11px;
-    color: var(--text-muted);
-  }
+#camera-feed {
+  width: 240px;
+  min-width: 240px;
+  height: 160px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  object-fit: cover;
+  background: #000;
+}
 
-  .session-id strong { color: var(--text-dim); }
+.perception-box {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  justify-content: center;
+}
 
-  /* ── Transcript area ── */
-  #transcript-panel {
-    grid-area: transcript;
-    padding: 28px;
-    overflow-y: auto;
-    display: flex;
-    flex-direction: column;
-    gap: 0;
-    max-height: calc(100vh - 130px);
-  }
+.perc-title { font-size:10px; color:var(--text-muted); text-transform:uppercase; letter-spacing:.08em; }
 
-  .empty-state {
-    margin: auto;
-    text-align: center;
-    color: var(--text-muted);
-    font-size: 13px;
-    line-height: 2;
-  }
+.speaker-chips { display: flex; flex-wrap: wrap; gap: 6px; min-height: 26px; }
 
-  .empty-state .big {
-    font-family: var(--font-display);
-    font-size: 36px;
-    font-weight: 800;
-    color: var(--border);
-    display: block;
-    margin-bottom: 8px;
-  }
+.chip {
+  font-size: 11px; padding: 3px 10px;
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  display: flex; align-items: center; gap: 5px;
+}
+.chip .dot { width:6px; height:6px; border-radius:50%; background: var(--text-muted); }
+.chip.focused .dot  { background: var(--accent); }
+.chip.distracted .dot { background: var(--warn); }
+.chip.away .dot     { background: var(--text-muted); }
 
-  .segment {
-    display: grid;
-    grid-template-columns: 90px 1fr;
-    gap: 0 16px;
-    padding: 14px 0;
-    border-bottom: 1px solid var(--border);
-    animation: fadein 0.3s ease;
-  }
+#scene-summary {
+  font-size:12px; color:var(--text-dim);
+  font-style:italic;
+  min-height: 18px;
+}
 
-  @keyframes fadein {
-    from { opacity: 0; transform: translateY(6px); }
-    to   { opacity: 1; transform: translateY(0); }
-  }
+/* ── Agent reply banner ── */
+#agent-banner {
+  display: none;
+  background: linear-gradient(90deg, #7c6af715 0%, transparent 100%);
+  border-left: 3px solid var(--purple);
+  border-radius: 0 6px 6px 0;
+  padding: 8px 14px;
+  font-size: 13px;
+  color: var(--text);
+  animation: fadein .3s ease;
+  max-width: 600px;
+}
+#agent-banner .agent-label {
+  font-size:10px; color:var(--purple); text-transform:uppercase;
+  letter-spacing:.07em; margin-bottom:3px; font-weight:600;
+}
 
-  .seg-meta {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    padding-top: 2px;
-  }
+/* ── Transcript panel ── */
+#transcript-panel {
+  padding: 20px 24px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
 
-  .speaker-tag {
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--speaker-a);
-    font-family: var(--font-display);
-  }
+.empty-state {
+  margin: auto; text-align:center; color:var(--text-muted); font-size:13px; line-height:2;
+}
+.empty-state .big {
+  font-family:var(--font-display); font-size:32px; font-weight:800;
+  color:var(--border); display:block; margin-bottom:6px;
+}
 
-  .speaker-tag.b { color: var(--speaker-b); }
+.segment {
+  display: grid;
+  grid-template-columns: 96px 1fr;
+  gap: 0 14px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+  animation: fadein .3s ease;
+}
+@keyframes fadein { from{opacity:0;transform:translateY(5px)} to{opacity:1;transform:none} }
 
-  .seg-time {
-    font-size: 10px;
-    color: var(--text-muted);
-  }
+.seg-meta { display:flex; flex-direction:column; gap:3px; padding-top:2px; }
+.speaker-tag {
+  font-size:11px; font-weight:600; letter-spacing:.05em; text-transform:uppercase;
+  color:var(--accent); font-family:var(--font-display);
+}
+.seg-time  { font-size:10px; color:var(--text-muted); }
+.seg-lang  { font-size:10px; color:var(--text-muted); border:1px solid var(--border); border-radius:3px; padding:1px 4px; width:fit-content; }
+.seg-mode  { font-size:9px; color:var(--text-muted); letter-spacing:.04em; }
+.seg-text  { font-size:14px; line-height:1.7; color:var(--text); }
+.seg-latency { font-size:10px; color:var(--text-muted); margin-top:3px; }
+.seg-engagement { font-size:9px; padding:1px 5px; border-radius:3px; border:1px solid var(--border); width:fit-content; margin-top:2px; }
+.seg-engagement.focused   { border-color:var(--accent); color:var(--accent); }
+.seg-engagement.distracted{ border-color:var(--warn); color:var(--warn); }
 
-  .seg-lang {
-    font-size: 10px;
-    color: var(--text-muted);
-    border: 1px solid var(--border);
-    border-radius: 3px;
-    padding: 1px 5px;
-    width: fit-content;
-  }
+.interim-line {
+  padding:12px 0; border-bottom:1px solid var(--border);
+  display:grid; grid-template-columns:96px 1fr; gap:0 14px; opacity:.5;
+}
+.interim-text { font-size:14px; line-height:1.7; color:var(--accent); }
+.interim-text::after { content:'▋'; animation:blink .8s step-end infinite; }
+@keyframes blink { 50%{opacity:0} }
 
-  .seg-text {
-    font-size: 15px;
-    line-height: 1.7;
-    color: var(--text);
-    padding-top: 1px;
-  }
+/* ── Sidebar ── */
+#sidebar {
+  grid-area: sidebar;
+  border-left: 1px solid var(--border);
+  background: var(--surface);
+  padding: 16px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
 
-  .seg-latency {
-    font-size: 10px;
-    color: var(--text-muted);
-    margin-top: 4px;
-  }
+.panel-title {
+  font-family:var(--font-display); font-size:10px; font-weight:700;
+  letter-spacing:.1em; text-transform:uppercase; color:var(--text-muted); margin-bottom:8px;
+}
 
-  /* interim / streaming text */
-  .interim-line {
-    padding: 14px 0;
-    border-bottom: 1px solid var(--border);
-    display: grid;
-    grid-template-columns: 90px 1fr;
-    gap: 0 16px;
-    opacity: 0.5;
-  }
+/* Audio VU + waveform */
+#waveform { width:100%; height:48px; border:1px solid var(--border); border-radius:6px; background:var(--surface2); }
 
-  .interim-text {
-    font-size: 15px;
-    line-height: 1.7;
-    color: var(--accent);
-    padding-top: 1px;
-  }
+/* Stats */
+.stats-grid { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
+.stat-card { background:var(--surface2); border:1px solid var(--border); border-radius:6px; padding:10px; }
+.stat-label { font-size:10px; color:var(--text-muted); margin-bottom:3px; }
+.stat-value { font-size:18px; font-weight:600; color:var(--accent); font-family:var(--font-display); }
+.stat-unit  { font-size:10px; color:var(--text-muted); }
 
-  .interim-text::after {
-    content: '▋';
-    animation: blink 0.8s step-end infinite;
-  }
+/* Eval panel */
+.eval-row {
+  display:flex; justify-content:space-between; align-items:center;
+  font-size:11px; color:var(--text-dim);
+  padding:4px 0; border-bottom:1px solid var(--border);
+}
+.eval-row .ev-val { color:var(--text); font-weight:600; }
 
-  @keyframes blink {
-    50% { opacity: 0; }
-  }
+/* LKC entries */
+.lkc-entry {
+  background:var(--surface2); border:1px solid var(--border);
+  border-left:3px solid var(--accent); border-radius:5px;
+  padding:8px 10px; font-size:11px; color:var(--text-dim);
+  animation:fadein .3s ease;
+}
+.lkc-entry.vision  { border-left-color: var(--blue); }
+.lkc-entry.agent   { border-left-color: var(--purple); }
+.lkc-entry .lkc-text { color:var(--text); font-size:12px; margin-top:3px; }
+.lkc-entry .lkc-ts   { font-size:10px; color:var(--text-muted); margin-top:2px; }
 
-  /* ── Sidebar ── */
-  #sidebar {
-    grid-area: sidebar;
-    border-left: 1px solid var(--border);
-    background: var(--surface);
-    padding: 20px;
-    overflow-y: auto;
-    max-height: calc(100vh - 130px);
-    display: flex;
-    flex-direction: column;
-    gap: 20px;
-  }
+#lkc-entries { display:flex; flex-direction:column; gap:5px; max-height:260px; overflow-y:auto; }
 
-  .panel-title {
-    font-family: var(--font-display);
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: var(--text-muted);
-    margin-bottom: 10px;
-  }
+/* ── Controls ── */
+#controls {
+  grid-area: controls;
+  border-top:1px solid var(--border);
+  background:var(--surface);
+  padding:0 24px;
+  display:flex; align-items:center; gap:12px;
+}
+#vu-bar { height:3px; background:var(--border); border-radius:2px; width:80px; overflow:hidden; }
+#vu-fill { height:100%; width:0%; background:var(--accent); transition:width .05s; }
+#status-text { font-size:11px; color:var(--text-muted); flex:1; }
+#status-text strong { color:var(--text-dim); }
 
-  /* Stats grid */
-  .stats-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 8px;
-  }
-
-  .stat-card {
-    background: var(--surface2);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 12px;
-  }
-
-  .stat-label { font-size: 10px; color: var(--text-muted); margin-bottom: 4px; }
-  .stat-value { font-size: 20px; font-weight: 600; color: var(--accent); font-family: var(--font-display); }
-  .stat-unit  { font-size: 10px; color: var(--text-muted); }
-
-  /* Waveform viz */
-  #waveform {
-    width: 100%;
-    height: 56px;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    background: var(--surface2);
-  }
-
-  /* LKC entries */
-  .lkc-entry {
-    background: var(--surface2);
-    border: 1px solid var(--border);
-    border-left: 3px solid var(--accent);
-    border-radius: 6px;
-    padding: 10px 12px;
-    font-size: 11px;
-    color: var(--text-dim);
-    animation: fadein 0.3s ease;
-  }
-
-  .lkc-entry .lkc-text { color: var(--text); font-size: 12px; margin-top: 4px; }
-  .lkc-entry .lkc-ts   { font-size: 10px; color: var(--text-muted); margin-top: 3px; }
-
-  #lkc-entries { display: flex; flex-direction: column; gap: 6px; max-height: 240px; overflow-y: auto; }
-
-  /* ── Controls ── */
-  #controls {
-    grid-area: controls;
-    border-top: 1px solid var(--border);
-    background: var(--surface);
-    padding: 16px 28px;
-    display: flex;
-    align-items: center;
-    gap: 16px;
-  }
-
-  #status-text {
-    font-size: 12px;
-    color: var(--text-muted);
-    flex: 1;
-  }
-
-  #status-text strong { color: var(--text-dim); }
-
-  .btn {
-    font-family: var(--font-mono);
-    font-size: 13px;
-    font-weight: 600;
-    padding: 10px 24px;
-    border-radius: 8px;
-    border: 1px solid var(--border);
-    cursor: pointer;
-    transition: all 0.15s;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-  }
-
-  .btn-primary {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: #000;
-  }
-
-  .btn-primary:hover { background: #00ffb0; box-shadow: 0 0 20px var(--accent-glow); }
-
-  .btn-stop {
-    background: transparent;
-    border-color: var(--warn);
-    color: var(--warn);
-  }
-
-  .btn-stop:hover { background: #ff6b3510; }
-
-  .btn-secondary {
-    background: transparent;
-    color: var(--text-dim);
-  }
-
-  .btn-secondary:hover { background: var(--surface2); color: var(--text); }
-
-  .btn:disabled { opacity: 0.3; cursor: not-allowed; }
-
-  /* VU meter */
-  #vu-bar {
-    height: 4px;
-    background: var(--border);
-    border-radius: 2px;
-    width: 120px;
-    overflow: hidden;
-  }
-
-  #vu-fill {
-    height: 100%;
-    width: 0%;
-    background: var(--accent);
-    border-radius: 2px;
-    transition: width 0.05s linear;
-  }
+.btn {
+  font-family:var(--font-mono); font-size:12px; font-weight:600;
+  padding:8px 18px; border-radius:6px; border:1px solid var(--border);
+  cursor:pointer; transition:all .15s; letter-spacing:.04em; text-transform:uppercase;
+}
+.btn-primary { background:var(--accent); border-color:var(--accent); color:#000; }
+.btn-primary:hover { background:#00ffb0; box-shadow:0 0 16px var(--accent-glow); }
+.btn-stop   { background:transparent; border-color:var(--warn); color:var(--warn); }
+.btn-stop:hover   { background:#ff6b3510; }
+.btn-secondary  { background:transparent; color:var(--text-dim); }
+.btn-secondary:hover { background:var(--surface2); color:var(--text); }
+.btn:disabled { opacity:.3; cursor:not-allowed; }
 </style>
 </head>
 <body>
 
 <header>
-  <div class="logo">Lab Brain <span>/ ASR</span></div>
-  <div id="live-badge" class="badge" style="display:none">● live</div>
+  <div class="logo">Lab Brain <span>/ M5·M2</span></div>
+  <div class="badge">Module 5</div>
+  <div class="badge">Month 2</div>
+  <div id="live-badge" class="badge live" style="display:none">live</div>
+  <div id="mode-pill" class="mode-pill ambient">ambient</div>
   <div class="session-id">session: <strong id="session-display">—</strong></div>
 </header>
 
-<main id="transcript-panel">
-  <div class="empty-state" id="empty-state">
-    <span class="big">▶ Ready</span>
-    Press <strong>Start Recording</strong> to begin streaming transcription.<br>
-    Segments will appear here tagged by speaker and written to the LKC.
+<!-- Camera + perception strip -->
+<main>
+  <div id="camera-strip">
+    <video id="camera-feed" autoplay muted playsinline></video>
+    <div class="perception-box">
+      <div>
+        <div class="perc-title">Detected speakers</div>
+        <div class="speaker-chips" id="speaker-chips">
+          <span style="font-size:11px;color:var(--text-muted)">Camera inactive</span>
+        </div>
+      </div>
+      <div>
+        <div class="perc-title">Scene</div>
+        <div id="scene-summary">—</div>
+      </div>
+      <div id="agent-banner">
+        <div class="agent-label">Lab Brain</div>
+        <div id="agent-text"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="transcript-panel">
+    <div class="empty-state" id="empty-state">
+      <span class="big">▶ Ready</span>
+      Press <strong>Start</strong> to begin. Camera + mic will be requested.<br>
+      Lab Brain will greet, capture, and answer in real time.
+    </div>
   </div>
 </main>
 
+<!-- Sidebar -->
 <aside id="sidebar">
   <div>
     <div class="panel-title">Audio input</div>
@@ -387,13 +339,13 @@
         <div class="stat-value" id="stat-segs">0</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">Avg latency</div>
+        <div class="stat-label">ASR p50</div>
         <div class="stat-value" id="stat-lat">—</div>
         <div class="stat-unit">ms</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">Language</div>
-        <div class="stat-value" id="stat-lang" style="font-size:14px">—</div>
+        <div class="stat-value" id="stat-lang" style="font-size:13px">—</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">Words</div>
@@ -403,74 +355,71 @@
   </div>
 
   <div>
+    <div class="panel-title">Evaluation</div>
+    <div id="eval-rows">
+      <div class="eval-row"><span>Vision frames</span><span class="ev-val" id="ev-vis-frames">0</span></div>
+      <div class="eval-row"><span>Vision p50</span><span class="ev-val" id="ev-vis-lat">— ms</span></div>
+      <div class="eval-row"><span>E2E p50</span><span class="ev-val" id="ev-e2e">— ms</span></div>
+      <div class="eval-row"><span>Reliability</span><span class="ev-val" id="ev-rel">—</span></div>
+      <div class="eval-row"><span>Agent replies</span><span class="ev-val" id="ev-agent">0</span></div>
+    </div>
+  </div>
+
+  <div>
     <div class="panel-title">LKC stream</div>
     <div id="lkc-entries">
-      <div style="font-size:11px;color:var(--text-muted)">No entries yet — start recording.</div>
+      <div style="font-size:11px;color:var(--text-muted)">No entries yet.</div>
     </div>
   </div>
 </aside>
 
+<!-- Controls -->
 <div id="controls">
   <div id="vu-bar"><div id="vu-fill"></div></div>
   <div id="status-text">Idle — <strong>not connected</strong></div>
-  <button class="btn btn-secondary" id="btn-clear" onclick="clearSession()">Clear</button>
-  <button class="btn btn-primary" id="btn-start" onclick="startRecording()">Start Recording</button>
-  <button class="btn btn-stop" id="btn-stop" onclick="stopRecording()" disabled>Stop</button>
+  <button class="btn btn-secondary" onclick="clearSession()">Clear</button>
+  <button class="btn btn-primary"   id="btn-start" onclick="startSession()">Start</button>
+  <button class="btn btn-stop"      id="btn-stop"  onclick="stopSession()" disabled>Stop</button>
 </div>
 
 <script>
-const WS_URL = `ws://${location.host}/ws/asr`;
-const SAMPLE_RATE = 16000;
-const CHUNK_MS = 500;
+// ── Constants ────────────────────────────────────────────────────────────────
+const SAMPLE_RATE       = 16000;
+const SCRIPT_BUF        = 4096;
+const SAMPLES_PER_CHUNK = 8000;
 
-// FIX 1: ScriptProcessor bufferSize MUST be a power of 2.
-// 16000 * 0.5 = 8000 is not a power of 2 → browser silently drops the node.
-// Use 4096 (~256ms) and accumulate chunks until we reach ~500ms worth.
-const SCRIPT_BUFFER_SIZE = 4096;  // power of 2, valid for createScriptProcessor
-const SAMPLES_PER_CHUNK = SAMPLE_RATE * CHUNK_MS / 1000;  // 8000 samples = target send size
+// Camera settings fetched from /config/client on load (set in config.json)
+let CAMERA_FPS     = 5;
+let CAMERA_QUALITY = 0.6;
+let TTS_HIDE_MS    = 8000;
 
-let ws = null;
-let audioCtx = null;
-let mediaStream = null;
-let scriptNode = null;
-let isRecording = false;
-let segmentCount = 0;
-let latencies = [];
-let wordCount = 0;
-let lastLang = '—';
+// ── State ────────────────────────────────────────────────────────────────────
+let ws = null, wsVision = null, wsTts = null;
+let audioCtx = null, mediaStream = null, cameraStream = null, scriptNode = null;
+let isRecording = false, sessionId = null;
+let segCount = 0, latencies = [], wordCount = 0, lastLang = '—';
+let agentReplies = 0;
+let visFrames = 0, visLatencies = [], e2eLatencies = [];
+let accumBuffer = new Float32Array(SAMPLES_PER_CHUNK), accumOffset = 0;
+let cameraInterval = null;
 
-// FIX 2: Accumulation buffer — collect 4096-sample callbacks until we have
-// a full 8000-sample (500ms) chunk to send to the server.
-let accumBuffer = new Float32Array(SAMPLES_PER_CHUNK);
-let accumOffset = 0;
-
-// Waveform
+// ── Canvas waveform ──────────────────────────────────────────────────────────
 const canvas = document.getElementById('waveform');
-const ctx2d = canvas.getContext('2d');
-canvas.width = canvas.offsetWidth * window.devicePixelRatio;
-canvas.height = canvas.offsetHeight * window.devicePixelRatio;
-ctx2d.scale(window.devicePixelRatio, window.devicePixelRatio);
+const ctx2d   = canvas.getContext('2d');
+canvas.width  = canvas.offsetWidth  * devicePixelRatio;
+canvas.height = canvas.offsetHeight * devicePixelRatio;
+ctx2d.scale(devicePixelRatio, devicePixelRatio);
 const W = canvas.offsetWidth, H = canvas.offsetHeight;
 let waveData = new Float32Array(128);
 
 function drawWave() {
   ctx2d.clearRect(0, 0, W, H);
-  if (!isRecording) {
-    ctx2d.strokeStyle = '#1f2730';
-    ctx2d.lineWidth = 1;
-    ctx2d.beginPath();
-    ctx2d.moveTo(0, H/2); ctx2d.lineTo(W, H/2);
-    ctx2d.stroke();
-    requestAnimationFrame(drawWave);
-    return;
-  }
-  ctx2d.strokeStyle = '#00e5a0';
-  ctx2d.lineWidth = 1.5;
+  ctx2d.strokeStyle = isRecording ? '#00e5a0' : '#1f2730';
+  ctx2d.lineWidth   = 1.5;
   ctx2d.beginPath();
   const step = W / waveData.length;
   for (let i = 0; i < waveData.length; i++) {
-    const x = i * step;
-    const y = H/2 + waveData[i] * H * 0.45;
+    const x = i * step, y = H/2 + waveData[i] * H * 0.45;
     i === 0 ? ctx2d.moveTo(x, y) : ctx2d.lineTo(x, y);
   }
   ctx2d.stroke();
@@ -478,83 +427,273 @@ function drawWave() {
 }
 drawWave();
 
-function setStatus(msg) {
-  document.getElementById('status-text').innerHTML = msg;
+// ── Helpers ──────────────────────────────────────────────────────────────────
+const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+function setStatus(msg) { document.getElementById('status-text').innerHTML = msg; }
+
+function setMode(mode) {
+  const pill = document.getElementById('mode-pill');
+  pill.textContent = mode.replace('_', ' ');
+  pill.className   = `mode-pill ${mode}`;
 }
 
 function updateStats() {
-  document.getElementById('stat-segs').textContent = segmentCount;
+  document.getElementById('stat-segs').textContent  = segCount;
   document.getElementById('stat-words').textContent = wordCount;
-  document.getElementById('stat-lang').textContent = lastLang;
-  if (latencies.length > 0) {
-    const avg = Math.round(latencies.reduce((a,b)=>a+b,0)/latencies.length);
-    document.getElementById('stat-lat').textContent = avg;
+  document.getElementById('stat-lang').textContent  = lastLang;
+  if (latencies.length) {
+    const sorted = [...latencies].sort((a,b)=>a-b);
+    document.getElementById('stat-lat').textContent = Math.round(sorted[Math.floor(sorted.length*0.5)]);
+  }
+  document.getElementById('ev-vis-frames').textContent = visFrames;
+  document.getElementById('ev-agent').textContent      = agentReplies;
+  if (visLatencies.length) {
+    const sv = [...visLatencies].sort((a,b)=>a-b);
+    document.getElementById('ev-vis-lat').textContent = Math.round(sv[Math.floor(sv.length*0.5)]) + ' ms';
+  }
+  if (e2eLatencies.length) {
+    const se = [...e2eLatencies].sort((a,b)=>a-b);
+    document.getElementById('ev-e2e').textContent = Math.round(se[Math.floor(se.length*0.5)]) + ' ms';
   }
 }
 
+// ── LKC sidebar helper ───────────────────────────────────────────────────────
+function addLkcEntry(type, label, text, ts) {
+  const box = document.getElementById('lkc-entries');
+  if (box.querySelector('div[style]')) box.innerHTML = '';
+  const entry = document.createElement('div');
+  entry.className = `lkc-entry ${type}`;
+  entry.innerHTML = `
+    <div>${esc(label)}</div>
+    <div class="lkc-text">${esc(text.length > 65 ? text.slice(0,65)+'…' : text)}</div>
+    <div class="lkc-ts">${ts}</div>
+  `;
+  box.insertBefore(entry, box.firstChild);
+  while (box.children.length > 30) box.removeChild(box.lastChild);
+}
+
+// ── Transcript segment ────────────────────────────────────────────────────────
 function addSegment(data) {
   document.getElementById('empty-state')?.remove();
   document.getElementById('interim-row')?.remove();
 
-  segmentCount++;
+  segCount++;
   latencies.push(data.latency_ms);
+  if (data.e2e_ms) e2eLatencies.push(data.e2e_ms);
   wordCount += data.text.split(/\s+/).filter(Boolean).length;
   lastLang = (data.language || '—').toUpperCase();
   updateStats();
+  if (data.mode) setMode(data.mode);
 
   const panel = document.getElementById('transcript-panel');
-  const time = new Date(data.timestamp).toLocaleTimeString();
+  const time  = new Date(data.timestamp).toLocaleTimeString();
+  const engCls = data.engagement && data.engagement !== 'unknown' ? data.engagement : '';
 
   const seg = document.createElement('div');
   seg.className = 'segment';
   seg.innerHTML = `
     <div class="seg-meta">
-      <div class="speaker-tag">${data.speaker}</div>
+      <div class="speaker-tag">${esc(data.speaker)}</div>
       <div class="seg-time">${time}</div>
-      <div class="seg-lang">${lastLang}</div>
+      <div class="seg-lang">${esc(lastLang)}</div>
+      <div class="seg-mode">${esc(data.mode || '')}</div>
     </div>
     <div>
-      <div class="seg-text">${escHtml(data.text)}</div>
-      <div class="seg-latency">↳ ${data.latency_ms}ms inference</div>
+      <div class="seg-text">${esc(data.text)}</div>
+      <div class="seg-latency">ASR ${data.latency_ms}ms${data.e2e_ms ? ' · e2e '+data.e2e_ms+'ms' : ''}</div>
+      ${engCls ? `<div class="seg-engagement ${engCls}">${engCls}</div>` : ''}
     </div>
   `;
   panel.appendChild(seg);
-  seg.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  seg.scrollIntoView({ behavior:'smooth', block:'end' });
 
-  // LKC sidebar
-  const lkcBox = document.getElementById('lkc-entries');
-  if (lkcBox.querySelector('div[style]')) lkcBox.innerHTML = '';
-  const entry = document.createElement('div');
-  entry.className = 'lkc-entry';
-  entry.innerHTML = `
-    <div>${data.session_id} · ${data.speaker}</div>
-    <div class="lkc-text">${escHtml(data.text.length > 60 ? data.text.slice(0,60)+'…' : data.text)}</div>
-    <div class="lkc-ts">${time}</div>
-  `;
-  lkcBox.insertBefore(entry, lkcBox.firstChild);
+  addLkcEntry('transcript', `${data.session_id} · ${data.speaker}`, data.text, time);
 }
 
-function showInterim() {
+// ── Agent reply ───────────────────────────────────────────────────────────────
+function showAgentReply(text, mode) {
+  agentReplies++;
+  updateStats();
+  const banner = document.getElementById('agent-banner');
+  document.getElementById('agent-text').textContent = text;
+  banner.style.display = 'block';
+  // Auto-hide after tts_auto_hide_ms from config
+  clearTimeout(banner._timer);
+  banner._timer = setTimeout(() => { banner.style.display = 'none'; }, TTS_HIDE_MS);
+
+  const ts = new Date().toLocaleTimeString();
+  addLkcEntry('agent', `Lab Brain · ${mode || ''}`, text, ts);
+}
+
+// ── Perception update ─────────────────────────────────────────────────────────
+function updatePerception(data) {
+  visFrames++;
+  if (data.latency_ms) visLatencies.push(data.latency_ms);
+
+  // Reliability display
+  if (visFrames > 0) {
+    document.getElementById('ev-rel').textContent =
+      '~' + Math.round((visFrames / Math.max(visFrames, 1)) * 100) + '%';
+  }
+  updateStats();
+
+  document.getElementById('scene-summary').textContent = data.scene_summary || '—';
+
+  const chips = document.getElementById('speaker-chips');
+  if (data.present_speakers && data.present_speakers.length > 0) {
+    chips.innerHTML = data.present_speakers.map(sp => {
+      const eng = (data.engagement_cues || {})[sp] || 'unknown';
+      return `<div class="chip ${eng}"><div class="dot"></div>${esc(sp)} <span style="font-size:9px;opacity:.6">${eng}</span></div>`;
+    }).join('');
+  } else {
+    chips.innerHTML = `<span style="font-size:11px;color:var(--text-muted)">No one detected</span>`;
+  }
+
+  const ts = new Date().toLocaleTimeString();
+  if (data.scene_summary) {
+    addLkcEntry('vision', `vision · ${sessionId}`, data.scene_summary, ts);
+  }
+}
+
+// ── Interim row ──────────────────────────────────────────────────────────────
+function showInterim(mode) {
   document.getElementById('interim-row')?.remove();
   const panel = document.getElementById('transcript-panel');
   const row = document.createElement('div');
-  row.className = 'interim-line';
-  row.id = 'interim-row';
+  row.className = 'interim-line'; row.id = 'interim-row';
   row.innerHTML = `
-    <div class="seg-meta"><div class="speaker-tag">listening</div></div>
-    <div class="interim-text">processing</div>
-  `;
+    <div class="seg-meta"><div class="speaker-tag" style="color:var(--text-muted)">listening</div>
+    <div class="seg-mode" style="color:var(--text-muted)">${esc(mode||'')}</div></div>
+    <div class="interim-text">processing</div>`;
   panel.appendChild(row);
-  row.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  row.scrollIntoView({ behavior:'smooth', block:'end' });
 }
 
-function escHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+// ── TTS (Web Speech API) ──────────────────────────────────────────────────────
+function speak(text) {
+  if (!window.speechSynthesis) return;
+  const utt = new SpeechSynthesisUtterance(text);
+  utt.rate = 1.05;
+  window.speechSynthesis.speak(utt);
 }
 
-async function startRecording() {
+// ── Camera pipeline ───────────────────────────────────────────────────────────
+async function startCamera(sid) {
+  try {
+    cameraStream = await navigator.mediaDevices.getUserMedia({ video: { width:320, height:240, frameRate:CAMERA_FPS }, audio: false });
+    const video = document.getElementById('camera-feed');
+    video.srcObject = cameraStream;
+
+    wsVision = new WebSocket(`ws://${location.host}/ws/vision?session_id=${sid}`);
+    wsVision.binaryType = 'arraybuffer';
+
+    wsVision.onopen = () => {
+      const offscreen = document.createElement('canvas');
+      offscreen.width  = 320; offscreen.height = 240;
+      const octx = offscreen.getContext('2d');
+
+      cameraInterval = setInterval(() => {
+        if (!wsVision || wsVision.readyState !== WebSocket.OPEN) return;
+        octx.drawImage(video, 0, 0, 320, 240);
+        offscreen.toBlob(blob => {
+          if (!blob) return;
+          blob.arrayBuffer().then(buf => {
+            if (wsVision.readyState === WebSocket.OPEN) wsVision.send(buf);
+          });
+        }, 'image/jpeg', CAMERA_QUALITY);
+      }, 1000 / CAMERA_FPS);
+    };
+
+    wsVision.onmessage = ev => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'perception') updatePerception(msg);
+    };
+
+    wsVision.onerror = () => log('[vision ws] error');
+
+  } catch(e) {
+    setStatus(`<strong style="color:var(--warn)">Camera access denied:</strong> ${e.message} (continuing audio-only)`);
+    document.getElementById('camera-feed').style.border = '1px dashed #333';
+  }
+}
+
+function stopCamera() {
+  clearInterval(cameraInterval);
+  wsVision?.close();
+  cameraStream?.getTracks().forEach(t => t.stop());
+  document.getElementById('camera-feed').srcObject = null;
+  document.getElementById('speaker-chips').innerHTML =
+    `<span style="font-size:11px;color:var(--text-muted)">Camera inactive</span>`;
+}
+
+// ── TTS relay WebSocket ───────────────────────────────────────────────────────
+function startTtsRelay(sid) {
+  wsTts = new WebSocket(`ws://${location.host}/ws/tts?session_id=${sid}`);
+  wsTts.onmessage = ev => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === 'speak') speak(msg.text);
+  };
+}
+
+// ── Audio pipeline ────────────────────────────────────────────────────────────
+function setupAudioPipeline() {
+  const source = audioCtx.createMediaStreamSource(mediaStream);
+  scriptNode   = audioCtx.createScriptProcessor(SCRIPT_BUF, 1, 1);
+  accumBuffer  = new Float32Array(SAMPLES_PER_CHUNK);
+  accumOffset  = 0;
+
+  scriptNode.onaudioprocess = e => {
+    const input = e.inputBuffer.getChannelData(0);
+
+    // Waveform (downsample to 128)
+    const step = Math.floor(input.length / 128);
+    for (let i = 0; i < 128; i++) waveData[i] = input[i * step];
+
+    // VU meter
+    let ss = 0; for (let i = 0; i < input.length; i++) ss += input[i]*input[i];
+    document.getElementById('vu-fill').style.width = Math.min(100, Math.sqrt(ss/input.length)*800) + '%';
+
+    // Accumulate and send 500ms chunks
+    let src = 0;
+    while (src < input.length) {
+      const space  = SAMPLES_PER_CHUNK - accumOffset;
+      const toCopy = Math.min(space, input.length - src);
+      accumBuffer.set(input.subarray(src, src + toCopy), accumOffset);
+      accumOffset += toCopy; src += toCopy;
+      if (accumOffset >= SAMPLES_PER_CHUNK) {
+        if (ws && ws.readyState === WebSocket.OPEN) ws.send(accumBuffer.buffer.slice(0));
+        accumBuffer = new Float32Array(SAMPLES_PER_CHUNK);
+        accumOffset = 0;
+      }
+    }
+  };
+
+  const mute = audioCtx.createGain(); mute.gain.value = 0;
+  source.connect(scriptNode);
+  scriptNode.connect(mute);
+  mute.connect(audioCtx.destination);
+}
+
+// ── Load client config from server ───────────────────────────────────────────
+async function fetchClientConfig() {
+  try {
+    const res = await fetch('/config/client');
+    const data = await res.json();
+    CAMERA_FPS     = data.camera_fps     ?? CAMERA_FPS;
+    CAMERA_QUALITY = data.camera_quality ?? CAMERA_QUALITY;
+    TTS_HIDE_MS    = data.tts_auto_hide_ms ?? TTS_HIDE_MS;
+  } catch(e) {
+    log('Could not fetch /config/client — using defaults.');
+  }
+}
+fetchClientConfig();
+
+// ── Session lifecycle ─────────────────────────────────────────────────────────
+async function startSession() {
   if (isRecording) return;
 
+  // Mic
   try {
     mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
   } catch(e) {
@@ -562,112 +701,55 @@ async function startRecording() {
     return;
   }
 
-  // FIX 3: Create AudioContext AFTER getUserMedia resolves (Chrome autoplay policy).
-  // Explicitly request 16kHz so no resampling is needed between browser and server.
   audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
   await audioCtx.resume();
 
-  ws = new WebSocket(WS_URL);
+  // ASR WebSocket
+  ws = new WebSocket(`ws://${location.host}/ws/asr`);
   ws.binaryType = 'arraybuffer';
 
   ws.onopen = () => {
     setStatus('Connected — <strong style="color:var(--accent)">streaming</strong>');
     document.getElementById('btn-start').disabled = true;
-    document.getElementById('btn-stop').disabled = false;
+    document.getElementById('btn-stop').disabled  = false;
     document.getElementById('live-badge').style.display = 'inline-flex';
     isRecording = true;
     setupAudioPipeline();
   };
 
-  ws.onmessage = (ev) => {
+  ws.onmessage = ev => {
     const msg = JSON.parse(ev.data);
     if (msg.type === 'session') {
-      document.getElementById('session-display').textContent = msg.session_id;
+      sessionId = msg.session_id;
+      document.getElementById('session-display').textContent = sessionId;
+      // Start camera + TTS relay now that we have a session ID
+      startCamera(sessionId);
+      startTtsRelay(sessionId);
     } else if (msg.type === 'transcript') {
       addSegment(msg);
+    } else if (msg.type === 'agent_reply') {
+      showAgentReply(msg.text, msg.mode);
     } else if (msg.type === 'listening') {
-      showInterim();
+      showInterim(msg.mode);
     } else if (msg.type === 'error') {
       setStatus(`<strong style="color:var(--warn)">Server error:</strong> ${msg.message}`);
     }
   };
 
-  ws.onclose = () => {
-    setStatus('Disconnected');
-    isRecording = false;
-    document.getElementById('live-badge').style.display = 'none';
-  };
-
-  ws.onerror = () => {
-    setStatus('<strong style="color:var(--warn)">WebSocket error</strong> — is the server running?');
-  };
+  ws.onclose  = () => { setStatus('Disconnected'); isRecording = false; document.getElementById('live-badge').style.display = 'none'; };
+  ws.onerror  = () => { setStatus('<strong style="color:var(--warn)">WebSocket error</strong> — is the server running?'); };
 }
 
-function setupAudioPipeline() {
-  const source = audioCtx.createMediaStreamSource(mediaStream);
-
-  // FIX 1 (applied): Use a valid power-of-2 buffer size.
-  // onaudioprocess fires every 4096/16000 = ~256ms.
-  // We accumulate two callbacks (~512ms ≈ CHUNK_MS) then send.
-  scriptNode = audioCtx.createScriptProcessor(SCRIPT_BUFFER_SIZE, 1, 1);
-
-  // Reset accumulator on each new session
-  accumBuffer = new Float32Array(SAMPLES_PER_CHUNK);
-  accumOffset = 0;
-
-  scriptNode.onaudioprocess = (e) => {
-    const input = e.inputBuffer.getChannelData(0);
-
-    // Update waveform viz (use the raw 4096-sample callback directly)
-    // Downsample to 128 points for the canvas
-    const step = Math.floor(input.length / 128);
-    for (let i = 0; i < 128; i++) waveData[i] = input[i * step];
-
-    // VU meter
-    let sumSq = 0;
-    for (let i = 0; i < input.length; i++) sumSq += input[i] * input[i];
-    const rms = Math.sqrt(sumSq / input.length);
-    document.getElementById('vu-fill').style.width = Math.min(100, rms * 800) + '%';
-
-    // FIX 2 (applied): Accumulate samples into a 500ms buffer before sending.
-    let srcOffset = 0;
-    while (srcOffset < input.length) {
-      const space = SAMPLES_PER_CHUNK - accumOffset;
-      const toCopy = Math.min(space, input.length - srcOffset);
-      accumBuffer.set(input.subarray(srcOffset, srcOffset + toCopy), accumOffset);
-      accumOffset += toCopy;
-      srcOffset  += toCopy;
-
-      if (accumOffset >= SAMPLES_PER_CHUNK) {
-        // We have a full 500ms chunk — send it
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(accumBuffer.buffer.slice(0));
-        }
-        // Reset for next chunk
-        accumBuffer = new Float32Array(SAMPLES_PER_CHUNK);
-        accumOffset = 0;
-      }
-    }
-  };
-
-  // FIX 4: scriptNode MUST be connected to destination to fire in Chrome/Firefox.
-  // The output goes nowhere audible (we create a GainNode at 0 to avoid echo).
-  const silentGain = audioCtx.createGain();
-  silentGain.gain.value = 0;
-  source.connect(scriptNode);
-  scriptNode.connect(silentGain);
-  silentGain.connect(audioCtx.destination);
-}
-
-function stopRecording() {
+function stopSession() {
   isRecording = false;
   scriptNode?.disconnect();
   mediaStream?.getTracks().forEach(t => t.stop());
-  ws?.close();
+  ws?.close(); wsTts?.close();
   audioCtx?.close();
+  stopCamera();
   accumOffset = 0;
   document.getElementById('btn-start').disabled = false;
-  document.getElementById('btn-stop').disabled = true;
+  document.getElementById('btn-stop').disabled  = true;
   document.getElementById('live-badge').style.display = 'none';
   document.getElementById('vu-fill').style.width = '0%';
   document.getElementById('interim-row')?.remove();
@@ -677,17 +759,22 @@ function stopRecording() {
 function clearSession() {
   document.getElementById('transcript-panel').innerHTML =
     `<div class="empty-state" id="empty-state">
-      <span class="big">▶ Ready</span>
-      Press <strong>Start Recording</strong> to begin streaming transcription.<br>
-      Segments will appear here tagged by speaker and written to the LKC.
-    </div>`;
+       <span class="big">▶ Ready</span>
+       Press <strong>Start</strong> to begin. Camera + mic will be requested.<br>
+       Lab Brain will greet, capture, and answer in real time.
+     </div>`;
   document.getElementById('lkc-entries').innerHTML =
-    `<div style="font-size:11px;color:var(--text-muted)">No entries yet — start recording.</div>`;
-  segmentCount = 0; latencies = []; wordCount = 0; lastLang = '—';
+    `<div style="font-size:11px;color:var(--text-muted)">No entries yet.</div>`;
+  segCount = 0; latencies = []; wordCount = 0; lastLang = '—';
+  agentReplies = 0; visFrames = 0; visLatencies = []; e2eLatencies = [];
   document.getElementById('session-display').textContent = '—';
+  setMode('ambient');
   fetch('/lkc', { method: 'DELETE' });
   updateStats();
 }
+
+// stub for inline console calls during dev
+function log(msg) { console.log('[LabBrain]', msg); }
 </script>
 </body>
 </html>
