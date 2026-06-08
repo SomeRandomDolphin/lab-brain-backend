@@ -1,10 +1,12 @@
 {
   "_comment": "Lab Brain — Module 5 configuration. Edit this file, then restart the server.",
 
-  "gemini": {
-    "api_key": "",
-    "vision_model":   "gemini-2.0-flash",
-    "dialogue_model": "gemini-2.0-flash"
+  "local_llm": {
+    "_comment": "OpenAI-compatible local server (e.g. Ollama). Set base_url to your server address.",
+    "base_url":      "http://localhost:11434/v1",
+    "api_key":       "ollama",
+    "vision_model":  "llava:7b",
+    "dialogue_model": "llama3.2:3b"
   },
 
   "whisper": {

@@ -8,8 +8,8 @@ hardcoding constants directly.
 Usage:
     from config import cfg
 
-    cfg.gemini.api_key
-    cfg.whisper.model_size
+    cfg.local_llm.base_url
+    cfg.local_llm.vision_model
     cfg.vad.silence_threshold
     ...
 """
@@ -30,14 +30,16 @@ CONFIG_PATH = Path(__file__).parent / "config.json"
 # ── Typed sub-configs ─────────────────────────────────────────────────────────
 
 @dataclass
-class GeminiConfig:
-    api_key:       str = ""
-    vision_model:  str = "gemini-2.0-flash"
-    dialogue_model:str = "gemini-2.0-flash"
+class LocalLLMConfig:
+    base_url:       str = "http://localhost:11434/v1"
+    api_key:        str = "ollama"          # Ollama ignores this; other servers may need it
+    vision_model:   str = "llava:7b"        # must support image inputs
+    dialogue_model: str = "llama3.2:3b"    # text-only chat model
 
     @property
     def available(self) -> bool:
-        return bool(self.api_key) and self.api_key != "YOUR_GEMINI_API_KEY_HERE"
+        """Always true — no remote API key required for a local server."""
+        return True
 
 
 @dataclass
@@ -86,8 +88,8 @@ class DialogueConfig:
 
 @dataclass
 class Config:
-    gemini:   GeminiConfig   = field(default_factory=GeminiConfig)
-    whisper:  WhisperConfig  = field(default_factory=WhisperConfig)
+    local_llm: LocalLLMConfig = field(default_factory=LocalLLMConfig)
+    whisper:  WhisperConfig   = field(default_factory=WhisperConfig)
     vad:      VadConfig      = field(default_factory=VadConfig)
     vision:   VisionConfig   = field(default_factory=VisionConfig)
     lkc:      LkcConfig      = field(default_factory=LkcConfig)
@@ -119,7 +121,7 @@ def load(path: Path = CONFIG_PATH) -> Config:
 
     c = Config()
     section_map = {
-        "gemini":   c.gemini,
+        "local_llm": c.local_llm,
         "whisper":  c.whisper,
         "vad":      c.vad,
         "vision":   c.vision,
@@ -131,13 +133,10 @@ def load(path: Path = CONFIG_PATH) -> Config:
         if section in raw:
             _apply(obj, raw[section])
 
-    if not c.gemini.available:
-        log.warning(
-            "Gemini API key not set in config.json — "
-            "vision and dialogue will run in stub mode."
-        )
+    if not c.local_llm.available:
+        log.warning("Local LLM base_url not set — vision and dialogue will run in stub mode.")
     else:
-        log.info("Config loaded. Gemini enabled.")
+        log.info(f"Config loaded. Local LLM endpoint: {c.local_llm.base_url}")
 
     return c
 

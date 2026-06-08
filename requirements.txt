@@ -10,9 +10,8 @@ numpy>=1.26.0
 
 # ── Month 2 additions ─────────────────────────────────────────────────────────
 
-# Gemini 2.0 Flash — VLM perception (vision.py) + dialogue agent (dialogue.py)
-# Set GEMINI_API_KEY env var before running. Without it, vision runs in stub mode.
-google-generativeai>=0.8.0
+# OpenAI-compatible client — talks to any local server (Ollama, LM Studio, llama.cpp, vLLM…)
+openai>=1.30.0
 
 # LKC retrieval — TF-IDF index over lkc_stream.jsonl (lkc_retrieval.py)
 scikit-learn>=1.4.0

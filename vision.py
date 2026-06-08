@@ -2,21 +2,21 @@
 vision.py — VLM Perception Layer (Module 5, Month 2)
 
 Receives JPEG frames from the browser camera WebSocket, sends them to
-Gemini Flash for structured scene understanding, and returns:
+a locally hosted vision model via an OpenAI-compatible API, and returns:
   - present_speakers: list of detected person labels (face-ID placeholder)
   - engagement_cues:  per-speaker attention/engagement estimate
   - scene_summary:    one-sentence description for the LKC
 
 Design notes
 ------------
-* We use Gemini 2.0 Flash (gemini-2.0-flash) via the google-generativeai SDK.
-  It accepts inline base64 image parts so no file upload is needed.
+* Uses the openai Python package pointed at a local server (e.g. Ollama,
+  LM Studio, llama.cpp server, vLLM). Configure base_url and vision_model
+  in config.json under the "local_llm" section.
 * Frame analysis runs at ~1 FPS (controlled by the caller); results are cached
   so the ASR path can read the latest perception state without waiting.
 * Face recognition is deliberately kept as a label ("Person A/B/C") rather
   than biometric identification — privacy gating is a Month 3 concern.
-* The Gemini API key is read from config.json (gemini.api_key).
-  Without it, vision runs in stub mode — no export or env var needed.
+* Without a reachable local server, vision runs in stub mode automatically.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -33,20 +34,21 @@ from config import cfg
 
 log = logging.getLogger(__name__)
 
-# ── Gemini SDK ────────────────────────────────────────────────────────────────
+# ── OpenAI-compatible local client ────────────────────────────────────────────
 try:
-    import google.generativeai as genai
-    if cfg.gemini.available:
-        genai.configure(api_key=cfg.gemini.api_key)
-        _vision_model = genai.GenerativeModel(cfg.gemini.vision_model)
-        GEMINI_AVAILABLE = True
-        log.info(f"Gemini vision model ready ({cfg.gemini.vision_model}).")
-    else:
-        GEMINI_AVAILABLE = False
-        log.warning("Gemini API key not configured — vision stub mode active.")
+    from openai import OpenAI
+    _client = OpenAI(
+        base_url=cfg.local_llm.base_url,
+        api_key=cfg.local_llm.api_key,
+    )
+    LOCAL_LLM_AVAILABLE = True
+    log.info(f"Local vision model ready ({cfg.local_llm.vision_model} @ {cfg.local_llm.base_url}).")
 except ImportError:
-    GEMINI_AVAILABLE = False
-    log.warning("google-generativeai not installed — vision stub mode active.")
+    LOCAL_LLM_AVAILABLE = False
+    log.warning("openai package not installed — vision stub mode active.")
+except Exception as exc:
+    LOCAL_LLM_AVAILABLE = False
+    log.warning(f"Could not initialise local LLM client: {exc} — vision stub mode active.")
 
 # ── Perception state shared across the session ───────────────────────────────
 @dataclass
@@ -69,27 +71,67 @@ def get_state(session_id: str) -> PerceptionState:
 def clear_state(session_id: str) -> None:
     _states.pop(session_id, None)
 
+# Backwards-compatible alias used by server.py
+GEMINI_AVAILABLE = LOCAL_LLM_AVAILABLE
+
+
+# ── JSON extraction (robust, handles common LLM formatting quirks) ────────────
+def _extract_json(session_id: str, raw: str) -> dict:
+    """
+    Try increasingly lenient strategies to pull a valid JSON object out of
+    whatever the vision model returned. Strategies in order:
+
+    1. Direct parse — model followed instructions perfectly.
+    2. Strip markdown fences (```json ... ``` or ``` ... ```).
+    3. Regex: grab the first {...} block anywhere in the text.
+    4. Fallback: return a safe empty-room default and log the raw text.
+    """
+    # Strategy 1 — direct
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 2 — strip markdown fences
+    cleaned = re.sub(r"```(?:json)?", "", raw, flags=re.IGNORECASE).replace("```", "").strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 3 — extract first {...} block (handles preamble/postamble prose)
+    m = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group())
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 4 — give up gracefully
+    log.warning(
+        f"[vision:{session_id}] could not parse model output as JSON; "
+        f"raw={raw[:200]!r}"
+    )
+    return {
+        "present_speakers": [],
+        "engagement_cues": {},
+        "scene_summary": "Unknown — could not parse model response.",
+    }
+
 
 # ── Prompt ────────────────────────────────────────────────────────────────────
 _VISION_PROMPT = """
-You are a meeting-room perception agent. Analyse this camera frame and respond
-with ONLY a JSON object — no prose, no markdown fences — with exactly these keys:
+Analyse this camera frame. Reply with ONLY a raw JSON object — no markdown, no code fences, no comments, no trailing commas, no explanation.
 
-{
-  "present_speakers": ["Person A", "Person B"],   // list of visible people; use
-                                                   // consistent labels across frames
-  "engagement_cues": {                             // one of: focused | distracted |
-    "Person A": "focused",                         //         away | unknown
-    "Person B": "distracted"
-  },
-  "scene_summary": "Two people at a whiteboard, one writing."  // ≤15 words
-}
+Example of the exact format required:
+{"present_speakers":["Person A"],"engagement_cues":{"Person A":"focused"},"scene_summary":"One person at a desk looking at a monitor."}
 
 Rules:
-- If no people are visible, return empty lists/dict and summary "Empty room."
-- Use the same person labels (Person A, B, …) consistently within a session.
-- Do NOT include names, biometric data, or emotion diagnoses.
-- Respond with valid JSON only.
+- present_speakers: array of visible person labels. Use "Person A", "Person B", etc. Empty array if nobody visible.
+- engagement_cues: object mapping each label to one of: focused | distracted | away | unknown
+- scene_summary: one plain sentence, 15 words max. Use "Empty room." if nobody is present.
+- No names, no biometric data, no emotion diagnoses.
+- Output ONLY the JSON. Nothing before or after it.
 """.strip()
 
 
@@ -106,36 +148,42 @@ async def analyse_frame(
     state = get_state(session_id)
     state.frame_count += 1
 
-    if not GEMINI_AVAILABLE:
+    if not LOCAL_LLM_AVAILABLE:
         # Stub: return a plausible fake so the rest of the system keeps working
         state.present_speakers = ["Person A"]
         state.engagement_cues = {"Person A": "focused"}
-        state.scene_summary = "[Vision stub — set api_key in config.json to enable]"
+        state.scene_summary = "[Vision stub — install openai package and configure local_llm in config.json]"
         state.last_updated = time.time()
         return state
 
     b64 = base64.b64encode(jpeg_bytes).decode()
-    image_part = {"mime_type": "image/jpeg", "data": b64}
 
     loop = asyncio.get_event_loop()
     try:
         response = await loop.run_in_executor(
             None,
-            lambda: _vision_model.generate_content(
-                [_VISION_PROMPT, image_part],
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.1,
-                    max_output_tokens=256,
-                ),
+            lambda: _client.chat.completions.create(
+                model=cfg.local_llm.vision_model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{b64}"
+                                },
+                            },
+                            {"type": "text", "text": _VISION_PROMPT},
+                        ],
+                    }
+                ],
+                max_tokens=300,
+                temperature=0.0,
             )
         )
-        raw = response.text.strip()
-        # Strip accidental markdown fences
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        parsed = json.loads(raw)
+        raw = response.choices[0].message.content.strip()
+        parsed = _extract_json(session_id, raw)
 
         state.present_speakers = parsed.get("present_speakers", [])
         state.engagement_cues  = parsed.get("engagement_cues", {})

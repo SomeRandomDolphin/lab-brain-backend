@@ -36,25 +36,23 @@ from config import cfg
 
 log = logging.getLogger(__name__)
 
-# ── Gemini for dialogue ───────────────────────────────────────────────────────
+# ── OpenAI-compatible local client for dialogue ───────────────────────────────
 try:
-    import google.generativeai as genai
-    if cfg.gemini.available:
-        genai.configure(api_key=cfg.gemini.api_key)
-        _chat_model = genai.GenerativeModel(
-            cfg.gemini.dialogue_model,
-            system_instruction=(
-                "You are Lab Brain, a helpful AI assistant embedded in a research "
-                "laboratory meeting room. You are concise (≤2 sentences), professional, "
-                "and always grounded in the lab context provided. Never hallucinate "
-                "citations or project details."
-            ),
-        )
-        GEMINI_AVAILABLE = True
-    else:
-        GEMINI_AVAILABLE = False
+    from openai import OpenAI
+    _dialogue_client = OpenAI(
+        base_url=cfg.local_llm.base_url,
+        api_key=cfg.local_llm.api_key,
+    )
+    LOCAL_LLM_AVAILABLE = True
 except ImportError:
-    GEMINI_AVAILABLE = False
+    LOCAL_LLM_AVAILABLE = False
+
+_SYSTEM_PROMPT = (
+    "You are Lab Brain, a helpful AI assistant embedded in a research "
+    "laboratory meeting room. You are concise (≤2 sentences), professional, "
+    "and always grounded in the lab context provided. Never hallucinate "
+    "citations or project details."
+)
 
 
 # ── Mode enum ─────────────────────────────────────────────────────────────────
@@ -83,9 +81,9 @@ class DialogueState:
     mode: ConvMode = ConvMode.AMBIENT
     mode_entered_at: float = field(default_factory=time.time)
     greeted_speakers: set[str] = field(default_factory=set)
-    # Gemini multi-turn chat handle (one per session)
-    _chat: object = field(default=None, repr=False)
-    # Rolling context window sent to Gemini (last N transcript lines)
+    # Rolling message history for the local LLM (list of {role, content} dicts)
+    _chat_history: list = field(default_factory=list, repr=False)
+    # Rolling context window sent to the LLM (last N transcript lines)
     transcript_context: list[str] = field(default_factory=list)
     CONTEXT_WINDOW: int = field(default_factory=lambda: cfg.dialogue.context_window)
 
@@ -97,10 +95,8 @@ class DialogueState:
     def context_block(self) -> str:
         return "\n".join(self.transcript_context)
 
-    def get_chat(self):
-        if self._chat is None and GEMINI_AVAILABLE:
-            self._chat = _chat_model.start_chat(history=[])
-        return self._chat
+    def get_chat_history(self) -> list:
+        return self._chat_history
 
 
 _dialogue_states: dict[str, DialogueState] = {}
@@ -181,8 +177,8 @@ async def generate_response(
         return None
 
     if state.mode in (ConvMode.QA, ConvMode.GREETING):
-        if not GEMINI_AVAILABLE:
-            return "[Gemini not configured — set api_key in config.json for agent replies]"
+        if not LOCAL_LLM_AVAILABLE:
+            return "[Local LLM not available — install the openai package and configure local_llm in config.json]"
 
         # Build grounded prompt
         context_lines = state.context_block()
@@ -191,23 +187,37 @@ async def generate_response(
             if lkc_context.strip()
             else ""
         )
-        prompt = (
+        user_message = (
             f"Recent conversation:\n{context_lines}"
             f"{lkc_section}\n\n"
             f"The speaker just said: \"{transcript}\"\n"
             f"Respond as Lab Brain in ≤2 sentences."
         )
 
+        history = state.get_chat_history()
+        history.append({"role": "user", "content": user_message})
+
         loop = asyncio.get_event_loop()
         try:
-            chat = state.get_chat()
             response = await loop.run_in_executor(
                 None,
-                lambda: chat.send_message(prompt)
+                lambda: _dialogue_client.chat.completions.create(
+                    model=cfg.local_llm.dialogue_model,
+                    messages=[{"role": "system", "content": _SYSTEM_PROMPT}] + history,
+                    max_tokens=120,
+                    temperature=0.4,
+                )
             )
-            return response.text.strip()
+            reply = response.choices[0].message.content.strip()
+            # Keep assistant turn in history for multi-turn context
+            history.append({"role": "assistant", "content": reply})
+            # Trim history to avoid unbounded growth (keep last 2*CONTEXT_WINDOW turns)
+            max_turns = state.CONTEXT_WINDOW * 2
+            if len(history) > max_turns:
+                state._chat_history = history[-max_turns:]
+            return reply
         except Exception as exc:
-            log.warning(f"[dialogue:{state.session_id}] Gemini error: {exc}")
+            log.warning(f"[dialogue:{state.session_id}] Local LLM error: {exc}")
             return None
 
     return None
