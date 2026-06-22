@@ -1,10 +1,16 @@
 """
-eval_metrics.py — Evaluation Metrics (Module 5, Month 2)
+eval_metrics.py — Evaluation Metrics (Module 5, Month 3)
 
-Tracks the three evaluation axes specified in the research plan:
+Tracks the evaluation axes specified in the research plan:
   1. Transcription accuracy  — WER against user-supplied reference (optional)
   2. Recognition reliability — vision hit/miss/error rates across frames
   3. Latency                 — ASR p50/p95, vision p50/p95, end-to-end
+
+Month 3 additions:
+  4. Capture quality         — action item / decision tag counts per session
+  5. Environment coverage    — how often a valid environment_state is received
+  6. Confirmation resolution — ratio of agent confirmations accepted vs denied
+  7. Privacy compliance      — count of redacted PII tokens per session
 
 All metrics are accumulated in-memory and exposed via /metrics JSON endpoint.
 A CSV export endpoint (/metrics/csv) is also provided for thesis reporting.
@@ -76,6 +82,23 @@ class SessionMetrics:
     # Segment count
     segment_count: int = 0
 
+    # Month 3: Autonomous capture quality
+    tag_action_items_count: int = 0
+    tag_decisions_count:    int = 0
+    tag_deadlines_count:    int = 0
+
+    # Month 3: Environment coverage (frames that returned a valid env state)
+    env_frames_valid:   int = 0
+    env_frames_invalid: int = 0
+
+    # Month 3: Confirmation loop resolution
+    confirmations_sent:     int = 0
+    confirmations_accepted: int = 0
+    confirmations_denied:   int = 0
+
+    # Month 3: Privacy — PII tokens redacted
+    pii_tokens_redacted: int = 0
+
     def record_asr(self, latency_ms: float) -> None:
         self.asr_latencies.append(latency_ms)
         self.segment_count += 1
@@ -103,6 +126,27 @@ class SessionMetrics:
         self.mode_dwell[self._current_mode] += now - self._mode_last_switch
         self._mode_last_switch = now
         self._current_mode = new_mode
+
+    # Month 3 record helpers ──────────────────────────────────────────────────
+    def record_tags(self, tags: dict) -> None:
+        """Called by server.py after capture.process_segment writes a record."""
+        self.tag_action_items_count += len(tags.get("action_items", []))
+        self.tag_decisions_count    += len(tags.get("decisions",    []))
+        self.tag_deadlines_count    += len(tags.get("deadlines",    []))
+
+    def record_environment(self, valid: bool) -> None:
+        if valid:
+            self.env_frames_valid   += 1
+        else:
+            self.env_frames_invalid += 1
+
+    def record_confirmation(self, sent: bool = False, accepted: bool = False, denied: bool = False) -> None:
+        if sent:     self.confirmations_sent     += 1
+        if accepted: self.confirmations_accepted += 1
+        if denied:   self.confirmations_denied   += 1
+
+    def record_pii_redaction(self, token_count: int) -> None:
+        self.pii_tokens_redacted += token_count
 
     # ── Derived stats ──────────────────────────────────────────────────────────
     @staticmethod
@@ -156,6 +200,30 @@ class SessionMetrics:
                 "p95_ms": self._percentile(self.e2e_latencies, 0.95),
             },
             "mode_dwell_s": {k: round(v, 1) for k, v in dwell.items()},
+            # Month 3
+            "capture": {
+                "action_items": self.tag_action_items_count,
+                "decisions":    self.tag_decisions_count,
+                "deadlines":    self.tag_deadlines_count,
+            },
+            "environment": {
+                "valid_frames":   self.env_frames_valid,
+                "invalid_frames": self.env_frames_invalid,
+                "coverage":       round(
+                    self.env_frames_valid / max(self.env_frames_valid + self.env_frames_invalid, 1), 3
+                ),
+            },
+            "confirmations": {
+                "sent":     self.confirmations_sent,
+                "accepted": self.confirmations_accepted,
+                "denied":   self.confirmations_denied,
+                "accept_rate": round(
+                    self.confirmations_accepted / max(self.confirmations_sent, 1), 3
+                ) if self.confirmations_sent else None,
+            },
+            "privacy": {
+                "pii_tokens_redacted": self.pii_tokens_redacted,
+            },
         }
 
     def to_csv_rows(self) -> list[dict]:

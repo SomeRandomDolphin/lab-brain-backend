@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Lab Brain — Module 5 Month 2</title>
+<title>Lab Brain — Module 5 Month 3</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Syne:wght@400;700;800&display=swap" rel="stylesheet">
 <style>
@@ -287,7 +287,7 @@ main {
 <header>
   <div class="logo">Lab Brain <span>/ M5·M2</span></div>
   <div class="badge">Module 5</div>
-  <div class="badge">Month 2</div>
+  <div class="badge">Month 3</div>
   <div id="live-badge" class="badge live" style="display:none">live</div>
   <div id="mode-pill" class="mode-pill ambient">ambient</div>
   <div class="session-id">session: <strong id="session-display">—</strong></div>
@@ -362,6 +362,50 @@ main {
       <div class="eval-row"><span>E2E p50</span><span class="ev-val" id="ev-e2e">— ms</span></div>
       <div class="eval-row"><span>Reliability</span><span class="ev-val" id="ev-rel">—</span></div>
       <div class="eval-row"><span>Agent replies</span><span class="ev-val" id="ev-agent">0</span></div>
+    </div>
+  </div>
+
+  <!-- Month 3: Environment state (Physical AI) -->
+  <div>
+    <div class="panel-title">Environment</div>
+    <div id="env-panel" style="font-size:12px;line-height:1.8">
+      <div><span style="color:var(--text-muted)">Layout</span>&ensp;<strong id="env-layout">—</strong></div>
+      <div><span style="color:var(--text-muted)">Lighting</span>&ensp;<strong id="env-lighting">—</strong></div>
+      <div><span style="color:var(--text-muted)">Ambient</span>&ensp;<strong id="env-ambient">—</strong></div>
+      <div style="margin-top:4px;color:var(--text-muted);font-size:11px" id="env-objects">Objects: —</div>
+    </div>
+  </div>
+
+  <!-- Month 3: Autonomous capture — action items & decisions -->
+  <div>
+    <div class="panel-title" style="display:flex;justify-content:space-between;align-items:center">
+      Captured Tags
+      <button onclick="fetchTags()" style="font-size:10px;padding:2px 6px;border:1px solid var(--border);background:transparent;color:var(--text-muted);border-radius:4px;cursor:pointer">refresh</button>
+    </div>
+    <div id="tags-panel" style="font-size:11px;line-height:1.7;max-height:140px;overflow-y:auto">
+      <div style="color:var(--text-muted)">No tags yet.</div>
+    </div>
+  </div>
+
+  <!-- Month 3: Privacy / Consent -->
+  <div>
+    <div class="panel-title">Privacy &amp; Consent</div>
+    <div style="font-size:11px;display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px" id="consent-chips"></div>
+    <div style="display:flex;gap:4px">
+      <input id="consent-speaker" placeholder="Person A" style="width:72px;font-size:11px;padding:3px 5px;border:1px solid var(--border);background:var(--bg-input,#1e1e2a);color:inherit;border-radius:4px">
+      <button onclick="grantConsent(true)"  style="font-size:10px;padding:3px 7px;background:#22c55e22;border:1px solid #22c55e55;color:#22c55e;border-radius:4px;cursor:pointer">✓ Allow</button>
+      <button onclick="grantConsent(false)" style="font-size:10px;padding:3px 7px;background:#ef444422;border:1px solid #ef444455;color:#ef4444;border-radius:4px;cursor:pointer">✗ Deny</button>
+    </div>
+  </div>
+
+  <!-- Month 3: End-of-session summary -->
+  <div>
+    <div class="panel-title" style="display:flex;justify-content:space-between;align-items:center">
+      Session Summary
+      <button id="btn-summary" onclick="requestSummary()" style="font-size:10px;padding:2px 8px;border:1px solid var(--accent,#7c6ef5);background:transparent;color:var(--accent,#7c6ef5);border-radius:4px;cursor:pointer">generate</button>
+    </div>
+    <div id="summary-panel" style="font-size:11px;color:var(--text-muted);line-height:1.6;max-height:180px;overflow-y:auto;white-space:pre-wrap">
+      No summary yet — click generate after the session ends.
     </div>
   </div>
 
@@ -607,7 +651,10 @@ async function startCamera(sid) {
 
     wsVision.onmessage = ev => {
       const msg = JSON.parse(ev.data);
-      if (msg.type === 'perception') updatePerception(msg);
+      if (msg.type === 'perception') {
+        updatePerception(msg);
+        if (msg.environment_state) updateEnvironment(msg.environment_state); // Month 3
+      }
     };
 
     wsVision.onerror = () => log('[vision ws] error');
@@ -721,12 +768,15 @@ async function startSession() {
     const msg = JSON.parse(ev.data);
     if (msg.type === 'session') {
       sessionId = msg.session_id;
+      _currentSession = sessionId;                          // Month 3
       document.getElementById('session-display').textContent = sessionId;
       // Start camera + TTS relay now that we have a session ID
       startCamera(sessionId);
       startTtsRelay(sessionId);
     } else if (msg.type === 'transcript') {
       addSegment(msg);
+      if (msg.environment) updateEnvironment(msg.environment); // Month 3
+      if (msg.tags)        maybeUpdateTags(msg.tags);          // Month 3
     } else if (msg.type === 'agent_reply') {
       showAgentReply(msg.text, msg.mode);
     } else if (msg.type === 'listening') {
@@ -765,6 +815,16 @@ function clearSession() {
      </div>`;
   document.getElementById('lkc-entries').innerHTML =
     `<div style="font-size:11px;color:var(--text-muted)">No entries yet.</div>`;
+  // Month 3: reset new panels
+  document.getElementById('tags-panel').innerHTML =
+    '<div style="color:var(--text-muted)">No tags yet.</div>';
+  document.getElementById('summary-panel').textContent =
+    'No summary yet — click generate after the session ends.';
+  document.getElementById('env-layout').textContent   = '—';
+  document.getElementById('env-lighting').textContent = '—';
+  document.getElementById('env-ambient').textContent  = '—';
+  document.getElementById('env-objects').textContent  = 'Objects: —';
+  _currentSession = null;
   segCount = 0; latencies = []; wordCount = 0; lastLang = '—';
   agentReplies = 0; visFrames = 0; visLatencies = []; e2eLatencies = [];
   document.getElementById('session-display').textContent = '—';
@@ -775,6 +835,125 @@ function clearSession() {
 
 // stub for inline console calls during dev
 function log(msg) { console.log('[LabBrain]', msg); }
+
+// ── Month 3: Environment state (Physical AI) ──────────────────────────────
+function updateEnvironment(env) {
+  if (!env) return;
+  const safe = v => v || '—';
+  document.getElementById('env-layout').textContent   = safe(env.layout);
+  document.getElementById('env-lighting').textContent = safe(env.lighting);
+  document.getElementById('env-ambient').textContent  = safe(env.ambient);
+  const objs = Array.isArray(env.objects) && env.objects.length
+    ? 'Objects: ' + env.objects.join(', ')
+    : 'Objects: —';
+  document.getElementById('env-objects').textContent = objs;
+}
+
+// ── Month 3: Captured tags panel ─────────────────────────────────────────
+let _currentSession = null;
+
+async function fetchTags() {
+  if (!_currentSession) return;
+  try {
+    const r = await fetch(`/capture/tags/${_currentSession}`);
+    const d = await r.json();
+    const panel = document.getElementById('tags-panel');
+    const lines = [];
+    (d.action_items || []).forEach(t =>
+      lines.push(`<div><span style="color:#f59e0b">⚡ Action</span>&ensp;${escHtml(t)}</div>`));
+    (d.decisions || []).forEach(t =>
+      lines.push(`<div><span style="color:#22c55e">✔ Decision</span>&ensp;${escHtml(t)}</div>`));
+    (d.deadlines || []).forEach(t =>
+      lines.push(`<div><span style="color:#f87171">📅 Deadline</span>&ensp;${escHtml(t)}</div>`));
+    if (d.entities && d.entities.length)
+      lines.push(`<div style="margin-top:4px;color:var(--text-muted);font-size:10px">Entities: ${escHtml(d.entities.join(', '))}</div>`);
+    panel.innerHTML = lines.length ? lines.join('') : '<div style="color:var(--text-muted)">No tags yet.</div>';
+  } catch(e) { console.warn('fetchTags error', e); }
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// Auto-refresh tags every 15 s when recording
+setInterval(() => { if (isRecording) fetchTags(); }, 15000);
+
+// Update tags panel when a segment arrives with action/decision tags
+function maybeUpdateTags(tags) {
+  if (!tags) return;
+  const hasTag = (tags.action_items && tags.action_items.length) ||
+                 (tags.decisions    && tags.decisions.length)    ||
+                 (tags.deadlines    && tags.deadlines.length);
+  if (hasTag) fetchTags();
+}
+
+// ── Month 3: Privacy / Consent ────────────────────────────────────────────
+async function grantConsent(allow) {
+  const speaker = document.getElementById('consent-speaker').value.trim();
+  if (!speaker) { alert('Enter a speaker label first (e.g. Person A)'); return; }
+  try {
+    await fetch('/privacy/consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ speaker, consented: allow })
+    });
+    renderConsentChips();
+  } catch(e) { console.warn('consent error', e); }
+}
+
+async function renderConsentChips() {
+  try {
+    const r = await fetch('/privacy/status');
+    const d = await r.json();
+    const chips = document.getElementById('consent-chips');
+    chips.innerHTML = Object.entries(d.registry || {}).map(([sp, info]) => {
+      const ok = info.consented;
+      const col = ok ? '#22c55e' : '#ef4444';
+      const sym = ok ? '✓' : '✗';
+      return `<span style="border:1px solid ${col};color:${col};border-radius:10px;padding:1px 7px;cursor:pointer"
+               title="click to toggle" onclick="toggleConsent('${escHtml(sp)}',${!ok})">
+               ${sym} ${escHtml(sp)}</span>`;
+    }).join('') || '<span style="color:var(--text-muted);font-size:10px">No consent records yet</span>';
+  } catch(e) {}
+}
+
+async function toggleConsent(speaker, allow) {
+  await fetch('/privacy/consent', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ speaker, consented: allow })
+  });
+  renderConsentChips();
+}
+
+renderConsentChips();
+setInterval(renderConsentChips, 30000);
+
+// ── Month 3: End-of-session summary ──────────────────────────────────────
+async function requestSummary() {
+  if (!_currentSession) { alert('Start a session first.'); return; }
+  const btn = document.getElementById('btn-summary');
+  const panel = document.getElementById('summary-panel');
+  btn.disabled = true;
+  btn.textContent = '…';
+  panel.textContent = 'Generating summary via local LLM…';
+  try {
+    const r = await fetch(`/summary/${_currentSession}`, { method: 'POST' });
+    const d = await r.json();
+    panel.textContent = d.summary || 'No summary returned.';
+  } catch(e) {
+    panel.textContent = 'Summary request failed: ' + e.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'generate';
+  }
+}
+
+// ── Month 3: Hook into existing onmessage / startSession ────────────────
+// Patch the ws onmessage to handle new fields (environment, tags).
+// This wraps the existing handler so the Month 2 logic is preserved.
+const _origStartSession = typeof startSession === 'function' ? startSession : null;
+
 </script>
 </body>
 </html>

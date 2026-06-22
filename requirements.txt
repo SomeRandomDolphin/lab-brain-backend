@@ -1,25 +1,47 @@
-# Module 5 Month 2 — Multimodal Conversational Agent
+# Module 5 Month 4 — Multimodal Conversational Agent
 # Install with: pip install -r requirements.txt
 
 # ── Month 1 (unchanged) ───────────────────────────────────────────────────────
 fastapi>=0.111.0
 uvicorn[standard]>=0.29.0
 websockets>=12.0
-faster-whisper>=1.0.0
 numpy>=1.26.0
 
-# ── Month 2 additions ─────────────────────────────────────────────────────────
-
-# OpenAI-compatible client — talks to any local server (Ollama, LM Studio, llama.cpp, vLLM…)
+# ── Month 2 (unchanged) ───────────────────────────────────────────────────────
+# OpenAI-compatible client — talks to Ollama, LM Studio, llama.cpp, vLLM…
 openai>=1.30.0
 
-# LKC retrieval — TF-IDF index over lkc_stream.jsonl (lkc_retrieval.py)
-scikit-learn>=1.4.0
-
-# Pydantic v2 is already a FastAPI dependency; listed here for clarity
+# Pydantic v2
 pydantic>=2.0.0
 
-# ── Month 3 (not needed yet) ──────────────────────────────────────────────────
-# pyannote.audio>=3.3   # real speaker diarization (replaces round-robin placeholder)
-# whisperx              # word-level timestamps + diarization alignment
-# sentence-transformers # dense embeddings for LKC retrieval upgrade
+# ── Month 3 (unchanged) ───────────────────────────────────────────────────────
+# Rifqi ingest: ISO timestamp parsing
+python-dateutil>=2.9.0
+
+# ── Month 4 additions ─────────────────────────────────────────────────────────
+
+# WhisperX — replaces faster-whisper; adds word-level timestamps + diarization
+# alignment on top of the same CTranslate2 backend.
+# GPU recommended; runs on CPU with compute_type=int8.
+whisperx>=3.1.5
+
+# Dense LKC retrieval — replaces TF-IDF; ~22 MB model downloaded on first use.
+# CPU-friendly; upgrade to a larger model (all-mpnet-base-v2) for Month 5.
+sentence-transformers>=3.0.0
+
+# Speaker diarization — pyannote/speaker-diarization-3.1.
+# Requires a Hugging Face token that has accepted the model licence:
+#   huggingface-cli login   (or set HF_TOKEN env var)
+# Comment out if GPU/RAM budget is tight; server falls back to round-robin.
+pyannote.audio>=3.3.2
+
+# PyTorch — required by both pyannote and sentence-transformers.
+# CPU-only build (saves ~1 GB); swap for a CUDA build if GPU is available.
+torch>=2.1.0
+
+# scikit-learn — kept as TF-IDF fallback for lkc_retrieval when
+# sentence-transformers is unavailable (e.g. resource-constrained laptops).
+scikit-learn>=1.4.0
+
+# ── Dev / evaluation ──────────────────────────────────────────────────────────
+# jiwer>=3.0.4       # standard WER — our pure-Python impl is used for PoC
