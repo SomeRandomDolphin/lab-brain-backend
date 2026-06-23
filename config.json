@@ -2,7 +2,8 @@
   "local_llm": {
     "base_url":       "http://localhost:11434/v1",
     "vision_model":   "llava:7b",
-    "dialogue_model": "llama3.2:3b"
+    "dialogue_model": "llama3.2:3b",
+    "hf_token":       "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"
   },
   "whisper": {
     "model_size":  "small",

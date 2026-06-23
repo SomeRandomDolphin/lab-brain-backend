@@ -35,6 +35,7 @@ class LocalLLMConfig:
     api_key:        str = "ollama"          # Ollama ignores this; other servers may need it
     vision_model:   str = "llava:7b"        # must support image inputs
     dialogue_model: str = "llama3.2:3b"    # text-only chat model
+    hf_token:       str = ""                # Hugging Face token for gated models (e.g. pyannote diarization)
 
     @property
     def available(self) -> bool:

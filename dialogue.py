@@ -73,7 +73,8 @@ def _get_diarization_pipeline() -> Optional["PyannotePipeline"]:
       • pyannote.audio >= 3.3.2  (see requirements.txt)
       • A Hugging Face token that has accepted the model terms:
           huggingface-cli login
-        OR set HF_TOKEN / HUGGINGFACE_TOKEN environment variable.
+        OR set `local_llm.hf_token` in config.json,
+        OR set the HF_TOKEN / HUGGINGFACE_TOKEN environment variable.
       • torch (CPU or CUDA — GPU recommended for real-time use)
 
     Returns None on any initialisation failure so the server degrades
@@ -92,7 +93,11 @@ def _get_diarization_pipeline() -> Optional["PyannotePipeline"]:
 
     try:
         import os
-        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+        hf_token = (
+            cfg.local_llm.hf_token
+            or os.environ.get("HF_TOKEN")
+            or os.environ.get("HUGGINGFACE_TOKEN")
+        )
         use_auth = {"use_auth_token": hf_token} if hf_token else {}
         pipeline = PyannotePipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
