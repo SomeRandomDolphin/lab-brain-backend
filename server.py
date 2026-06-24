@@ -71,6 +71,7 @@ import eval_metrics
 import capture
 import privacy
 import livekit_rooms                         # Month 6
+import supabase_store                        # Month 7
 from config import cfg
 from dialogue import ConvMode
 
@@ -250,6 +251,13 @@ async def livekit_create_room(req: RoomCreateRequest = None):
     # Start the backend subscriber task that drives the existing pipeline
     livekit_rooms.start_subscriber(session_id, _livekit_pipeline)
 
+    # Month 7: persist session to Supabase
+    supabase_store.upsert_session(
+        session_id=session_id,
+        host_identity=req.display_name,
+        started_at=time.time(),
+    )
+
     log.info(f"[server] LiveKit room created: {session_id} host={req.display_name}")
     return RoomCreateResponse(
         session_id=session_id,
@@ -301,6 +309,12 @@ async def livekit_delete_room(session_id: str):
     """
     await livekit_rooms.stop_subscriber(session_id)
     deleted = await livekit_rooms.delete_room(session_id)
+
+    # Month 7: mark session ended in Supabase, snapshot final metrics
+    ended_ts = time.time()
+    supabase_store.upsert_session(session_id=session_id, ended_at=ended_ts)
+    metrics_snap = eval_metrics.get_metrics(session_id).summary()
+    supabase_store.upsert_eval_metrics(session_id, metrics_snap)
 
     # Cleanup session state (mirrors what /ws/asr disconnect did in Month 5)
     vision.clear_state(session_id)
@@ -520,6 +534,25 @@ async def _livekit_pipeline(
         e2e = round((time.time() - request_received_at) * 1000)
         metrics.record_e2e(e2e)
 
+        # Month 7: persist transcript segment to Supabase
+        supabase_store.insert_transcript(
+            session_id=session_id,
+            speaker=speaker,
+            text=redacted_text,
+            language=detected_lang,
+            mode=new_mode.value,
+            timestamp_unix=seg_start,
+            timestamp_iso=record["timestamp_iso"],
+            tags=record.get("tags", {}),
+            word_timestamps=word_timestamps,
+            asr_latency_ms=asr_latency,
+            e2e_latency_ms=e2e,
+            segment_index=segment_index,
+        )
+        # Month 7: optionally upload raw audio segment to Supabase Storage
+        if cfg.supabase.store_audio:
+            supabase_store.upload_audio_segment(session_id, segment_index, segment_audio)
+
         log.info(
             f"[{session_id}] seg#{segment_index} "
             f"asr={asr_latency}ms e2e={e2e}ms [{detected_lang}] "
@@ -598,6 +631,17 @@ async def _livekit_pipeline(
                 state.engagement_cues,
                 state.environment_state,
             ))
+            # Month 7: persist vision frame to Supabase (gated by config flag)
+            if cfg.supabase.store_vision:
+                supabase_store.insert_vision_frame(
+                    session_id=session_id,
+                    timestamp_unix=time.time(),
+                    scene_summary=state.scene_summary,
+                    present_speakers=state.present_speakers,
+                    engagement_cues=state.engagement_cues,
+                    environment_state=state.environment_state,
+                    latency_ms=latency_ms,
+                )
 
         livekit_rooms.broadcast(session_id, {
             "type":              "perception",
@@ -652,11 +696,19 @@ async def _handle_qa_sse(session_id, dlg, full_text, retriever, metrics, mode):
             "mode":     mode.value,
             "grounded": bool(lkc_context.strip()),
         })
-        # Separate 'speak' event so the frontend TTS handler is unambiguous
         livekit_rooms.broadcast(session_id, {
             "type": "speak",
             "text": reply,
         })
+        # Month 7: persist agent reply to Supabase
+        supabase_store.insert_agent_reply(
+            session_id=session_id,
+            text=reply,
+            mode=mode.value,
+            timestamp_unix=ts,
+            grounded=bool(lkc_context.strip()),
+            lkc_context=lkc_context,
+        )
     capture.clear_summon(session_id)
 
 
@@ -806,7 +858,119 @@ async def post_summary(session_id: str):
         "summary":       summary_md,
         "tags":          tags,
     })
-    return {"session_id": session_id, "summary": summary_md}
+
+    # Month 7: persist summary + generate full report export in Supabase
+    supabase_store.upsert_session_summary(session_id, summary_md, tags)
+    transcript_rows = supabase_store.get_transcripts(session_id) or [
+        {"timestamp_iso": r.get("timestamp_iso",""), "speaker": r.get("speaker",""),
+         "text": r.get("text","")}
+        for r in records
+    ]
+    report_url = supabase_store.export_report(session_id, summary_md, tags, transcript_rows)
+
+    return {
+        "session_id": session_id,
+        "summary":    summary_md,
+        "report_url": report_url,   # Month 7: direct download link from Supabase Storage
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Month 7: Supabase REST endpoints
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/supabase/status")
+async def supabase_status():
+    """
+    Check Supabase connectivity and configuration.
+    Returns whether the client is reachable and which features are enabled.
+    """
+    return supabase_store.status()
+
+
+@app.get("/supabase/sessions")
+async def supabase_list_sessions(limit: int = Query(default=50, le=200)):
+    """
+    Return recent sessions from Supabase (richer than /lkc/sessions —
+    includes host identity, ended_at, and metadata).
+    Falls back to an empty list if Supabase is not configured.
+    """
+    return {"sessions": supabase_store.get_sessions(limit=limit)}
+
+
+@app.get("/supabase/sessions/{session_id}/transcripts")
+async def supabase_get_transcripts(
+    session_id: str,
+    limit: int = Query(default=500, le=2000),
+):
+    """Return all transcript segments for a session from Supabase."""
+    rows = supabase_store.get_transcripts(session_id, limit=limit)
+    return {"session_id": session_id, "count": len(rows), "transcripts": rows}
+
+
+@app.get("/supabase/sessions/{session_id}/summary")
+async def supabase_get_summary(session_id: str):
+    """
+    Return the persisted session summary from Supabase.
+    Useful for re-displaying a summary without re-running the LLM.
+    """
+    row = supabase_store.get_session_summary(session_id)
+    if row is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "No summary found. Run POST /summary/{session_id} first."},
+        )
+    return row
+
+
+@app.get("/supabase/sessions/{session_id}/report")
+async def supabase_get_report_url(session_id: str):
+    """Return the Supabase Storage public URL for the session report markdown."""
+    url = supabase_store.get_report_url(session_id)
+    if url is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "No report found. Run POST /summary/{session_id} first."},
+        )
+    return {"session_id": session_id, "report_url": url}
+
+
+@app.get("/supabase/sessions/{session_id}/audio/{segment_index}")
+async def supabase_get_audio_url(session_id: str, segment_index: int):
+    """
+    Return the Supabase Storage public URL for a raw audio segment.
+    Only available when store_audio=true in config.json.
+    """
+    if not cfg.supabase.store_audio:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Audio storage is disabled. Set store_audio=true in config.json."},
+        )
+    url = supabase_store.get_audio_segment_url(session_id, segment_index)
+    if url is None:
+        return JSONResponse(status_code=404, content={"error": "Segment not found."})
+    return {"session_id": session_id, "segment_index": segment_index, "url": url}
+
+
+# Month 7: consent changes are also mirrored to Supabase so the consent
+# registry is durable across restarts and visible from the frontend.
+# We wrap the privacy router's POST by adding our own route that calls
+# both privacy.register_consent and supabase_store.upsert_consent.
+class ConsentSyncRequest(BaseModel):
+    speaker:    str
+    consented:  bool
+    real_name:  Optional[str] = None
+
+@app.post("/supabase/consent")
+async def supabase_sync_consent(req: ConsentSyncRequest):
+    """
+    Dual-write consent: updates the local consent.json AND Supabase.
+    The existing POST /privacy/consent endpoint only writes locally;
+    call this endpoint from the frontend instead to get Supabase durability.
+    """
+    entry = privacy.register_consent(req.speaker, req.consented, req.real_name)
+    supabase_store.upsert_consent(req.speaker, req.consented, req.real_name)
+    return {"speaker": req.speaker, **entry}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

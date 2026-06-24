@@ -112,12 +112,35 @@ class LiveKitConfig:
 
     Quick local dev:
         docker run --rm -p 7880:7880 livekit/livekit-server --dev
-    This starts the server with placeholder credentials
-    api_key="devkey", api_secret="secret" (not "devsecret" — match exactly).
+    Then set api_key="devkey", api_secret="devsecret".
     """
     url:        str = "ws://localhost:7880"
     api_key:    str = "devkey"
-    api_secret: str = "secret"
+    api_secret: str = "devsecret"
+
+
+@dataclass
+class SupabaseConfig:
+    """
+    Month 7 — Supabase persistence layer.
+
+    url  : Supabase project URL (https://<ref>.supabase.co).
+           Overridden by SUPABASE_URL env var when set.
+    key  : Supabase service-role secret key.
+           Overridden by SUPABASE_KEY env var when set.
+           Use the service-role key (not anon) so the backend can bypass RLS.
+
+    store_audio  : upload raw PCM segments to the audio-segments Storage bucket.
+                   Disable to save quota during development.
+    store_vision : persist vision frame rows to Supabase.
+                   Generates ~1 row/s; disable if not needed.
+
+    NOTE: env vars always take precedence over values in config.json.
+    """
+    url:          str  = ""
+    key:          str  = ""
+    store_audio:  bool = False   # off by default — enable once bucket is created
+    store_vision: bool = True
 
 
 @dataclass
@@ -132,6 +155,7 @@ class Config:
     summon:    SummonConfig   = field(default_factory=SummonConfig)
     spacy:     SpacyConfig    = field(default_factory=SpacyConfig)
     livekit:   LiveKitConfig  = field(default_factory=LiveKitConfig)   # Month 6
+    supabase:  SupabaseConfig = field(default_factory=SupabaseConfig)  # Month 7
 
 
 # ── Loader ─────────────────────────────────────────────────────────────────────
@@ -167,16 +191,30 @@ def load(path: Path = CONFIG_PATH) -> Config:
         "summon":    c.summon,
         "spacy":     c.spacy,
         "livekit":   c.livekit,   # Month 6
+        "supabase":  c.supabase,  # Month 7
     }
     for section, obj in section_map.items():
         if section in raw:
             _apply(obj, raw[section])
 
+    # Env vars override config.json values for secrets
+    import os
+    if os.environ.get("SUPABASE_URL"):
+        c.supabase.url = os.environ["SUPABASE_URL"]
+    if os.environ.get("SUPABASE_KEY"):
+        c.supabase.key = os.environ["SUPABASE_KEY"]
+    # Push resolved values back into env so supabase_store._get_client() picks them up
+    if c.supabase.url:
+        os.environ.setdefault("SUPABASE_URL", c.supabase.url)
+    if c.supabase.key:
+        os.environ.setdefault("SUPABASE_KEY", c.supabase.key)
+
     log.info(f"Config loaded. LLM: {c.local_llm.base_url} | "
              f"summon_required={c.summon.require_summon} | "
              f"NER={c.spacy.model} | "
              f"graph={c.lkc.db_file} | "
-             f"livekit={c.livekit.url}")
+             f"livekit={c.livekit.url} | "
+             f"supabase={'configured' if c.supabase.url else 'disabled'}")
     return c
 
 

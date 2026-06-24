@@ -21,7 +21,7 @@ torch>=2.1.0
 scikit-learn>=1.4.0
 
 # ── Month 5 (unchanged) ───────────────────────────────────────────────────────
-sentence-transformers==3.3.1
+sentence-transformers>=3.3.1
 spacy>=3.7.0
 
 # ── Month 6 additions ─────────────────────────────────────────────────────────
@@ -31,9 +31,13 @@ livekit>=0.11.0
 livekit-api>=0.6.0
 
 # Audio resampling: converts LiveKit's 48kHz int16 stereo to 16kHz mono float32
-# before feeding into the existing VadChunker / WhisperX pipeline.
 soxr>=0.3.7
 
-# PyAV is pulled by whisperx; listed explicitly for the video frame decoder
-# used in the LiveKit video subscriber.
+# PyAV — video frame decoder for the LiveKit video subscriber
 av>=12.0.0
+
+# ── Month 7 additions ─────────────────────────────────────────────────────────
+
+# Supabase Python client — Postgres tables + Storage buckets
+# Docs: https://supabase.com/docs/reference/python/introduction
+supabase>=2.4.0

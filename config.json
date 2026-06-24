@@ -32,9 +32,16 @@
     "entity_types": ["PERSON", "ORG", "PRODUCT", "GPE", "DATE", "EVENT", "WORK_OF_ART"]
   },
   "livekit": {
-    "_comment":   "LiveKit SFU — run: docker run --rm -p 7880:7880 livekit/livekit-server --dev (dev mode uses api_key=devkey, api_secret=secret)",
+    "_comment":   "LiveKit SFU — run: docker run --rm -p 7880:7880 livekit/livekit-server --dev",
     "url":        "ws://localhost:7880",
     "api_key":    "devkey",
-    "api_secret": "secret"
+    "api_secret": "devsecret"
+  },
+  "supabase": {
+    "_comment":     "Set SUPABASE_URL and SUPABASE_KEY env vars instead of hardcoding secrets here.",
+    "url":          "",
+    "key":          "",
+    "store_audio":  false,
+    "store_vision": true
   }
 }
