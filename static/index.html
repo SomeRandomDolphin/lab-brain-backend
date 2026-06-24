@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Lab Brain — Module 5 Month 3</title>
+<title>Lab Brain — Module 5 Month 5</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Syne:wght@400;700;800&display=swap" rel="stylesheet">
 <style>
@@ -78,6 +78,41 @@ header {
 .mode-pill.meeting_capture{ border-color:var(--accent); color:var(--accent); }
 .mode-pill.qa             { border-color:var(--purple); color:var(--purple); }
 .mode-pill.ambient        { border-color:var(--text-muted); color:var(--text-muted); }
+.mode-pill.confirmation   { border-color:var(--warn); color:var(--warn); }
+
+/* ── Month 5: Summon indicator ── */
+#summon-indicator {
+  display: none;
+  align-items: center; gap: 6px;
+  font-size: 11px; color: var(--purple);
+  border: 1px solid var(--purple); border-radius: 20px;
+  padding: 3px 10px; margin-left: 4px;
+  animation: summon-pulse 1s ease infinite alternate;
+}
+#summon-indicator::before {
+  content:''; width:6px; height:6px; border-radius:50%;
+  background: var(--purple); display:inline-block;
+}
+@keyframes summon-pulse { from{opacity:.5} to{opacity:1} }
+.btn-summon {
+  font-family:var(--font-mono); font-size:11px; font-weight:600;
+  padding:6px 14px; border-radius:6px;
+  border:1px solid var(--purple); color: var(--purple);
+  background: transparent; cursor:pointer; letter-spacing:.04em;
+  text-transform:uppercase; transition:all .15s;
+}
+.btn-summon:hover  { background: #7c6af715; }
+.btn-summon.active { background: var(--purple); color:#fff; }
+/* word-level speaker highlight */
+.word-sp { border-radius:3px; padding:1px 2px; cursor:default; }
+/* session history rows */
+.sh-row { display:grid; grid-template-columns:76px 1fr 44px; gap:6px;
+  font-size:11px; padding:5px 0; border-bottom:1px solid var(--border); align-items:center; }
+.sh-id    { color:var(--accent); font-weight:600; font-family:var(--font-mono); }
+.sh-meta  { font-size:10px; color:var(--text-muted); }
+.sh-btn   { font-size:10px; padding:2px 5px; border:1px solid var(--border);
+  background:transparent; color:var(--text-muted); border-radius:4px; cursor:pointer; }
+.sh-btn:hover { border-color:var(--accent); color:var(--accent); }
 
 .session-id { font-size:11px; color:var(--text-muted); }
 .session-id strong { color:var(--text-dim); }
@@ -285,12 +320,13 @@ main {
 <body>
 
 <header>
-  <div class="logo">Lab Brain <span>/ M5·M2</span></div>
+  <div class="logo">Lab Brain <span>/ M5·M5</span></div>
   <div class="badge">Module 5</div>
-  <div class="badge">Month 3</div>
+  <div class="badge">Month 5</div>
   <div id="live-badge" class="badge live" style="display:none">live</div>
   <div id="mode-pill" class="mode-pill ambient">ambient</div>
-  <div class="session-id">session: <strong id="session-display">—</strong></div>
+  <div id="summon-indicator">listening…</div>
+  <div class="session-id" style="margin-left:auto">session: <strong id="session-display">—</strong></div>
 </header>
 
 <!-- Camera + perception strip -->
@@ -409,6 +445,17 @@ main {
     </div>
   </div>
 
+  <!-- Month 5: Session history (persistent graph) -->
+  <div>
+    <div class="panel-title" style="display:flex;justify-content:space-between;align-items:center">
+      Session History
+      <button onclick="fetchSessionHistory()" style="font-size:10px;padding:2px 6px;border:1px solid var(--border);background:transparent;color:var(--text-muted);border-radius:4px;cursor:pointer">refresh</button>
+    </div>
+    <div id="session-history" style="font-size:11px;max-height:160px;overflow-y:auto">
+      <div style="color:var(--text-muted)">No past sessions.</div>
+    </div>
+  </div>
+
   <div>
     <div class="panel-title">LKC stream</div>
     <div id="lkc-entries">
@@ -422,6 +469,7 @@ main {
   <div id="vu-bar"><div id="vu-fill"></div></div>
   <div id="status-text">Idle — <strong>not connected</strong></div>
   <button class="btn btn-secondary" onclick="clearSession()">Clear</button>
+  <button class="btn-summon" id="btn-summon" onclick="toggleSummon()" title="Manually summon Lab Brain (or say 'Lab Brain…')">Ask Brain</button>
   <button class="btn btn-primary"   id="btn-start" onclick="startSession()">Start</button>
   <button class="btn btn-stop"      id="btn-stop"  onclick="stopSession()" disabled>Stop</button>
 </div>
@@ -601,15 +649,21 @@ function updatePerception(data) {
 }
 
 // ── Interim row ──────────────────────────────────────────────────────────────
-function showInterim(mode) {
+function showInterim(mode, summoned) {
   document.getElementById('interim-row')?.remove();
   const panel = document.getElementById('transcript-panel');
   const row = document.createElement('div');
   row.className = 'interim-line'; row.id = 'interim-row';
+  const label = summoned ? 'Lab Brain…' : 'listening';
+  const col   = summoned ? 'var(--purple)' : 'var(--text-muted)';
   row.innerHTML = `
-    <div class="seg-meta"><div class="speaker-tag" style="color:var(--text-muted)">listening</div>
-    <div class="seg-mode" style="color:var(--text-muted)">${esc(mode||'')}</div></div>
-    <div class="interim-text">processing</div>`;
+    <div class="seg-meta">
+      <div class="speaker-tag" style="color:${col}">${label}</div>
+      <div class="seg-mode" style="color:var(--text-muted)">${esc(mode||'')}</div>
+    </div>
+    <div class="interim-text" style="color:${summoned?'var(--purple)':'var(--accent)'}">
+      ${summoned ? 'thinking…' : 'processing'}
+    </div>`;
   panel.appendChild(row);
   row.scrollIntoView({ behavior:'smooth', block:'end' });
 }
@@ -768,19 +822,21 @@ async function startSession() {
     const msg = JSON.parse(ev.data);
     if (msg.type === 'session') {
       sessionId = msg.session_id;
-      _currentSession = sessionId;                          // Month 3
+      _currentSession = sessionId;
       document.getElementById('session-display').textContent = sessionId;
-      // Start camera + TTS relay now that we have a session ID
       startCamera(sessionId);
       startTtsRelay(sessionId);
+      fetchSessionHistory();                           // Month 5
     } else if (msg.type === 'transcript') {
       addSegment(msg);
-      if (msg.environment) updateEnvironment(msg.environment); // Month 3
-      if (msg.tags)        maybeUpdateTags(msg.tags);          // Month 3
+      if (msg.environment) updateEnvironment(msg.environment);
+      if (msg.tags)        maybeUpdateTags(msg.tags);
+      updateSummonUI(msg.summoned);                    // Month 5
     } else if (msg.type === 'agent_reply') {
       showAgentReply(msg.text, msg.mode);
+      updateSummonUI(false);                           // Month 5: clear after reply
     } else if (msg.type === 'listening') {
-      showInterim(msg.mode);
+      showInterim(msg.mode, msg.summoned);             // Month 5
     } else if (msg.type === 'error') {
       setStatus(`<strong style="color:var(--warn)">Server error:</strong> ${msg.message}`);
     }
@@ -811,11 +867,10 @@ function clearSession() {
     `<div class="empty-state" id="empty-state">
        <span class="big">▶ Ready</span>
        Press <strong>Start</strong> to begin. Camera + mic will be requested.<br>
-       Lab Brain will greet, capture, and answer in real time.
+       Say <strong>"Lab Brain…"</strong> to ask a question. Otherwise the agent captures silently.
      </div>`;
   document.getElementById('lkc-entries').innerHTML =
     `<div style="font-size:11px;color:var(--text-muted)">No entries yet.</div>`;
-  // Month 3: reset new panels
   document.getElementById('tags-panel').innerHTML =
     '<div style="color:var(--text-muted)">No tags yet.</div>';
   document.getElementById('summary-panel').textContent =
@@ -824,6 +879,7 @@ function clearSession() {
   document.getElementById('env-lighting').textContent = '—';
   document.getElementById('env-ambient').textContent  = '—';
   document.getElementById('env-objects').textContent  = 'Objects: —';
+  updateSummonUI(false);                              // Month 5
   _currentSession = null;
   segCount = 0; latencies = []; wordCount = 0; lastLang = '—';
   agentReplies = 0; visFrames = 0; visLatencies = []; e2eLatencies = [];
@@ -949,10 +1005,185 @@ async function requestSummary() {
   }
 }
 
-// ── Month 3: Hook into existing onmessage / startSession ────────────────
-// Patch the ws onmessage to handle new fields (environment, tags).
-// This wraps the existing handler so the Month 2 logic is preserved.
-const _origStartSession = typeof startSession === 'function' ? startSession : null;
+// ═══════════════════════════════════════════════════════════════════════════
+// Month 5 additions
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Summon UI ─────────────────────────────────────────────────────────────
+let _summoned = false;
+
+function updateSummonUI(active) {
+  _summoned = !!active;
+  const indicator = document.getElementById('summon-indicator');
+  const btn       = document.getElementById('btn-summon');
+  indicator.style.display = _summoned ? 'inline-flex' : 'none';
+  if (btn) btn.classList.toggle('active', _summoned);
+}
+
+async function toggleSummon() {
+  if (!sessionId) { alert('Start a session first.'); return; }
+  if (_summoned) {
+    await fetch(`/agent/summon/${sessionId}`, { method: 'DELETE' });
+    updateSummonUI(false);
+  } else {
+    await fetch(`/agent/summon/${sessionId}`, { method: 'POST' });
+    updateSummonUI(true);
+  }
+}
+
+// ── Word-level speaker colour palette ────────────────────────────────────
+const _speakerColours = [
+  '#00e5a040', '#7c6af740', '#38bdf840', '#f59e0b40',
+  '#22c55e40', '#f8717140', '#e879f940', '#0ea5e940',
+];
+const _speakerMap = {};
+let   _colourIdx  = 0;
+
+function _colourFor(speaker) {
+  if (!_speakerMap[speaker]) {
+    _speakerMap[speaker] = _speakerColours[_colourIdx % _speakerColours.length];
+    _colourIdx++;
+  }
+  return _speakerMap[speaker];
+}
+
+// Override addSegment to support word-level speaker colouring (Month 5)
+const _origAddSegment = addSegment;
+function addSegment(data) {
+  // If word_timestamps with per-word speaker data are present,
+  // render coloured words instead of plain text.
+  if (data.word_timestamps && data.word_timestamps.length > 0 &&
+      data.word_timestamps[0].speaker) {
+    document.getElementById('empty-state')?.remove();
+    document.getElementById('interim-row')?.remove();
+
+    segCount++;
+    latencies.push(data.latency_ms);
+    if (data.e2e_ms) e2eLatencies.push(data.e2e_ms);
+    wordCount += data.text.split(/\s+/).filter(Boolean).length;
+    lastLang = (data.language || '—').toUpperCase();
+    updateStats();
+    if (data.mode) setMode(data.mode);
+
+    const panel = document.getElementById('transcript-panel');
+    const time  = new Date(data.timestamp).toLocaleTimeString();
+    const engCls = data.engagement && data.engagement !== 'unknown' ? data.engagement : '';
+
+    // Build word-coloured HTML
+    const wordsHtml = data.word_timestamps.map(w => {
+      const bg  = _colourFor(w.speaker || data.speaker);
+      const tip = `title="${esc(w.speaker||'')}"`;
+      return `<span class="word-sp" style="background:${bg}" ${tip}>${esc(w.word)} </span>`;
+    }).join('');
+
+    const seg = document.createElement('div');
+    seg.className = 'segment';
+    seg.innerHTML = `
+      <div class="seg-meta">
+        <div class="speaker-tag">${esc(data.speaker)}</div>
+        <div class="seg-time">${time}</div>
+        <div class="seg-lang">${esc(lastLang)}</div>
+        <div class="seg-mode">${esc(data.mode||'')}</div>
+      </div>
+      <div>
+        <div class="seg-text" style="line-height:1.9">${wordsHtml}</div>
+        <div class="seg-latency">ASR ${data.latency_ms}ms${data.e2e_ms?' · e2e '+data.e2e_ms+'ms':''}</div>
+        ${engCls?`<div class="seg-engagement ${engCls}">${engCls}</div>`:''}
+        ${data.summoned?'<div style="font-size:9px;color:var(--purple);margin-top:2px">⬡ summoned</div>':''}
+      </div>`;
+    panel.appendChild(seg);
+    seg.scrollIntoView({ behavior:'smooth', block:'end' });
+    addLkcEntry('transcript', `${data.session_id}·${data.speaker}`, data.text, time);
+
+    if (data.environment) updateEnvironment(data.environment);
+    if (data.tags)        maybeUpdateTags(data.tags);
+    updateSummonUI(data.summoned);
+  } else {
+    // No word timestamps — fall through to original renderer,
+    // but still update summon UI
+    _origAddSegment(data);
+    updateSummonUI(data.summoned);
+  }
+}
+
+// ── Session History panel (Month 5 persistent graph) ──────────────────────
+async function fetchSessionHistory() {
+  try {
+    const r = await fetch('/lkc/sessions');
+    const d = await r.json();
+    const panel = document.getElementById('session-history');
+    const sessions = d.sessions || [];
+    if (!sessions.length) {
+      panel.innerHTML = '<div style="color:var(--text-muted)">No past sessions.</div>';
+      return;
+    }
+    panel.innerHTML = sessions.slice(0, 12).map(s => {
+      const sid   = esc(s.session_id);
+      const start = new Date(s.started_iso).toLocaleTimeString();
+      const date  = new Date(s.started_iso).toLocaleDateString();
+      const counts = `${s.transcripts} segs · ${s.agent_replies} replies`;
+      return `<div class="sh-row">
+        <span class="sh-id" title="${date}">${sid}</span>
+        <span class="sh-meta">${date} ${start}<br>${counts}</span>
+        <button class="sh-btn" onclick="loadSession('${sid}')">load</button>
+      </div>`;
+    }).join('');
+  } catch(e) { console.warn('fetchSessionHistory error', e); }
+}
+
+async function loadSession(sid) {
+  try {
+    const r  = await fetch(`/lkc/sessions/${encodeURIComponent(sid)}?record_type=transcript&limit=100`);
+    const d  = await r.json();
+    const panel = document.getElementById('transcript-panel');
+    panel.innerHTML = '';
+
+    // Show a "loaded from history" header
+    const hdr = document.createElement('div');
+    hdr.style.cssText = 'padding:10px 0;font-size:11px;color:var(--purple);border-bottom:1px solid var(--border);margin-bottom:8px';
+    hdr.textContent = `◎ Loaded ${d.count} records from session ${sid}`;
+    panel.appendChild(hdr);
+
+    (d.records || []).forEach(rec => {
+      if (rec.type !== 'transcript') return;
+      const seg = document.createElement('div');
+      seg.className = 'segment';
+      const time = (rec.timestamp_iso||'').slice(11,19);
+      const tags = rec.tags || {};
+      const tagBadges = [
+        ...(tags.action_items||[]).map(()=>'<span style="font-size:9px;color:#f59e0b">⚡ action</span>'),
+        ...(tags.decisions||[]).map(()=>'<span style="font-size:9px;color:#22c55e">✔ decision</span>'),
+      ].join(' ');
+      seg.innerHTML = `
+        <div class="seg-meta">
+          <div class="speaker-tag">${esc(rec.speaker||'?')}</div>
+          <div class="seg-time">${time}</div>
+          <div class="seg-lang">${esc((rec.language||'').toUpperCase())}</div>
+        </div>
+        <div>
+          <div class="seg-text">${esc(rec.text||'')}</div>
+          ${tagBadges ? `<div style="margin-top:3px;display:flex;gap:4px">${tagBadges}</div>` : ''}
+        </div>`;
+      panel.appendChild(seg);
+    });
+    panel.scrollTop = 0;
+  } catch(e) { console.warn('loadSession error', e); }
+}
+
+// Auto-load history on page load
+fetchSessionHistory();
+
+// ── Poll summon state while recording ────────────────────────────────────
+setInterval(async () => {
+  if (!isRecording || !sessionId) return;
+  try {
+    const r = await fetch(`/agent/summon/${sessionId}`);
+    const d = await r.json();
+    // Only update UI if it diverged from our local state
+    // (e.g. server auto-cleared summon after a reply we didn't catch)
+    if (d.summoned !== _summoned) updateSummonUI(d.summoned);
+  } catch(e) {}
+}, 3000);
 
 </script>
 </body>

@@ -1,43 +1,30 @@
 """
-capture.py — Autonomous Capture & Rifqi Pipeline Integration (Module 5, Month 3)
+capture.py — Autonomous Capture & Rifqi Pipeline Integration (Module 5, Month 5)
 
-Two responsibilities:
+Month 5 changes
+---------------
+1.  spaCy NER replaces regex entity extraction.
+    The default model is `en_core_web_sm` (downloaded automatically on first
+    use via `python -m spacy download en_core_web_sm`).  The regex _ENTITY_RE
+    and _PROJECT_RE patterns are kept as a fallback when spaCy is unavailable.
+    Entity types extracted: PERSON, ORG, PRODUCT, GPE, DATE, EVENT, WORK_OF_ART
 
-1.  Rifqi Handshake (Module 2 — Meeting Capture Pipeline)
-    -----------------------------------------------------------
-    Rifqi's pipeline pushes structured meeting segments via POST /capture/ingest.
-    This module receives them, normalises to the shared LKC schema, and writes
-    them to lkc_stream.jsonl so Module 5's retrieval layer can answer questions
-    that span both pipelines.
+2.  Wake-word / summon system — the agent now replies ONLY when explicitly
+    addressed.  Any transcript containing a configured summon phrase (default:
+    "lab brain", "hey brain", "brain", "@lab") sets a session-level summon
+    flag that server.py reads before triggering QA mode.
+    This prevents the agent from interrupting every question in the room.
 
-    Expected payload from Rifqi (flexible; extra fields are ignored):
-      {
-        "session_id": "abc123",
-        "speaker":    "Zharif",          # real name already resolved by Module 2
-        "text":       "We decided to use sentence-transformers for Month 3.",
-        "timestamp":  "2025-06-01T09:34:12Z",
-        "source":     "module2"          # tag so we can filter in the LKC viewer
-      }
+    API:
+        summoned = capture.check_summon(session_id, text)   # True/False
+        capture.clear_summon(session_id)                     # reset after reply
 
-2.  Autonomous Capture
-    -----------------------------------------------------------
-    Every transcript segment (from either pipeline) is run through a lightweight
-    rule-based tagger that detects:
-
-      • ACTION ITEMS  — "I will / we will / you should / action: ..."
-      • DECISIONS     — "we decided / agreed to / conclusion: ..."
-      • ENTITIES      — mentioned people, projects, and deadlines
-
-    Detected tags are appended to the LKC record under a "tags" key and,
-    optionally, queued for agent confirmation ("Lab Brain: I captured an action
-    item — [text]. Correct?").
-
-    The full NLP upgrade path (spaCy NER, pyannote diarization alignment) is
-    stubbed with TODO markers for Month 3 final hardening.
-
-Design note: this module is intentionally stateless; it reads/writes the shared
-lkc_stream.jsonl through the same helper as server.py to preserve the single
-source of truth.
+Unchanged from Month 3/4
+------------------------
+* Rifqi Module 2 ingest endpoint (POST /capture/ingest)
+* Autonomous action-item / decision / deadline detection
+* Confirmation queue for agent TTS verification
+* write_to_lkc() now delegates to lkc_graph.write_to_lkc() (Month 5)
 """
 
 from __future__ import annotations
@@ -58,76 +45,186 @@ log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["capture"])
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Shared LKC path (resolved at server startup via cfg; default here for import)
-# ─────────────────────────────────────────────────────────────────────────────
-_lkc_path: Path = Path("lkc_stream.jsonl")
+# ── Month 5: delegate LKC writes to the persistent graph ─────────────────────
+import lkc_graph
 
 def set_lkc_path(path: Path) -> None:
-    global _lkc_path
-    _lkc_path = path
+    """Keep backward-compat signature; Month 5 uses the graph, not raw JSONL."""
+    lkc_graph.configure(
+        db_path=path.with_suffix(".db"),
+        jsonl_path=path,
+    )
 
 def _write(record: dict) -> None:
-    with _lkc_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    lkc_graph.write_to_lkc(record)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Autonomous tagger
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Month 5: spaCy NER ────────────────────────────────────────────────────────
+SPACY_AVAILABLE = False
+_nlp = None
 
-# Action-item triggers
+_SPACY_ENTITY_TYPES = {"PERSON", "ORG", "PRODUCT", "GPE", "DATE", "EVENT", "WORK_OF_ART"}
+
+def _load_spacy():
+    global _nlp, SPACY_AVAILABLE
+    if _nlp is not None:
+        return _nlp
+    try:
+        import spacy
+        try:
+            _nlp = spacy.load("en_core_web_sm")
+        except OSError:
+            log.warning(
+                "[capture] spaCy model 'en_core_web_sm' not found. "
+                "Run: python -m spacy download en_core_web_sm"
+                " — falling back to regex NER."
+            )
+            return None
+        SPACY_AVAILABLE = True
+        log.info("[capture] spaCy NER loaded (en_core_web_sm).")
+        return _nlp
+    except ImportError:
+        log.warning("[capture] spaCy not installed — falling back to regex NER.")
+        return None
+
+
+# ── Regex patterns (kept as fallback) ─────────────────────────────────────────
+
 _ACTION_RE = re.compile(
     r"\b(i will|we will|i'll|we'll|you should|please|action(?: item)?[:\-]|"
     r"todo[:\-]|to do[:\-]|need to|has to|must|going to|gonna)\b",
     re.IGNORECASE,
 )
-
-# Decision triggers
 _DECISION_RE = re.compile(
     r"\b(we decided|we agreed|it was decided|conclusion[:\-]|we will go with|"
     r"final decision|approved|rejected|resolved)\b",
     re.IGNORECASE,
 )
-
-# Deadline triggers (simple)
 _DEADLINE_RE = re.compile(
     r"\b(by (monday|tuesday|wednesday|thursday|friday|"
     r"saturday|sunday|end of (day|week|month|sprint)|next week|"
     r"tomorrow|tonight)|deadline[:\-]|due[:\- ]+\w+)\b",
     re.IGNORECASE,
 )
-
-# Named entity heuristics — Capitalised words not at sentence start, 2-20 chars
-_ENTITY_RE = re.compile(r"(?<!\.\s)(?<![?!]\s)\b([A-Z][a-z]{1,19})\b")
-
-# Project / technical term heuristics
+# Regex fallback entity patterns (used only when spaCy is unavailable)
+_ENTITY_RE  = re.compile(r"(?<!\.\s)(?<![?!]\s)\b([A-Z][a-z]{1,19})\b")
 _PROJECT_RE = re.compile(
     r"\b(Lab Brain|Module \d|TEEP|LKC|pyannote|WhisperX|sentence-transformers|"
     r"Ollama|Gemini|faster-whisper|FastAPI|Supabase|Rifqi|Wildan|Lathifah|Nabhyla|"
     r"Fadhil|Davian|Diajeng|Prof\.? Ben)\b",
     re.IGNORECASE,
 )
+_STOPWORDS = {
+    "The", "A", "An", "In", "Is", "It", "I", "We", "You",
+    "He", "She", "They", "This", "That", "And", "But", "Or",
+    "So", "If", "Do", "No", "Yes", "Lab",
+}
 
+
+def _extract_entities_spacy(text: str) -> list[str]:
+    """Use spaCy NER to extract meaningful named entities."""
+    nlp = _load_spacy()
+    if nlp is None:
+        return []
+    doc = nlp(text)
+    seen: set[str] = set()
+    entities: list[str] = []
+    for ent in doc.ents:
+        label = ent.label_
+        if label not in _SPACY_ENTITY_TYPES:
+            continue
+        norm = ent.text.strip()
+        if norm and norm not in seen and len(norm) > 1:
+            entities.append(norm)
+            seen.add(norm)
+    return entities
+
+
+def _extract_entities_regex(text: str) -> list[str]:
+    """Regex-based entity extraction (Month 3/4 fallback)."""
+    raw_ents = _ENTITY_RE.findall(text) + _PROJECT_RE.findall(text)
+    seen: set[str] = set()
+    entities: list[str] = []
+    for e in raw_ents:
+        if e not in _STOPWORDS and e not in seen:
+            entities.append(e)
+            seen.add(e)
+    return entities
+
+
+def _extract_entities(text: str) -> list[str]:
+    """Try spaCy first; fall back to regex."""
+    if SPACY_AVAILABLE or _load_spacy() is not None:
+        return _extract_entities_spacy(text)
+    return _extract_entities_regex(text)
+
+
+# ── Month 5: Wake-word / Summon System ───────────────────────────────────────
+# The agent only enters QA mode when explicitly summoned.
+# Add / remove phrases here; matching is case-insensitive.
+SUMMON_PHRASES: list[str] = [
+    "lab brain",
+    "hey brain",
+    "hey lab brain",
+    "@lab",
+    "brain,",
+    "brain?",
+    "lab,",
+]
+
+_SUMMON_RE = re.compile(
+    "|".join(re.escape(p) for p in SUMMON_PHRASES),
+    re.IGNORECASE,
+)
+
+# Per-session summon state: session_id → True if the agent was summoned in the
+# last segment and has not yet replied.
+_summon_state: dict[str, bool] = {}
+
+
+def check_summon(session_id: str, text: str) -> bool:
+    """
+    Return True if the transcript explicitly addresses Lab Brain.
+    Sets a sticky flag so the agent can reply on the same turn.
+
+    Call this BEFORE update_mode() in server.py.
+    """
+    if _SUMMON_RE.search(text):
+        _summon_state[session_id] = True
+        log.info(f"[capture:{session_id}] Agent summoned via wake-word.")
+        return True
+    return False
+
+
+def is_summoned(session_id: str) -> bool:
+    """Check whether the session has a pending (unanswered) summon."""
+    return _summon_state.get(session_id, False)
+
+
+def clear_summon(session_id: str) -> None:
+    """Reset the summon flag after the agent has replied."""
+    _summon_state.pop(session_id, None)
+
+
+# ── Tagger ────────────────────────────────────────────────────────────────────
 
 def tag_segment(text: str) -> dict:
     """
     Returns a tags dict with detected categories and extracted entities.
-    Empty lists mean no match — callers should skip writing empty tag blocks.
+
+    Month 5: entity extraction uses spaCy NER (regex fallback).
 
     {
       "action_items": ["I will deploy by Friday"],
       "decisions":    [],
-      "entities":     ["Rifqi", "TEEP"],
+      "entities":     ["Rifqi", "TEEP", "2026-06-03"],
       "deadlines":    ["by Friday"],
     }
     """
     action_items: list[str] = []
     decisions:    list[str] = []
     deadlines:    list[str] = []
-    entities:     list[str] = []
 
-    # Split into sentences for better precision
     sentences = re.split(r"[.!?]+", text)
     for sent in sentences:
         sent = sent.strip()
@@ -140,17 +237,7 @@ def tag_segment(text: str) -> dict:
         if _DEADLINE_RE.search(sent):
             deadlines.append(sent)
 
-    # Named entities (capitalised + project names)
-    raw_ents = _ENTITY_RE.findall(text) + _PROJECT_RE.findall(text)
-    # Deduplicate preserving order, filter stopwords
-    _STOPWORDS = {"The", "A", "An", "In", "Is", "It", "I", "We", "You",
-                  "He", "She", "They", "This", "That", "And", "But", "Or",
-                  "So", "If", "Do", "No", "Yes", "Lab"}
-    seen: set[str] = set()
-    for e in raw_ents:
-        if e not in _STOPWORDS and e not in seen:
-            entities.append(e)
-            seen.add(e)
+    entities = _extract_entities(text)
 
     return {
         "action_items": action_items,
@@ -164,8 +251,8 @@ def has_tags(tags: dict) -> bool:
     return any(tags.get(k) for k in ("action_items", "decisions", "deadlines"))
 
 
-# Queued confirmations to be delivered via TTS to the agent
-# Maps session_id → list of pending confirmation texts
+# ── Confirmation queue ────────────────────────────────────────────────────────
+
 _pending_confirmations: dict[str, list[str]] = {}
 
 def get_pending_confirmations(session_id: str) -> list[str]:
@@ -174,6 +261,8 @@ def get_pending_confirmations(session_id: str) -> list[str]:
 def _queue_confirmation(session_id: str, text: str) -> None:
     _pending_confirmations.setdefault(session_id, []).append(text)
 
+
+# ── Core segment processor ────────────────────────────────────────────────────
 
 def process_segment(
     session_id: str,
@@ -184,12 +273,13 @@ def process_segment(
     language: str,
     *,
     confirm_agent: bool = True,
+    word_timestamps: Optional[list[dict]] = None,
 ) -> dict:
     """
-    Tag a transcript segment and write an enriched LKC record.
-    Returns the written record so server.py can inspect it.
+    Tag a transcript segment and write an enriched LKC record to the graph.
+    Returns the written record so server.py can inspect tags / word timestamps.
     """
-    tags = tag_segment(text)
+    tags   = tag_segment(text)
     ts_iso = datetime.utcfromtimestamp(timestamp_unix).isoformat() + "Z"
 
     record: dict = {
@@ -203,9 +293,11 @@ def process_segment(
         "language":       language,
         "tags":           tags,
     }
+    if word_timestamps:
+        record["word_timestamps"] = word_timestamps
+
     _write(record)
 
-    # Queue confirmations for non-empty tags
     if confirm_agent and has_tags(tags):
         parts: list[str] = []
         if tags["action_items"]:
@@ -221,65 +313,55 @@ def process_segment(
     return record
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Rifqi pipeline ingest endpoint
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Rifqi Module 2 ingest endpoint ────────────────────────────────────────────
 
 class RifqiSegment(BaseModel):
-    session_id:  str
-    speaker:     str
-    text:        str
-    timestamp:   Optional[str] = None   # ISO string; defaults to now
-    source:      str = "module2"
-    mode:        str = "meeting_capture"
-    language:    str = "id"
-    extra:       Optional[dict] = None  # any extra fields from Module 2
+    session_id: str
+    speaker:    str
+    text:       str
+    timestamp:  Optional[str] = None
+    source:     str = "module2"
+    mode:       str = "meeting_capture"
+    language:   str = "id"
+    extra:      Optional[dict] = None
 
 
 @router.post("/ingest")
 async def ingest_from_rifqi(seg: RifqiSegment):
     """
     Receive a structured segment from Rifqi's Module 2 pipeline,
-    run autonomous tagging, and write to the shared LKC.
+    run autonomous tagging (including spaCy NER), and write to the LKC graph.
     """
     ts_unix = time.time()
     if seg.timestamp:
         try:
             from datetime import timezone
-            from dateutil import parser as dtparser  # type: ignore
+            from dateutil import parser as dtparser
             ts_unix = dtparser.parse(seg.timestamp).timestamp()
         except Exception:
-            pass  # fall back to now
+            pass
 
     record = process_segment(
         seg.session_id, seg.speaker, seg.text,
         ts_unix, seg.mode, seg.language,
-        confirm_agent=False,  # Module 2 segments don't need TTS confirmation
+        confirm_agent=False,
     )
     if seg.source:
         record["source"] = seg.source
     if seg.extra:
         record["extra"] = seg.extra
 
-    # Re-write the record with source annotation
-    # (process_segment already wrote it; we patch in-place via a second write
-    #  only if module 2 adds metadata — acceptable for PoC)
-    log.info(f"[capture] Rifqi ingest: session={seg.session_id} speaker={seg.speaker} "
-             f"tags_found={has_tags(record['tags'])}")
-    return {
-        "ok":     True,
-        "record": record,
-    }
+    log.info(
+        f"[capture] Rifqi ingest: session={seg.session_id} speaker={seg.speaker} "
+        f"tags={has_tags(record['tags'])}"
+    )
+    return {"ok": True, "record": record}
 
 
 @router.get("/confirmations/{session_id}")
 async def poll_confirmations(session_id: str):
-    """
-    Module 5 server polls this to pick up agent confirmation messages
-    and route them through the TTS queue.
-    """
     return {
-        "session_id": session_id,
+        "session_id":    session_id,
         "confirmations": get_pending_confirmations(session_id),
     }
 
@@ -287,27 +369,19 @@ async def poll_confirmations(session_id: str):
 @router.get("/tags/{session_id}")
 async def get_session_tags(session_id: str):
     """
-    Return all captured action items / decisions / entities from the LKC
-    for a given session.  Useful for the end-of-session summary panel.
+    Return all captured tags from the persistent LKC graph for a session.
+    Month 5: reads from SQLite, not by scanning lkc_stream.jsonl.
     """
-    if not _lkc_path.exists():
-        return {"session_id": session_id, "tags": {}}
+    records = lkc_graph.read_lkc(
+        session_id=session_id, record_type="transcript"
+    )
 
     action_items: list[str] = []
     decisions:    list[str] = []
     entities:     set[str]  = set()
     deadlines:    list[str] = []
 
-    for line in _lkc_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            r = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if r.get("session_id") != session_id:
-            continue
+    for r in records:
         tags = r.get("tags", {})
         action_items.extend(tags.get("action_items", []))
         decisions.extend(tags.get("decisions", []))
@@ -315,9 +389,19 @@ async def get_session_tags(session_id: str):
         entities.update(tags.get("entities", []))
 
     return {
-        "session_id":  session_id,
+        "session_id":   session_id,
         "action_items": action_items,
-        "decisions":   decisions,
-        "deadlines":   deadlines,
-        "entities":    sorted(entities),
+        "decisions":    decisions,
+        "deadlines":    deadlines,
+        "entities":     sorted(entities),
+    }
+
+
+@router.get("/ner_backend")
+async def ner_backend_status():
+    """Report which NER backend is active."""
+    _load_spacy()
+    return {
+        "backend":   "spacy_en_core_web_sm" if SPACY_AVAILABLE else "regex_fallback",
+        "spacy_available": SPACY_AVAILABLE,
     }

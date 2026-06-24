@@ -2,23 +2,52 @@
 
 Part of **TEEP 2026 / Lab Brain** — a humanistic intelligence platform for digitalising knowledge creation using the SECI model.
 
-> **Current milestone: Month 4** — WhisperX word-level timestamps · pyannote speaker diarization · sentence-transformers dense LKC retrieval
+> **Current milestone: Month 5** — Persistent SQLite LKC graph · all-mpnet-base-v2 dense retrieval · spaCy NER · WhisperX + pyannote word-level speaker alignment · Summon-gated QA (agent only speaks when addressed)
 
 ---
 
-## What this does
+## What's new in Month 5
 
-- Streams 16 kHz PCM audio from the browser mic over WebSocket
-- Runs **WhisperX** (word-level timestamps + alignment, int8 CPU/GPU) with energy-based VAD; falls back to **faster-whisper** if WhisperX is not installed
-- Sends camera frames to a local **LLaVA** vision model (via Ollama) for presence detection, engagement cues, and **environment/object awareness** (Physical AI)
-- Runs **pyannote/speaker-diarization-3.1** to assign speaker labels from audio; falls back to round-robin if pyannote is unavailable
-- Manages four conversation modes — **Greeting · Meeting Capture · Q&A · Ambient** — plus a **Confirmation** mode for autonomous tag verification
-- Autonomously detects and tags **action items, decisions, deadlines, and entities** from the live transcript
-- Retrieves grounded answers from in-session LKC history using **sentence-transformers** dense embeddings; falls back to TF-IDF when sentence-transformers is not installed
-- Enforces **privacy & consent gating** — PII redaction, per-speaker opt-in, face anonymisation for non-consenting speakers
-- Accepts structured segments from **Rifqi's Module 2** pipeline via REST ingest
-- Generates an **end-of-session summary** (decisions, action items, open questions) using the local LLM
-- Writes everything to `lkc_stream.jsonl` — the shared LKC store for all Lab Brain modules
+### 1. Persistent LKC Graph (`lkc_graph.py`)
+The flat `lkc_stream.jsonl` append log is now backed by a **SQLite WAL database** (`lkc_graph.db`). All records are written to both the graph (primary) and the JSONL file (backward-compat mirror for Rifqi / Wildan pipelines).
+
+Benefits:
+- Survives server restarts — no records lost between sessions
+- Indexed queries by `session_id`, `record_type`, and `timestamp_unix` — no full-file scans
+- Cross-session history available for retrieval (Q&A can reach back into last week's meeting)
+- New REST endpoints for browsing, filtering, and deleting session data
+
+### 2. Upgraded Embedding Model (`lkc_retrieval.py`)
+`all-mpnet-base-v2` (~420 MB) replaces `all-MiniLM-L6-v2` (~22 MB) as the primary dense retrieval model. Cosine similarity relevance floor raised from 0.15 → 0.20 to reflect mpnet's generally higher scores.
+
+Fallback chain: mpnet → MiniLM → TF-IDF (sklearn) → disabled.
+
+### 3. spaCy NER (`capture.py`)
+Regex-based entity extraction replaced with `en_core_web_sm` (or `en_core_web_trf` for transformer-level accuracy). Entity types captured: `PERSON`, `ORG`, `PRODUCT`, `GPE`, `DATE`, `EVENT`, `WORK_OF_ART`.
+
+Regex patterns are kept as a fallback when spaCy is not installed.
+
+### 4. Word-Level Speaker Attribution (`dialogue.py`)
+`assign_speaker_words()` combines pyannote diarization turn boundaries with WhisperX per-word timestamps to annotate each word with the speaker who said it. The result is stored in `lkc_stream.jsonl` under `word_timestamps[].speaker`.
+
+### 5. Summon-Gated QA (agent goes quiet by default)
+The agent no longer interrupts every question in the room. It only enters QA mode when **explicitly addressed** with a wake-word:
+
+| Phrase | Example |
+|--------|---------|
+| `lab brain` | *"Lab Brain, what did we decide about embeddings?"* |
+| `hey brain` | *"Hey Brain, summarise the last ten minutes."* |
+| `@lab` | *"@lab what's the action item count?"* |
+| `brain,` / `brain?` | *"Brain, can you recap?"* |
+
+Configure phrases in `config.json` under `summon.phrases`. Set `require_summon: false` to restore Month 4 question-triggered behaviour.
+
+The frontend can also summon or dismiss the agent via REST:
+```
+POST   /agent/summon/{session_id}   — summon (e.g. clicking a mic button)
+DELETE /agent/summon/{session_id}   — dismiss
+GET    /agent/summon/{session_id}   — check current state
+```
 
 ---
 
@@ -29,43 +58,36 @@ Browser
 ├── Mic PCM (float32, 16kHz, 500ms chunks)
 │    └── /ws/asr ──► VadChunker ──► WhisperX (word timestamps + alignment)
 │                         │               └── faster-whisper fallback
-│                    capture.py  ← autonomous tagger (action items, decisions)
+│                         │
+│                    capture.py  ← spaCy NER + wake-word detection
 │                    privacy.py  ← PII redaction + consent gate
-│                    dialogue.py ← mode FSM (Greeting/Capture/QA/Ambient/Confirmation)
-│                         │    └── pyannote diarization (round-robin fallback)
-│                         ├── lkc_retrieval.py (sentence-transformers over lkc_stream.jsonl)
-│                         │                    └── TF-IDF fallback
+│                    dialogue.py ← mode FSM (summon-gated QA)
+│                         │    └── pyannote diarization + word-level alignment
+│                         ├── lkc_retrieval.py (mpnet over SQLite graph)
+│                         │                    └── MiniLM / TF-IDF fallback
 │                         └── local LLM reply (llama3.2:3b via Ollama)
 │                              └── /ws/tts ──► SpeechSynthesis (browser)
 │
 ├── Camera JPEG (1 FPS)
 │    └── /ws/vision ──► vision.py ──► llava:7b via Ollama
-│                            ├── present_speakers (privacy-gated)
-│                            ├── engagement_cues
-│                            ├── scene_summary
-│                            └── environment_state  ← Physical AI
 │
 └── Rifqi Module 2
-     └── POST /capture/ingest ──► capture.py ──► lkc_stream.jsonl
-                                       │
-                                  autonomous tagging
-                                  (same pipeline as live ASR)
+     └── POST /capture/ingest ──► capture.py ──► lkc_graph.db + lkc_stream.jsonl
 
-lkc_stream.jsonl  ←  shared store (transcript · vision · agent_reply · session_summary)
+lkc_graph.db         ←  persistent SQLite store (primary, survives restarts)
+lkc_stream.jsonl     ←  JSONL mirror (backward compat for other modules)
 ```
 
 ---
 
 ## Setup
 
-No system-level audio library needed. Mic and camera run in the browser via Web Audio / MediaDevices APIs.
-
-### 1. Start Ollama with the required models
+### 1. Start Ollama
 
 ```bash
-ollama pull llava:7b        # vision model (Physical AI + presence detection)
-ollama pull llama3.2:3b    # dialogue + summary model
-ollama serve                # starts at http://localhost:11434
+ollama pull llava:7b
+ollama pull llama3.2:3b
+ollama serve
 ```
 
 ### 2. Install Python packages
@@ -74,13 +96,17 @@ ollama serve                # starts at http://localhost:11434
 pip install -r requirements.txt
 ```
 
-> **pyannote note:** `pyannote.audio` requires accepting the model licence on Hugging Face before the pipeline will download. Run `huggingface-cli login` (or set the `HF_TOKEN` environment variable) after accepting the terms at https://huggingface.co/pyannote/speaker-diarization-3.1. If you skip this, the server falls back to round-robin speaker labelling automatically.
+### 3. Download spaCy model
 
-> **GPU note:** WhisperX, pyannote, and sentence-transformers all run on CPU. A CUDA-capable GPU gives a significant speed improvement, but is not required.
+```bash
+python -m spacy download en_core_web_sm
+# Optional — higher accuracy, transformer-based (slower on CPU):
+# python -m spacy download en_core_web_trf
+```
 
-### 3. Configure (optional)
+### 4. Configure
 
-Copy and edit `config.json` to override any default. All fields are optional — the server starts without it using the defaults shown below:
+Edit `config.json`. All fields are optional — the server starts with safe defaults.
 
 ```json
 {
@@ -89,38 +115,27 @@ Copy and edit `config.json` to override any default. All fields are optional —
     "vision_model":   "llava:7b",
     "dialogue_model": "llama3.2:3b"
   },
-  "whisper": {
-    "model_size":  "small",
-    "device":      "cpu",
-    "compute_type":"int8",
-    "language":    null,
-    "cpu_threads": 8
-  },
-  "vad": {
-    "silence_threshold": 0.01,
-    "silence_chunks":    4
-  },
   "lkc": {
-    "log_file":       "lkc_stream.jsonl",
+    "log_file":        "lkc_stream.jsonl",
+    "db_file":         "lkc_graph.db",
     "retrieval_top_k": 4
+  },
+  "summon": {
+    "phrases":        ["lab brain", "hey brain", "@lab"],
+    "require_summon": true
+  },
+  "spacy": {
+    "model": "en_core_web_sm"
   }
 }
 ```
 
-### 4. Run
+### 5. Run
 
 ```bash
 python server.py
 # open http://localhost:8000
 ```
-
-> **Windows note:** If you hit a `RuntimeError` about the asyncio event loop,
-> add at the very top of `server.py`, before other imports:
-> ```python
-> import asyncio, sys
-> if sys.platform == "win32":
->     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-> ```
 
 ---
 
@@ -128,229 +143,133 @@ python server.py
 
 | File | Role |
 |---|---|
-| `server.py` | FastAPI app — WebSocket endpoints for ASR (WhisperX), vision, TTS relay; REST endpoints for metrics, summary, LKC |
-| `dialogue.py` | Conversation mode FSM, pyannote speaker diarization, end-of-session summary generator |
-| `vision.py` | VLM perception layer — Physical AI environment sensing, privacy-gated speaker labels |
-| `capture.py` | Autonomous tagger + Rifqi Module 2 ingest endpoint |
-| `privacy.py` | Consent registry, PII redaction, face anonymisation gate |
-| `lkc_retrieval.py` | Dense sentence-transformers retrieval (TF-IDF fallback) over `lkc_stream.jsonl` for grounded Q&A |
-| `eval_metrics.py` | In-memory metrics (ASR/vision latency, WER, capture quality, confirmation rate, privacy) |
-| `config.py` | Typed config loader — reads `config.json`, falls back to safe defaults |
+| `server.py` | FastAPI app — WebSocket ASR/vision/TTS, REST API (Month 5 graph + summon endpoints) |
+| `dialogue.py` | Mode FSM, summon-gated QA, pyannote diarization, word-level speaker alignment |
+| `capture.py` | spaCy NER tagger, wake-word detection, Rifqi Module 2 ingest |
+| `lkc_graph.py` | **NEW** — SQLite-backed persistent LKC graph |
+| `lkc_retrieval.py` | Dense retrieval (mpnet → MiniLM → TF-IDF) over the full graph |
+| `vision.py` | VLM perception — Physical AI, privacy-gated speaker labels |
+| `privacy.py` | Consent registry, PII redaction, face anonymisation |
+| `eval_metrics.py` | In-memory metrics (ASR/vision latency, WER, capture, privacy) |
+| `config.py` | Typed config loader with Month 5 `SummonConfig` and `SpacyConfig` |
 | `static/index.html` | Single-file browser client |
 
 ---
 
-## LKC output format
+## REST API Reference
 
-All records are appended to `lkc_stream.jsonl`. Four record types:
-
-**Transcript segment** (Month 4 — enriched with tags, environment, and word-level timestamps)
-```json
-{
-  "type":           "transcript",
-  "session_id":     "a3f2b1c0",
-  "timestamp_iso":  "2026-06-03T08:14:22Z",
-  "timestamp_unix": 1748938462.831,
-  "speaker":        "Person A",
-  "text":           "We decided to use sentence-transformers for Month 4.",
-  "mode":           "meeting_capture",
-  "language":       "en",
-  "tags": {
-    "action_items": [],
-    "decisions":    ["We decided to use sentence-transformers for Month 4"],
-    "deadlines":    [],
-    "entities":     ["Month 4"]
-  },
-  "word_timestamps": [
-    {"word": "We",      "start": 0.0,  "end": 0.18, "score": 0.99},
-    {"word": "decided", "start": 0.2,  "end": 0.56, "score": 0.98}
-  ]
-}
-```
-
-**Vision frame**
-```json
-{
-  "type":             "vision",
-  "session_id":       "a3f2b1c0",
-  "timestamp_iso":    "2026-06-03T08:14:25Z",
-  "scene_summary":    "Two people at a desk with a whiteboard behind them.",
-  "present_speakers": ["Person A", "Person B"],
-  "engagement_cues":  {"Person A": "focused", "Person B": "distracted"},
-  "environment_state": {
-    "objects":  ["whiteboard", "laptop", "coffee cup"],
-    "layout":   "huddle",
-    "lighting": "bright",
-    "ambient":  "quiet"
-  }
-}
-```
-
-**Agent reply**
-```json
-{
-  "type":       "agent_reply",
-  "session_id": "a3f2b1c0",
-  "text":       "Based on the earlier discussion, the team agreed on sentence-transformers.",
-  "mode":       "qa"
-}
-```
-
-**Session summary** (generated by `POST /summary/{session_id}`)
-```json
-{
-  "type":       "session_summary",
-  "session_id": "a3f2b1c0",
-  "summary":    "## Summary\n- ...\n## Decisions\n- ...\n## Action Items\n- ...",
-  "tags": { "action_items": [...], "decisions": [...] }
-}
-```
-
-View the live LKC log at `http://localhost:8000/lkc`. Clear with `DELETE /lkc`.
-
----
-
-## REST API reference
+### LKC (Month 5 additions)
 
 | Method | Path | Description |
-|---|---|---|
-| `GET` | `/` | Browser client |
-| `GET` | `/lkc` | LKC viewer (JSON) |
-| `DELETE` | `/lkc` | Clear LKC log |
-| `GET` | `/mode/{session_id}` | Current conversation mode |
-| `GET` | `/perception/{session_id}` | Latest vision state (speakers, engagement, environment) |
+|--------|------|-------------|
+| `GET` | `/lkc/stats` | Graph-wide statistics (total records, sessions, timestamps) |
+| `GET` | `/lkc/sessions` | List all sessions with record counts |
+| `GET` | `/lkc/sessions/{sid}` | Records for a session. Query params: `record_type`, `since_unix`, `limit` |
+| `DELETE` | `/lkc/sessions/{sid}` | Delete all records for a session |
+| `GET` | `/lkc` | Legacy HTML viewer (last 500 records) |
+| `DELETE` | `/lkc` | Wipe entire graph |
+
+### Agent Summon (Month 5)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/agent/summon/{sid}` | Is the agent currently summoned? |
+| `POST` | `/agent/summon/{sid}` | Manually summon the agent (e.g. UI button press) |
+| `DELETE` | `/agent/summon/{sid}` | Dismiss the agent |
+
+### Diagnostics (Month 5)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/ner/status` | NER backend: `spacy_en_core_web_sm` or `regex_fallback` |
+| `GET` | `/retrieval/stats` | Embedding model, index size, backend in use |
+
+### All Month 3/4 endpoints (unchanged)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/mode/{sid}` | Current mode + summoned flag |
+| `GET` | `/perception/{sid}` | Latest vision state |
 | `GET` | `/metrics` | All session metrics (JSON) |
-| `GET` | `/metrics/csv` | Download metrics as CSV |
-| `POST` | `/eval/reference` | Submit reference transcript for WER calculation |
-| `POST` | `/summary/{session_id}` | Generate end-of-session LLM summary |
-| `GET` | `/config/client` | Client-facing config (FPS, TTS hide delay) |
-| `POST` | `/capture/ingest` | **Rifqi Module 2** — ingest a structured segment |
-| `GET` | `/capture/tags/{session_id}` | All captured action items, decisions, deadlines, entities |
-| `GET` | `/capture/confirmations/{session_id}` | Poll pending agent confirmation messages |
-| `GET` | `/privacy/status` | Consent registry + default policy |
-| `POST` | `/privacy/consent` | Grant or deny consent for a speaker |
-| `DELETE` | `/privacy/consent/{speaker}` | Remove a speaker from the registry |
+| `GET` | `/metrics/csv` | Metrics CSV download |
+| `POST` | `/eval/reference` | Submit WER reference transcript |
+| `POST` | `/summary/{sid}` | Generate end-of-session LLM summary |
+| `GET` | `/config/client` | Camera FPS, TTS hide delay |
+| `POST` | `/capture/ingest` | Rifqi Module 2 segment ingest |
+| `GET` | `/capture/tags/{sid}` | Action items, decisions, entities, deadlines |
+| `GET` | `/capture/confirmations/{sid}` | Pending confirmation messages |
+| `GET` | `/capture/ner_backend` | NER backend status |
+| `GET` | `/privacy/status` | Consent registry |
+| `POST` | `/privacy/consent` | Grant/deny consent for a speaker |
+| `DELETE` | `/privacy/consent/{speaker}` | Remove speaker from registry |
 
 WebSocket endpoints: `/ws/asr` · `/ws/vision?session_id=...` · `/ws/tts?session_id=...`
 
 ---
 
-## Rifqi Module 2 integration
+## Summon System — Frontend Integration
 
-Send a POST to `/capture/ingest` from Module 2's pipeline:
+The `transcript` WebSocket message now includes a `summoned` field:
 
-```python
-import httpx
-
-httpx.post("http://localhost:8000/capture/ingest", json={
-    "session_id": "shared-session-id",
-    "speaker":    "Zharif",          # real name already resolved by Module 2
-    "text":       "We agreed to submit the draft by end of sprint.",
-    "timestamp":  "2026-06-03T08:14:22Z",
-    "source":     "module2",
-})
+```json
+{
+  "type":     "transcript",
+  "text":     "Lab Brain, what did we decide about embeddings?",
+  "summoned": true,
+  "mode":     "qa",
+  ...
+}
 ```
 
-The segment is run through the same autonomous tagger and written to `lkc_stream.jsonl` under the shared session ID, making it immediately available to Module 5's LKC retrieval layer.
+Suggested UI patterns:
+- Show a pulsing indicator when `summoned: true` (agent is "thinking")
+- Add a **"Ask Lab Brain"** button that calls `POST /agent/summon/{session_id}` — useful when the speaker doesn't want to say the wake-word aloud
+- Add a **"Dismiss"** button that calls `DELETE /agent/summon/{session_id}` to cancel a pending response
 
 ---
 
-## Privacy & Consent
+## LKC Output Format (Month 5 additions)
 
-By default the system operates **opt-in** (`DEFAULT_CONSENT = False` in `privacy.py`) — no speaker is recorded or identified until they consent. Change to `True` for opt-out semantics.
+**Transcript segment** now includes per-word speaker attribution:
 
-Register consent via the UI sidebar or the API:
-
-```bash
-curl -X POST http://localhost:8000/privacy/consent \
-  -H "Content-Type: application/json" \
-  -d '{"speaker": "Person A", "consented": true, "real_name": "Zharif"}'
+```json
+{
+  "type":       "transcript",
+  "session_id": "a3f2b1c0",
+  "speaker":    "Person A",
+  "text":       "We decided to use mpnet for Month 5.",
+  "tags": {
+    "action_items": [],
+    "decisions":    ["We decided to use mpnet for Month 5"],
+    "entities":     ["Month 5"],
+    "deadlines":    []
+  },
+  "word_timestamps": [
+    {"word": "We",      "start": 0.0,  "end": 0.18, "score": 0.99, "speaker": "Person A"},
+    {"word": "decided", "start": 0.2,  "end": 0.56, "score": 0.98, "speaker": "Person A"}
+  ]
+}
 ```
 
-Non-consenting speakers are anonymised to `"Person (anon)"` in vision output. PII (emails, Indonesian phone numbers, NIK) is scrubbed from transcripts before LKC writes.
-
-Consent records persist in `consent.json` across server restarts.
-
 ---
 
-## Evaluation metrics
-
-`GET /metrics` returns per-session stats across seven axes:
-
-| Axis | Fields |
-|---|---|
-| ASR latency | `p50_ms`, `p95_ms`, segment count |
-| Vision latency | `p50_ms`, `p95_ms`, ok/error/stub frame counts, reliability |
-| WER | Mean WER, sample count (requires reference via `/eval/reference`) |
-| End-to-end | `p50_ms`, `p95_ms` (mic chunk received → transcript sent) |
-| Capture quality | `action_items`, `decisions`, `deadlines` counts per session |
-| Environment coverage | Valid / invalid frames, coverage ratio |
-| Confirmation resolution | Sent / accepted / denied, accept rate |
-| Privacy | PII tokens redacted |
-
-Download as CSV: `GET /metrics/csv`
-
----
-
-## Conversation modes
+## Conversation Modes
 
 | Mode | Trigger | Agent behaviour |
-|---|---|---|
-| **Ambient** | No speakers present | Silent — low-activity background |
-| **Greeting** | New face detected | Speaks a welcome; immediately transitions to Meeting Capture |
-| **Meeting Capture** | Active speech (non-question) | Silent capture — tags and writes to LKC |
-| **Q&A** | Question detected in transcript | Retrieves from LKC, then calls local LLM for a ≤2-sentence reply |
-| **Confirmation** | Autonomous tagger detects an action item or decision | Speaks *"I captured [tag]. Is that correct?"* — resolves on yes/no |
+|------|---------|-----------------|
+| **Ambient** | No speakers present | Silent |
+| **Greeting** | New face detected | Speaks welcome; returns to Meeting Capture |
+| **Meeting Capture** | Active speech (not summoned) | **Silent** — logs everything to LKC |
+| **QA** | Active speech **+ summon wake-word** | Retrieves from LKC + LLM reply (≤2 sentences) |
+| **Confirmation** | Tagger detects action item / decision | Speaks confirmation prompt; resolves on yes/no |
+
+> **Month 5 change:** QA mode previously triggered on any question detected in the room. It now requires an explicit summon phrase. Set `require_summon: false` in `config.json` to restore the old behaviour.
 
 ---
 
-## Speaker diarization
+## Month 6 upgrade path
 
-`assign_speaker()` in `dialogue.py` runs `pyannote/speaker-diarization-3.1` on each audio segment to identify the dominant speaker. The raw pyannote labels (e.g. `SPEAKER_01`) are mapped to stable per-session human labels (`Person A`, `Person B`, …) that remain consistent across segments within the same session.
-
-**Fallback behaviour:** if pyannote is not installed, the HF token is missing, or the model is unavailable, the server automatically falls back to round-robin label assignment — no manual configuration required. The fallback is logged at `WARNING` level on startup.
-
-To enable real diarization:
-```bash
-pip install pyannote.audio>=3.3.2 torch>=2.1.0
-huggingface-cli login   # or export HF_TOKEN=hf_...
-# Accept the model licence at https://huggingface.co/pyannote/speaker-diarization-3.1
-```
-
----
-
-## WhisperX ASR
-
-WhisperX wraps the same CTranslate2 backend as faster-whisper but adds a two-pass pipeline: transcription followed by a phoneme-level forced alignment step that produces per-word `start`, `end`, and `score` fields. These are written into each LKC transcript record under `word_timestamps` and forwarded to the browser UI.
-
-**Fallback behaviour:** if `whisperx` is not installed, the server loads `faster_whisper.WhisperModel` instead (same model weights, no word timestamps). A `WARNING` is logged on startup.
-
-**WhisperX model tradeoffs:**
-
-| Model | Size | WER (approx.) | CPU latency |
-|---|---|---|---|
-| `tiny` | ~75 MB | ~10% | ~300 ms |
-| `base` | ~145 MB | ~7% | ~600 ms |
-| `small` | ~466 MB | ~4% | ~1.5 s |
-| `medium` | ~1.5 GB | ~3% | ~4 s |
-
-Default is `small`. Change `model_size` in `config.json`. The alignment model for the detected language is downloaded once on first use and cached for the rest of the session.
-
----
-
-## LKC retrieval
-
-`lkc_retrieval.py` uses `sentence-transformers` (`all-MiniLM-L6-v2`, ~22 MB) to encode all LKC documents as dense vectors. At query time, cosine similarity is computed via a normalised matrix dot product — no vector database required. The index is rebuilt lazily whenever `lkc_stream.jsonl` is updated.
-
-**Fallback behaviour:** if `sentence-transformers` is not installed, the retriever automatically falls back to TF-IDF (sklearn). Both paths expose the same `query()` interface; call `retriever.stats()` to confirm which backend is active.
-
-The relevance floor is `0.15` for dense retrieval and `0.05` for TF-IDF, calibrated so that only meaningfully related segments are injected into the LLM prompt.
-
----
-
-## Month 5 upgrade path
-
-- **Persistent LKC graph** — survive server restarts; index the full session history, not just the current file
-- **WhisperX diarization alignment** — combine pyannote speaker segments with WhisperX word timestamps for word-level speaker attribution
-- **Larger embedding model** — swap `all-MiniLM-L6-v2` for `all-mpnet-base-v2` for higher retrieval accuracy on longer sessions
-- **spaCy NER** — replace regex entity extraction in `capture.py` with a fine-tuned English NER model for more precise entity detection
+- **Cross-session entity graph** — build a property graph linking People, Projects, Decisions, and Action Items across all sessions for structured Q&A
+- **Streaming TTS** — replace browser SpeechSynthesis with a local TTS model (Kokoro, Coqui) for consistent voice and offline operation
+- **WhisperX large-v3** — upgrade ASR model for lower WER on accented Indonesian-English code-switching
+- **Diarization + NER fusion** — use spaCy dependency parsing to resolve pronouns ("he", "she", "they") back to named speakers from the diarization timeline

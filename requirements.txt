@@ -1,4 +1,4 @@
-# Module 5 Month 4 — Multimodal Conversational Agent
+# Module 5 Month 6 — Multimodal Conversational Agent
 # Install with: pip install -r requirements.txt
 
 # ── Month 1 (unchanged) ───────────────────────────────────────────────────────
@@ -8,40 +8,32 @@ websockets>=12.0
 numpy>=1.26.0
 
 # ── Month 2 (unchanged) ───────────────────────────────────────────────────────
-# OpenAI-compatible client — talks to Ollama, LM Studio, llama.cpp, vLLM…
 openai>=1.30.0
-
-# Pydantic v2
 pydantic>=2.0.0
 
 # ── Month 3 (unchanged) ───────────────────────────────────────────────────────
-# Rifqi ingest: ISO timestamp parsing
 python-dateutil>=2.9.0
 
-# ── Month 4 additions ─────────────────────────────────────────────────────────
-
-# WhisperX — replaces faster-whisper; adds word-level timestamps + diarization
-# alignment on top of the same CTranslate2 backend.
-# GPU recommended; runs on CPU with compute_type=int8.
+# ── Month 4 (unchanged) ───────────────────────────────────────────────────────
 whisperx>=3.1.5
-
-# Dense LKC retrieval — replaces TF-IDF; ~22 MB model downloaded on first use.
-# CPU-friendly; upgrade to a larger model (all-mpnet-base-v2) for Month 5.
-sentence-transformers==3.3.1
-
-# Speaker diarization — pyannote/speaker-diarization-3.1.
-# Requires a Hugging Face token that has accepted the model licence:
-#   huggingface-cli login   (or set HF_TOKEN env var)
-# Comment out if GPU/RAM budget is tight; server falls back to round-robin.
 pyannote.audio>=3.3.2
-
-# PyTorch — required by both pyannote and sentence-transformers.
-# CPU-only build (saves ~1 GB); swap for a CUDA build if GPU is available.
 torch>=2.1.0
-
-# scikit-learn — kept as TF-IDF fallback for lkc_retrieval when
-# sentence-transformers is unavailable (e.g. resource-constrained laptops).
 scikit-learn>=1.4.0
 
-# ── Dev / evaluation ──────────────────────────────────────────────────────────
-# jiwer>=3.0.4       # standard WER — our pure-Python impl is used for PoC
+# ── Month 5 (unchanged) ───────────────────────────────────────────────────────
+sentence-transformers==3.3.1
+spacy>=3.7.0
+
+# ── Month 6 additions ─────────────────────────────────────────────────────────
+
+# LiveKit Python SDK — room management, token signing, server-side participant
+livekit>=0.11.0
+livekit-api>=0.6.0
+
+# Audio resampling: converts LiveKit's 48kHz int16 stereo to 16kHz mono float32
+# before feeding into the existing VadChunker / WhisperX pipeline.
+soxr>=0.3.7
+
+# PyAV is pulled by whisperx; listed explicitly for the video frame decoder
+# used in the LiveKit video subscriber.
+av>=12.0.0

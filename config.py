@@ -1,17 +1,9 @@
 """
-config.py — Central configuration loader for Module 5.
+config.py — Central configuration loader for Module 5 (Month 6).
 
-Reads config.json from the same directory as this file.
-All other modules import from here instead of reading env vars or
-hardcoding constants directly.
-
-Usage:
-    from config import cfg
-
-    cfg.local_llm.base_url
-    cfg.local_llm.vision_model
-    cfg.vad.silence_threshold
-    ...
+Month 6 additions
+-----------------
+* LiveKitConfig — SFU URL, API key/secret for token signing and room management
 """
 
 from __future__ import annotations
@@ -21,37 +13,37 @@ import logging
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 log = logging.getLogger(__name__)
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
-# ── Typed sub-configs ─────────────────────────────────────────────────────────
+
+# ── Typed sub-configs ──────────────────────────────────────────────────────────
 
 @dataclass
 class LocalLLMConfig:
     base_url:       str = "http://localhost:11434/v1"
-    api_key:        str = "ollama"          # Ollama ignores this; other servers may need it
-    vision_model:   str = "llava:7b"        # must support image inputs
-    dialogue_model: str = "llama3.2:3b"    # text-only chat model
-    hf_token:       str = ""                # Hugging Face token for gated models (e.g. pyannote diarization)
+    api_key:        str = "ollama"
+    vision_model:   str = "llava:7b"
+    dialogue_model: str = "llama3.2:3b"
+    hf_token:       str = ""
 
     @property
     def available(self) -> bool:
-        """Always true — no remote API key required for a local server."""
         return True
 
 
 @dataclass
 class WhisperConfig:
-    model_size:   str           = "small"  # tiny, base, small, medium, turbo
+    model_size:   str           = "small"
     device:       str           = "cpu"
     compute_type: str           = "int8"
-    beam_size:    int           = 1       # 1=greedy (3-4x faster, ~same WER for conversational speech)
-    language:     Optional[str] = None   # None = auto-detect
-    cpu_threads:  int           = 8      # set to your physical core count
-    num_workers:  int           = 2      # allows overlap between segments
+    beam_size:    int           = 1
+    language:     Optional[str] = None
+    cpu_threads:  int           = 8
+    num_workers:  int           = 2
 
 
 @dataclass
@@ -71,7 +63,8 @@ class VisionConfig:
 
 @dataclass
 class LkcConfig:
-    log_file:       str = "lkc_stream.jsonl"
+    log_file:        str = "lkc_stream.jsonl"
+    db_file:         str = "lkc_graph.db"
     retrieval_top_k: int = 4
 
 
@@ -88,23 +81,65 @@ class DialogueConfig:
 
 
 @dataclass
+class SummonConfig:
+    phrases: List[str] = field(default_factory=lambda: [
+        "lab brain",
+        "hey brain",
+        "hey lab brain",
+        "@lab",
+        "brain,",
+        "brain?",
+    ])
+    require_summon: bool = True
+
+
+@dataclass
+class SpacyConfig:
+    model:        str       = "en_core_web_sm"
+    entity_types: List[str] = field(default_factory=lambda: [
+        "PERSON", "ORG", "PRODUCT", "GPE", "DATE", "EVENT", "WORK_OF_ART"
+    ])
+
+
+@dataclass
+class LiveKitConfig:
+    """
+    Month 6 — LiveKit SFU configuration.
+
+    url        : WebSocket URL of the LiveKit server (self-hosted or Cloud).
+    api_key    : LiveKit API key (used to sign tokens and manage rooms).
+    api_secret : LiveKit API secret (never sent to the browser).
+
+    Quick local dev:
+        docker run --rm -p 7880:7880 livekit/livekit-server --dev
+    This starts the server with placeholder credentials
+    api_key="devkey", api_secret="secret" (not "devsecret" — match exactly).
+    """
+    url:        str = "ws://localhost:7880"
+    api_key:    str = "devkey"
+    api_secret: str = "secret"
+
+
+@dataclass
 class Config:
     local_llm: LocalLLMConfig = field(default_factory=LocalLLMConfig)
-    whisper:  WhisperConfig   = field(default_factory=WhisperConfig)
-    vad:      VadConfig      = field(default_factory=VadConfig)
-    vision:   VisionConfig   = field(default_factory=VisionConfig)
-    lkc:      LkcConfig      = field(default_factory=LkcConfig)
-    server:   ServerConfig   = field(default_factory=ServerConfig)
-    dialogue: DialogueConfig = field(default_factory=DialogueConfig)
+    whisper:   WhisperConfig  = field(default_factory=WhisperConfig)
+    vad:       VadConfig      = field(default_factory=VadConfig)
+    vision:    VisionConfig   = field(default_factory=VisionConfig)
+    lkc:       LkcConfig      = field(default_factory=LkcConfig)
+    server:    ServerConfig   = field(default_factory=ServerConfig)
+    dialogue:  DialogueConfig = field(default_factory=DialogueConfig)
+    summon:    SummonConfig   = field(default_factory=SummonConfig)
+    spacy:     SpacyConfig    = field(default_factory=SpacyConfig)
+    livekit:   LiveKitConfig  = field(default_factory=LiveKitConfig)   # Month 6
 
 
-# ── Loader ────────────────────────────────────────────────────────────────────
+# ── Loader ─────────────────────────────────────────────────────────────────────
 
 def _apply(dataclass_obj, raw: dict) -> None:
-    """Recursively set fields on a dataclass from a dict, ignoring unknown keys."""
     for key, val in raw.items():
         if key.startswith("_"):
-            continue  # skip comment keys
+            continue
         if hasattr(dataclass_obj, key):
             setattr(dataclass_obj, key, val)
 
@@ -123,24 +158,26 @@ def load(path: Path = CONFIG_PATH) -> Config:
     c = Config()
     section_map = {
         "local_llm": c.local_llm,
-        "whisper":  c.whisper,
-        "vad":      c.vad,
-        "vision":   c.vision,
-        "lkc":      c.lkc,
-        "server":   c.server,
-        "dialogue": c.dialogue,
+        "whisper":   c.whisper,
+        "vad":       c.vad,
+        "vision":    c.vision,
+        "lkc":       c.lkc,
+        "server":    c.server,
+        "dialogue":  c.dialogue,
+        "summon":    c.summon,
+        "spacy":     c.spacy,
+        "livekit":   c.livekit,   # Month 6
     }
     for section, obj in section_map.items():
         if section in raw:
             _apply(obj, raw[section])
 
-    if not c.local_llm.available:
-        log.warning("Local LLM base_url not set — vision and dialogue will run in stub mode.")
-    else:
-        log.info(f"Config loaded. Local LLM endpoint: {c.local_llm.base_url}")
-
+    log.info(f"Config loaded. LLM: {c.local_llm.base_url} | "
+             f"summon_required={c.summon.require_summon} | "
+             f"NER={c.spacy.model} | "
+             f"graph={c.lkc.db_file} | "
+             f"livekit={c.livekit.url}")
     return c
 
 
-# ── Module-level singleton ────────────────────────────────────────────────────
 cfg: Config = load()
