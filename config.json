@@ -1,47 +1,62 @@
 {
   "local_llm": {
-    "base_url":       "http://localhost:11434/v1",
-    "vision_model":   "llava:7b",
+    "base_url": "http://localhost:11434/v1",
+    "vision_model": "llava:7b",
     "dialogue_model": "llama3.2:3b",
-    "hf_token":       "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"
+    "hf_token": "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"
   },
   "whisper": {
-    "model_size":   "small",
-    "device":       "cpu",
+    "model_size": "small",
+    "device": "cpu",
     "compute_type": "int8",
-    "language":     null,
-    "cpu_threads":  8
+    "language": null,
+    "cpu_threads": 8
   },
   "vad": {
     "silence_threshold": 0.01,
-    "silence_chunks":    4
+    "silence_chunks": 4
   },
   "lkc": {
-    "log_file":        "lkc_stream.jsonl",
-    "db_file":         "lkc_graph.db",
+    "log_file": "lkc_stream.jsonl",
+    "db_file": "lkc_graph.db",
     "retrieval_top_k": 4
   },
   "summon": {
-    "_comment":       "Wake-word phrases that trigger the agent. Case-insensitive.",
-    "phrases":        ["lab brain", "hey brain", "hey lab brain", "@lab", "brain,", "brain?"],
+    "_comment": "Wake-word phrases that trigger the agent. Case-insensitive.",
+    "phrases": [
+      "lab brain",
+      "hey brain",
+      "hey lab brain",
+      "@lab",
+      "brain,",
+      "brain?"
+    ],
     "require_summon": true
   },
   "spacy": {
-    "_comment":    "NER model. Run: python -m spacy download en_core_web_sm",
-    "model":       "en_core_web_sm",
-    "entity_types": ["PERSON", "ORG", "PRODUCT", "GPE", "DATE", "EVENT", "WORK_OF_ART"]
+    "_comment": "NER model. Run: python -m spacy download en_core_web_sm",
+    "model": "en_core_web_sm",
+    "entity_types": [
+      "PERSON",
+      "ORG",
+      "PRODUCT",
+      "GPE",
+      "DATE",
+      "EVENT",
+      "WORK_OF_ART"
+    ]
   },
   "livekit": {
-    "_comment":   "LiveKit SFU — run: docker run --rm -p 7880:7880 livekit/livekit-server --dev",
-    "url":        "ws://localhost:7880",
-    "api_key":    "devkey",
+    "_comment": "LiveKit SFU \u00e2\u20ac\u201d run: docker run --rm -p 7880:7880 livekit/livekit-server --dev",
+    "url": "ws://localhost:7880",
+    "api_key": "devkey",
     "api_secret": "devsecret"
   },
   "supabase": {
-    "_comment":     "Set SUPABASE_URL and SUPABASE_KEY env vars instead of hardcoding secrets here.",
-    "url":          "",
-    "key":          "",
-    "store_audio":  false,
+    "_comment": "Set SUPABASE_URL and SUPABASE_KEY env vars instead of hardcoding secrets here.",
+    "url": "http://localhost:8000",
+    "key": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzgyMzAwMTkxLCJleHAiOjE5Mzk5ODAxOTF9.tlwNOPddfnP8sr0xn13nkx0LUSs2GOrEuV4wBuV7MHM",
+    "store_audio": false,
     "store_vision": true
   }
 }
