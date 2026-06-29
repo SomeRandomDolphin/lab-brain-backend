@@ -1,43 +1,42 @@
-# Module 5 Month 6 — Multimodal Conversational Agent
-# Install with: pip install -r requirements.txt
+# Lab Brain — Module 5 (Month 7+)
+# Install: pip install -r requirements.txt
 
-# ── Month 1 (unchanged) ───────────────────────────────────────────────────────
+# ── Web framework ──────────────────────────────────────────────────────────────
 fastapi>=0.111.0
 uvicorn[standard]>=0.29.0
-websockets>=12.0
-numpy>=1.26.0
-
-# ── Month 2 (unchanged) ───────────────────────────────────────────────────────
-openai>=1.30.0
 pydantic>=2.0.0
-
-# ── Month 3 (unchanged) ───────────────────────────────────────────────────────
 python-dateutil>=2.9.0
 
-# ── Month 4 (unchanged) ───────────────────────────────────────────────────────
+# ── Networking / async ────────────────────────────────────────────────────────
+websockets>=12.0
+
+# ── Numerics ──────────────────────────────────────────────────────────────────
+numpy>=1.26.0
+
+# ── LLM / ASR ─────────────────────────────────────────────────────────────────
+openai>=1.30.0
 whisperx>=3.1.5
-pyannote.audio>=3.3.2
 torch>=2.1.0
+
+# ── Diarization ───────────────────────────────────────────────────────────────
+pyannote.audio>=3.3.2
+
+# ── Retrieval ─────────────────────────────────────────────────────────────────
+sentence-transformers>=3.3.1
 scikit-learn>=1.4.0
 
-# ── Month 5 (unchanged) ───────────────────────────────────────────────────────
-sentence-transformers>=3.3.1
+# ── NER ───────────────────────────────────────────────────────────────────────
 spacy>=3.7.0
+# After install: python -m spacy download en_core_web_sm
 
-# ── Month 6 additions ─────────────────────────────────────────────────────────
-
-# LiveKit Python SDK — room management, token signing, server-side participant
+# ── LiveKit ───────────────────────────────────────────────────────────────────
 livekit>=0.11.0
 livekit-api>=0.6.0
+soxr>=0.3.7       # 48kHz → 16kHz resampling for LiveKit audio frames
+av>=12.0.0        # PyAV for video frame decoding
 
-# Audio resampling: converts LiveKit's 48kHz int16 stereo to 16kHz mono float32
-soxr>=0.3.7
-
-# PyAV — video frame decoder for the LiveKit video subscriber
-av>=12.0.0
-
-# ── Month 7 additions ─────────────────────────────────────────────────────────
-
-# Supabase Python client — Postgres tables + Storage buckets
-# Docs: https://supabase.com/docs/reference/python/introduction
+# ── Supabase ──────────────────────────────────────────────────────────────────
 supabase>=2.4.0
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+bcrypt>=4.1.0          # password hashing (PBKDF2 fallback used if unavailable)

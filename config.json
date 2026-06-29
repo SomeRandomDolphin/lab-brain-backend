@@ -3,7 +3,7 @@
     "base_url": "http://localhost:11434/v1",
     "vision_model": "llava:7b",
     "dialogue_model": "llama3.2:3b",
-    "hf_token": "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"
+    "hf_token": ""
   },
   "whisper": {
     "model_size": "small",
@@ -53,9 +53,9 @@
     "api_secret": "devsecret"
   },
   "supabase": {
-    "_comment": "Set SUPABASE_URL and SUPABASE_KEY env vars instead of hardcoding secrets here.",
+    "_comment": "Set SUPABASE_URL and SUPABASE_KEY env vars \u00e2\u20ac\u201d never hardcode secrets here.",
     "url": "http://localhost:8000",
-    "key": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzgyMzAwMTkxLCJleHAiOjE5Mzk5ODAxOTF9.tlwNOPddfnP8sr0xn13nkx0LUSs2GOrEuV4wBuV7MHM",
+    "key": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzgyNzEyNDE4LCJleHAiOjE5NDAzOTI0MTh9.JRXxfOd3PEP8YBvoX_u6f7WYu6Mr2ZWJfvRqL-GkUyc",
     "store_audio": false,
     "store_vision": true
   }

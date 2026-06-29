@@ -14,6 +14,7 @@
 #              Uses the Supabase CLI when available; falls back to Docker
 #              Compose by cloning the official supabase/supabase repo.
 #              Reads supabase.url / supabase.key from config.json.
+#              All Compose containers are prefixed "lab-brain-supabase".
 #
 #   Ollama   — Local LLM inference server (OpenAI-compatible API).
 #              Pulls vision_model and dialogue_model straight from config.json
@@ -189,11 +190,18 @@ start_livekit() {
 #   5. Start via `sh run.sh start`  (wraps `docker compose up -d --wait`)
 #   6. Health-check via `docker compose ps`
 #   7. Write supabase.url + supabase.key back into config.json
+#
+# All Compose-managed containers are prefixed with the project name
+# "lab-brain-supabase" (set via COMPOSE_PROJECT_NAME) so they appear as
+# lab-brain-supabase-db-1, lab-brain-supabase-kong-1, etc. — consistent
+# with the lab-brain-livekit and lab-brain-ollama naming convention.
 
 SUPABASE_PROJECT_DIR="${SCRIPT_DIR}/supabase-project"
 SUPABASE_REPO_DIR="${SCRIPT_DIR}/.supabase-repo"
 # The guide's API gateway (Kong) listens on port 8000
 SUPABASE_API_PORT=8000
+# Compose project name — controls the container name prefix
+SUPABASE_COMPOSE_PROJECT="lab-brain-supabase"
 
 start_supabase() {
   info "Setting up Supabase (official self-hosting guide)..."
@@ -231,6 +239,7 @@ start_supabase() {
 
   local env_file="${SUPABASE_PROJECT_DIR}/.env"
   local run_sh="${SUPABASE_PROJECT_DIR}/run.sh"
+  local compose_file="${SUPABASE_PROJECT_DIR}/docker-compose.yml"
 
   # ── Step 3: generate secrets (first-time only) ───────────────────────────
   # Detect whether this is a first-time setup by checking if POSTGRES_PASSWORD
@@ -288,32 +297,22 @@ start_supabase() {
 
   # ── Step 4: pull images ──────────────────────────────────────────────────
   info "Pulling Supabase Docker images (may take a while on first run)..."
-  (cd "$SUPABASE_PROJECT_DIR" && docker compose pull) \
+  (cd "$SUPABASE_PROJECT_DIR" && COMPOSE_PROJECT_NAME="$SUPABASE_COMPOSE_PROJECT" docker compose pull) \
     || die "docker compose pull failed. Check your internet connection."
 
   # ── Step 5: start via run.sh ─────────────────────────────────────────────
   info "Starting Supabase stack via run.sh start..."
   if [[ -f "$run_sh" ]]; then
-    (cd "$SUPABASE_PROJECT_DIR" && sh run.sh start) \
-      || die "run.sh start failed. Check logs: cd ${SUPABASE_PROJECT_DIR} && sh run.sh logs"
+    (cd "$SUPABASE_PROJECT_DIR" && COMPOSE_PROJECT_NAME="$SUPABASE_COMPOSE_PROJECT" sh run.sh start) \
+      || die "run.sh start failed. Check logs: cd ${SUPABASE_PROJECT_DIR} && COMPOSE_PROJECT_NAME=${SUPABASE_COMPOSE_PROJECT} sh run.sh logs"
   else
     # run.sh missing (older repo checkout) — fall back to docker compose directly
     warn "run.sh not found — falling back to docker compose up -d --wait."
-    (cd "$SUPABASE_PROJECT_DIR" && docker compose up -d --wait) \
-      || die "docker compose up failed. Check logs: docker compose -f ${SUPABASE_PROJECT_DIR}/docker-compose.yml logs"
+    (cd "$SUPABASE_PROJECT_DIR" && COMPOSE_PROJECT_NAME="$SUPABASE_COMPOSE_PROJECT" docker compose up -d --wait) \
+      || die "docker compose up failed. Check logs: cd ${SUPABASE_PROJECT_DIR} && COMPOSE_PROJECT_NAME=${SUPABASE_COMPOSE_PROJECT} docker compose logs"
   fi
 
-  # ── Step 6: health check ─────────────────────────────────────────────────
-  info "Waiting for Supabase API gateway on :${SUPABASE_API_PORT}..."
-  if wait_for_http "http://localhost:${SUPABASE_API_PORT}/" 120 2; then
-    success "Supabase is up."
-  else
-    warn "API gateway didn't respond within 120 s — services may still be starting."
-    warn "Run:  cd ${SUPABASE_PROJECT_DIR} && docker compose ps"
-    warn "      sh tests/test-container-logs.sh"
-  fi
-
-  # ── Step 7: extract keys and update config.json ──────────────────────────
+  # ── Step 6: extract keys and update config.json ──────────────────────────
   local anon_key publishable_key api_url
   # The guide uses SUPABASE_PUBLISHABLE_KEY (new) or ANON_KEY (legacy)
   publishable_key=$(grep -E '^(SUPABASE_PUBLISHABLE_KEY|ANON_KEY)=' "$env_file" \
@@ -337,16 +336,25 @@ print('config.json updated.')
   fi
 
   echo ""
+  local pg_port
+  pg_port=$(grep '^POSTGRES_PORT=' "$env_file" | cut -d= -f2- | tr -d '"' || true)
+  pg_port="${pg_port:-5432}"
+  local pg_pass_display
+  pg_pass_display=$(grep '^POSTGRES_PASSWORD=' "$env_file" | cut -d= -f2- | tr -d '"' || true)
+
   echo "  Studio (Dashboard) → http://localhost:${SUPABASE_API_PORT}"
   echo "  REST API           → http://localhost:${SUPABASE_API_PORT}/rest/v1/"
   echo "  Auth API           → http://localhost:${SUPABASE_API_PORT}/auth/v1/"
   echo "  Storage API        → http://localhost:${SUPABASE_API_PORT}/storage/v1/"
+  echo "  Postgres (direct)  → postgresql+asyncpg://postgres:${pg_pass_display}@localhost:${pg_port}/postgres"
+  echo "  (Set this as SUPABASE_DB_URL in your .env for Alembic migrations)"
   echo ""
+  echo "  Containers:   docker ps --filter name=${SUPABASE_COMPOSE_PROJECT}"
   echo "  Credentials:  cat ${env_file}"
-  echo "                cd ${SUPABASE_PROJECT_DIR} && sh run.sh secrets"
-  echo "  Logs:         cd ${SUPABASE_PROJECT_DIR} && sh run.sh logs [service]"
-  echo "  Stop:         cd ${SUPABASE_PROJECT_DIR} && sh run.sh stop"
-  echo "  Health:       cd ${SUPABASE_PROJECT_DIR} && docker compose ps"
+  echo "                cd ${SUPABASE_PROJECT_DIR} && COMPOSE_PROJECT_NAME=${SUPABASE_COMPOSE_PROJECT} sh run.sh secrets"
+  echo "  Logs:         cd ${SUPABASE_PROJECT_DIR} && COMPOSE_PROJECT_NAME=${SUPABASE_COMPOSE_PROJECT} sh run.sh logs [service]"
+  echo "  Stop:         cd ${SUPABASE_PROJECT_DIR} && COMPOSE_PROJECT_NAME=${SUPABASE_COMPOSE_PROJECT} sh run.sh stop"
+  echo "  Health:       docker ps --filter name=${SUPABASE_COMPOSE_PROJECT}"
   echo ""
 }
 

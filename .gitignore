@@ -1,5 +1,7 @@
-/__pycache__
-/.vscode
-/.supabase-repo
-/supabase-local
-/supabase-project
+__pycache__/
+.vscode/
+.env
+.venv/
+supabase-local/
+supabase-project/
+.supabase-repo/

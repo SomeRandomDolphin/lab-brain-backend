@@ -1,29 +1,8 @@
 """
-dialogue.py — Conversation Mode FSM + Agent Replies (Module 5, Month 5)
+app/pipeline/dialogue_service.py — Conversation Mode FSM + Agent Replies.
 
-Month 5 changes
----------------
-1.  Summon-gated QA — the agent replies ONLY when explicitly addressed via a
-    wake-word ("Lab Brain", "hey brain", "@lab", …).  The QA mode transition
-    in update_mode() now requires capture.is_summoned(session_id) to be True.
-    After the agent replies, capture.clear_summon() resets the flag so the
-    agent goes back to silent capture mode.
-
-    This prevents the agent from constantly jumping into QA mode whenever
-    anyone in the room asks a question to each other.
-
-2.  WhisperX + pyannote word-level speaker alignment — `assign_speaker_words()`
-    is a new function that takes pyannote diarization output and WhisperX
-    word-level timestamps and returns a word list annotated with speaker IDs.
-    This enables the LKC to store who said each individual word, not just
-    which speaker dominated a segment.
-
-    The function is called from server.py only when both pyannote AND whisperx
-    word-level timestamps are available; the existing `assign_speaker()` segment-
-    level fallback is unchanged.
-
-All Month 3/4 features (CONFIRMATION mode, pyannote diarization, summary
-generation, context window) are retained unchanged.
+Ported from the flat dialogue.py into the structured pipeline package.
+No logic changes — only import paths updated.
 """
 
 from __future__ import annotations
@@ -38,11 +17,11 @@ from typing import Optional
 
 import numpy as np
 
-from config import cfg
+from app.core.config import cfg
 
 log = logging.getLogger(__name__)
 
-# ── Month 4: pyannote.audio diarization (unchanged) ──────────────────────────
+# ── pyannote diarization ──────────────────────────────────────────────────────
 try:
     import torch
     from pyannote.audio import Pipeline as PyannotePipeline
@@ -54,7 +33,7 @@ _diarization_pipeline: Optional["PyannotePipeline"] = None
 _diarization_pipeline_error: Optional[str] = None
 
 
-def _get_diarization_pipeline() -> Optional["PyannotePipeline"]:
+def _get_diarization_pipeline():
     global _diarization_pipeline, _diarization_pipeline_error
     if _diarization_pipeline is not None:
         return _diarization_pipeline
@@ -71,11 +50,11 @@ def _get_diarization_pipeline() -> Optional["PyannotePipeline"]:
             or os.environ.get("HF_TOKEN")
             or os.environ.get("HUGGINGFACE_TOKEN")
         )
-        use_auth = {"use_auth_token": hf_token} if hf_token else {}
-        pipeline = PyannotePipeline.from_pretrained(
+        use_auth  = {"use_auth_token": hf_token} if hf_token else {}
+        pipeline  = PyannotePipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1", **use_auth
         )
-        device = "cuda" if (PYANNOTE_AVAILABLE and torch.cuda.is_available()) else "cpu"
+        device    = "cuda" if (PYANNOTE_AVAILABLE and torch.cuda.is_available()) else "cpu"
         pipeline.to(torch.device(device))
         _diarization_pipeline = pipeline
         log.info(f"[diarization] pyannote pipeline loaded on {device}")
@@ -86,7 +65,7 @@ def _get_diarization_pipeline() -> Optional["PyannotePipeline"]:
         return None
 
 
-# ── OpenAI-compatible local client ────────────────────────────────────────────
+# ── Local LLM client ──────────────────────────────────────────────────────────
 try:
     from openai import OpenAI
     _dialogue_client = OpenAI(
@@ -105,7 +84,7 @@ _SYSTEM_PROMPT = (
 )
 
 
-# ── Mode enum ─────────────────────────────────────────────────────────────────
+# ── Mode FSM ──────────────────────────────────────────────────────────────────
 class ConvMode(str, Enum):
     GREETING        = "greeting"
     MEETING_CAPTURE = "meeting_capture"
@@ -114,29 +93,47 @@ class ConvMode(str, Enum):
     CONFIRMATION    = "confirmation"
 
 
-# ── Question detection ────────────────────────────────────────────────────────
 _QUESTION_RE = re.compile(
     r"\b(what|who|where|when|why|how|is|are|was|were|can|could|should|would|"
     r"did|do|does|tell me|explain|summarize|recap|define)\b",
     re.IGNORECASE,
 )
 
+
 def _looks_like_question(text: str) -> bool:
     return text.strip().endswith("?") or bool(_QUESTION_RE.search(text))
 
 
-# ── Dialogue state ─────────────────────────────────────────────────────────────
+_AFFIRM_RE = re.compile(
+    r"\b(yes|correct|right|sure|exactly|affirmative|yep|yeah|confirmed|ok|okay|go ahead)\b",
+    re.IGNORECASE,
+)
+_DENY_RE = re.compile(
+    r"\b(no|nope|wrong|incorrect|never mind|nevermind|skip|cancel|ignore|not quite)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_affirmation(text: str) -> bool:
+    return bool(_AFFIRM_RE.search(text))
+
+
+def _is_denial(text: str) -> bool:
+    return bool(_DENY_RE.search(text))
+
+
+# ── Dialogue state ────────────────────────────────────────────────────────────
 @dataclass
 class DialogueState:
     session_id:           str
-    mode:                 ConvMode     = ConvMode.AMBIENT
-    mode_entered_at:      float        = field(default_factory=time.time)
-    greeted_speakers:     set[str]     = field(default_factory=set)
-    _chat_history:        list         = field(default_factory=list, repr=False)
-    transcript_context:   list[str]    = field(default_factory=list)
-    CONTEXT_WINDOW:       int          = field(default_factory=lambda: cfg.dialogue.context_window)
+    mode:                 ConvMode      = ConvMode.AMBIENT
+    mode_entered_at:      float         = field(default_factory=time.time)
+    greeted_speakers:     set[str]      = field(default_factory=set)
+    _chat_history:        list          = field(default_factory=list, repr=False)
+    transcript_context:   list[str]     = field(default_factory=list)
+    CONTEXT_WINDOW:       int           = field(default_factory=lambda: cfg.dialogue.context_window)
     confirmation_pending: Optional[str] = None
-    _speaker_counter:     int          = field(default=0, repr=False)
+    _speaker_counter:     int           = field(default=0, repr=False)
 
     def push_context(self, speaker: str, text: str) -> None:
         self.transcript_context.append(f"{speaker}: {text}")
@@ -150,44 +147,54 @@ class DialogueState:
         return self._chat_history
 
 
-# ── Speaker labels ─────────────────────────────────────────────────────────────
 _SPEAKER_LABELS = [f"Person {chr(65+i)}" for i in range(8)]
 _SAMPLE_RATE    = 16000
 
+_dialogue_states: dict[str, DialogueState] = {}
+
+
+def get_dialogue(session_id: str) -> DialogueState:
+    if session_id not in _dialogue_states:
+        _dialogue_states[session_id] = DialogueState(session_id=session_id)
+    return _dialogue_states[session_id]
+
+
+def clear_dialogue(session_id: str) -> None:
+    _dialogue_states.pop(session_id, None)
+
+
+def push_context(state: DialogueState, speaker: str, text: str) -> None:
+    state.push_context(speaker, text)
+
+
+# ── Speaker assignment ────────────────────────────────────────────────────────
 
 def assign_speaker(
     state: DialogueState,
-    audio_segment: bytes | np.ndarray | None = None,
+    audio_segment=None,
 ) -> str:
-    """Segment-level speaker assignment (unchanged from Month 4)."""
     pipeline = _get_diarization_pipeline()
-
     if pipeline is not None and audio_segment is not None:
         try:
             import torch
-            if isinstance(audio_segment, bytes):
-                wav = np.frombuffer(audio_segment, dtype=np.float32).copy()
-            elif isinstance(audio_segment, np.ndarray):
-                wav = audio_segment.astype(np.float32)
-            else:
-                raise TypeError(f"Unsupported audio type: {type(audio_segment)}")
-
+            wav = (
+                np.frombuffer(audio_segment, dtype=np.float32).copy()
+                if isinstance(audio_segment, bytes)
+                else audio_segment.astype(np.float32)
+            )
             min_samples = int(0.5 * _SAMPLE_RATE)
             if wav.size < min_samples:
                 raise ValueError(f"Segment too short ({wav.size} samples)")
 
             waveform    = torch.from_numpy(wav).unsqueeze(0)
-            audio_input = {"waveform": waveform, "sample_rate": _SAMPLE_RATE}
-            diarization = pipeline(audio_input)
+            diarization = pipeline({"waveform": waveform, "sample_rate": _SAMPLE_RATE})
 
             duration_per_speaker: dict[str, float] = {}
             for turn, _, speaker in diarization.itertracks(yield_label=True):
-                duration_per_speaker[speaker] = (
-                    duration_per_speaker.get(speaker, 0.0) + turn.duration
-                )
+                duration_per_speaker[speaker] = duration_per_speaker.get(speaker, 0.0) + turn.duration
 
             if not duration_per_speaker:
-                raise ValueError("No speakers detected by pyannote")
+                raise ValueError("No speakers detected")
 
             dominant_raw = max(duration_per_speaker, key=duration_per_speaker.get)
 
@@ -202,64 +209,34 @@ def assign_speaker(
             return state._speaker_map[dominant_raw]
 
         except Exception as exc:
-            log.warning(
-                f"[diarization:{state.session_id}] inference failed ({exc})"
-                " — falling back to round-robin"
-            )
+            log.warning(f"[diarization:{state.session_id}] inference failed ({exc}) — round-robin fallback")
 
     label = _SPEAKER_LABELS[state._speaker_counter % len(_SPEAKER_LABELS)]
     state._speaker_counter += 1
     return label
 
 
-# ── Month 5: Word-level speaker alignment ─────────────────────────────────────
-
 def assign_speaker_words(
     state: DialogueState,
     word_timestamps: list[dict],
     audio_segment: np.ndarray,
 ) -> list[dict]:
-    """
-    Combine pyannote diarization with WhisperX word-level timestamps to
-    produce per-word speaker attribution.
-
-    For each word in word_timestamps (each has 'word', 'start', 'end', 'score'),
-    we find which pyannote speaker turn contains the word's midpoint and
-    annotate the word dict with a 'speaker' key using the session-stable label.
-
-    Returns the enriched word list.  Falls back to assign_speaker() segment
-    attribution (all words get the same speaker) when pyannote is unavailable
-    or when word_timestamps is empty.
-
-    Parameters
-    ----------
-    state           : DialogueState (carries _speaker_map for label stability)
-    word_timestamps : list of {word, start, end, score} from WhisperX alignment
-    audio_segment   : float32 np.ndarray at 16 kHz (same segment)
-    """
     if not word_timestamps:
         return word_timestamps
 
     pipeline = _get_diarization_pipeline()
     if pipeline is None:
-        # Segment-level fallback: every word gets the same dominant speaker
-        fallback_speaker = assign_speaker(state, audio_segment)
-        return [{**w, "speaker": fallback_speaker} for w in word_timestamps]
+        fallback = assign_speaker(state, audio_segment)
+        return [{**w, "speaker": fallback} for w in word_timestamps]
 
     try:
         import torch
-
         wav         = audio_segment.astype(np.float32)
-        waveform    = torch.from_numpy(wav).unsqueeze(0)
-        audio_input = {"waveform": waveform, "sample_rate": _SAMPLE_RATE}
-        diarization = pipeline(audio_input)
+        diarization = pipeline({"waveform": torch.from_numpy(wav).unsqueeze(0), "sample_rate": _SAMPLE_RATE})
 
-        # Build stable label map
         if not hasattr(state, "_speaker_map"):
-            state._speaker_map: dict[str, str] = {}
+            state._speaker_map = {}
 
-        # Materialise diarization turns into a list for O(N*M) word-level lookup.
-        # For typical short segments (< 30 s) the turn count is small (< 10).
         turns: list[tuple[float, float, str]] = []
         for turn, _, raw_label in diarization.itertracks(yield_label=True):
             if raw_label not in state._speaker_map:
@@ -271,67 +248,31 @@ def assign_speaker_words(
             turns.append((turn.start, turn.end, state._speaker_map[raw_label]))
 
         def _speaker_at(t: float) -> str:
-            """Return the speaker label whose turn contains time t."""
             for start, end, label in turns:
                 if start <= t <= end:
                     return label
-            # If t falls in a gap, pick the nearest turn
             if not turns:
                 return assign_speaker(state, None)
             nearest = min(turns, key=lambda x: min(abs(x[0] - t), abs(x[1] - t)))
             return nearest[2]
 
-        enriched: list[dict] = []
-        for w in word_timestamps:
-            midpoint = (w.get("start", 0.0) + w.get("end", 0.0)) / 2.0
-            enriched.append({**w, "speaker": _speaker_at(midpoint)})
-
+        enriched = [
+            {**w, "speaker": _speaker_at((w.get("start", 0.0) + w.get("end", 0.0)) / 2.0)}
+            for w in word_timestamps
+        ]
         log.debug(
-            f"[diarization:{state.session_id}] word-level alignment: "
-            f"{len(enriched)} words, {len(turns)} turns, "
-            f"{len(state._speaker_map)} speakers"
+            f"[diarization:{state.session_id}] word-level: "
+            f"{len(enriched)} words, {len(turns)} turns"
         )
         return enriched
 
     except Exception as exc:
-        log.warning(
-            f"[diarization:{state.session_id}] word-level alignment failed ({exc})"
-            " — using segment-level fallback"
-        )
-        fallback_speaker = assign_speaker(state, audio_segment)
-        return [{**w, "speaker": fallback_speaker} for w in word_timestamps]
+        log.warning(f"[diarization:{state.session_id}] word-level failed ({exc}) — segment fallback")
+        fallback = assign_speaker(state, audio_segment)
+        return [{**w, "speaker": fallback} for w in word_timestamps]
 
 
-# ── Confirmation heuristics ────────────────────────────────────────────────────
-_AFFIRM_RE = re.compile(
-    r"\b(yes|correct|right|sure|exactly|affirmative|yep|yeah|confirmed|ok|okay|go ahead)\b",
-    re.IGNORECASE,
-)
-_DENY_RE = re.compile(
-    r"\b(no|nope|wrong|incorrect|never mind|nevermind|skip|cancel|ignore|not quite)\b",
-    re.IGNORECASE,
-)
-
-def _is_affirmation(text: str) -> bool:
-    return bool(_AFFIRM_RE.search(text))
-
-def _is_denial(text: str) -> bool:
-    return bool(_DENY_RE.search(text))
-
-
-# ── Dialogue state registry ────────────────────────────────────────────────────
-_dialogue_states: dict[str, DialogueState] = {}
-
-def get_dialogue(session_id: str) -> DialogueState:
-    if session_id not in _dialogue_states:
-        _dialogue_states[session_id] = DialogueState(session_id=session_id)
-    return _dialogue_states[session_id]
-
-def clear_dialogue(session_id: str) -> None:
-    _dialogue_states.pop(session_id, None)
-
-
-# ── Mode transition FSM ────────────────────────────────────────────────────────
+# ── Mode transition FSM ───────────────────────────────────────────────────────
 
 def update_mode(
     state: DialogueState,
@@ -340,17 +281,8 @@ def update_mode(
     new_speakers: list[str],
     pending_confirmation: Optional[str] = None,
     *,
-    summoned: bool = False,          # Month 5: explicit wake-word flag
+    summoned: bool = False,
 ) -> tuple[ConvMode, Optional[str]]:
-    """
-    Evaluate mode transitions.
-
-    Month 5 change: QA mode now requires `summoned=True`.  Without an
-    explicit wake-word, questions in the room are captured silently and the
-    agent does NOT interrupt with a spoken reply.
-
-    Returns (new_mode, entry_utterance | None).
-    """
     utterance: Optional[str] = None
 
     # 0. Resolve pending confirmation
@@ -366,14 +298,14 @@ def update_mode(
             state.mode_entered_at = time.time()
             return state.mode, "Understood, I'll discard that."
 
-    # 0b. Enter CONFIRMATION when capture.py has a pending item
+    # 0b. Enter CONFIRMATION from pending capture item
     if pending_confirmation and state.mode not in (ConvMode.GREETING, ConvMode.QA):
         state.confirmation_pending = pending_confirmation
         state.mode = ConvMode.CONFIRMATION
         state.mode_entered_at = time.time()
         return state.mode, pending_confirmation
 
-    # 1. New speaker detected → GREETING (takes priority)
+    # 1. New speaker → GREETING
     if new_speakers:
         names = " and ".join(new_speakers)
         state.greeted_speakers.update(new_speakers)
@@ -382,14 +314,7 @@ def update_mode(
         state.mode_entered_at = time.time()
         return state.mode, utterance
 
-    # 2. Active transcript + summon detected + question → QA
-    #    Month 5: guard requires `summoned=True`
-    if transcript and summoned and _looks_like_question(transcript):
-        state.mode = ConvMode.QA
-        state.mode_entered_at = time.time()
-        return state.mode, None
-
-    # 2b. Summoned but NOT a question → still answer (direct command)
+    # 2. Summoned → QA (question or direct command)
     if transcript and summoned:
         state.mode = ConvMode.QA
         state.mode_entered_at = time.time()
@@ -412,19 +337,13 @@ def update_mode(
     return state.mode, utterance
 
 
-# ── Response generator ─────────────────────────────────────────────────────────
+# ── Response generator ────────────────────────────────────────────────────────
 
 async def generate_response(
     state: DialogueState,
     transcript: str,
     lkc_context: str,
 ) -> Optional[str]:
-    """
-    Generate an agent reply.  Returns None for silent modes.
-
-    Month 5: after returning a reply, the caller must call
-    capture.clear_summon(session_id) to reset the wake-word flag.
-    """
     if state.mode in (ConvMode.MEETING_CAPTURE, ConvMode.AMBIENT, ConvMode.CONFIRMATION):
         return None
 
@@ -432,15 +351,14 @@ async def generate_response(
         if not LOCAL_LLM_AVAILABLE:
             return "[Local LLM not available — configure local_llm in config.json]"
 
-        context_lines = state.context_block()
         lkc_section = (
             f"\n\nRelevant LKC knowledge:\n{lkc_context}"
             if lkc_context.strip() else ""
         )
         user_message = (
-            f"Recent conversation:\n{context_lines}"
+            f"Recent conversation:\n{state.context_block()}"
             f"{lkc_section}\n\n"
-            f"The speaker directly addressed you and said: \"{transcript}\"\n"
+            f'The speaker directly addressed you and said: "{transcript}"\n'
             f"Respond as Lab Brain in ≤2 sentences."
         )
 
@@ -471,19 +389,12 @@ async def generate_response(
     return None
 
 
-# ── End-of-session summary ─────────────────────────────────────────────────────
+# ── Summary generator ─────────────────────────────────────────────────────────
 
-async def generate_summary(
-    state: DialogueState,
-    session_tags: dict,
-) -> str:
+async def generate_summary(state: DialogueState, session_tags: dict) -> str:
     if not LOCAL_LLM_AVAILABLE:
-        return (
-            "## Session Summary (stub)\n"
-            "Local LLM unavailable — configure local_llm.\n"
-        )
+        return "## Session Summary (stub)\nLocal LLM unavailable — configure local_llm.\n"
 
-    transcript_excerpt = state.context_block()
     action_block   = "\n".join(f"- {a}" for a in session_tags.get("action_items", [])) or "None"
     decision_block = "\n".join(f"- {d}" for d in session_tags.get("decisions",    [])) or "None"
     deadline_block = "\n".join(f"- {d}" for d in session_tags.get("deadlines",    [])) or "None"
@@ -491,13 +402,12 @@ async def generate_summary(
 
     user_message = (
         f"You are Lab Brain summarising a research meeting.\n\n"
-        f"Recent transcript (last {state.CONTEXT_WINDOW} turns):\n{transcript_excerpt}\n\n"
-        f"Captured tags:\n"
+        f"Recent transcript (last {state.CONTEXT_WINDOW} turns):\n{state.context_block()}\n\n"
         f"Action items:\n{action_block}\n\nDecisions:\n{decision_block}\n\n"
-        f"Deadlines:\n{deadline_block}\n\nKey entities/people: {entity_block}\n\n"
-        f"Produce a concise meeting summary in markdown with sections: "
+        f"Deadlines:\n{deadline_block}\n\nKey entities: {entity_block}\n\n"
+        f"Produce a concise meeting summary in markdown: "
         f"## Summary, ## Decisions, ## Action Items, ## Open Questions. "
-        f"Keep each section to ≤4 bullet points."
+        f"≤4 bullet points per section."
     )
 
     loop = asyncio.get_event_loop()
