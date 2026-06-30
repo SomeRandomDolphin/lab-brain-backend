@@ -195,7 +195,7 @@ def _queue_confirmation(session_id: str, text: str) -> None:
 
 # ── Core segment processor ────────────────────────────────────────────────────
 
-def process_segment(
+async def process_segment(
     session_id: str,
     speaker: str,
     text: str,
@@ -223,7 +223,7 @@ def process_segment(
     if word_timestamps:
         record["word_timestamps"] = word_timestamps
 
-    lkc_graph.write_to_lkc(record)
+    await lkc_graph.write_to_lkc(record)
 
     if confirm_agent and has_tags(tags):
         parts: list[str] = []

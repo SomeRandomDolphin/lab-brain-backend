@@ -1,118 +1,138 @@
 """
-app/db/supabase_client.py — Supabase persistence layer (runtime data access).
+app/db/supabase_client.py — Supabase persistence layer (SQLAlchemy async ORM).
+
+All runtime data access goes through SQLAlchemy with asyncpg, talking directly
+to the Postgres instance that backs your Supabase project. The supabase-py
+client is retained only for Storage bucket operations (audio segments and
+report exports), which have no SQLAlchemy equivalent.
 
 What goes where
 ---------------
-Postgres tables (via supabase-py):
+Postgres tables (SQLAlchemy ORM — see models.py):
   sessions          — one row per LiveKit room / Lab Brain session
   transcripts       — one row per WhisperX segment (text + tags + word timestamps)
   agent_replies     — one row per LLM reply
   vision_frames     — one row per analysed camera frame
   session_summaries — one row per end-of-session LLM summary
   eval_metrics      — one row per session metric snapshot
-  consent_registry  — speaker consent records (mirrors consent.json)
+  consent_registry  — speaker consent records
 
-Supabase Storage buckets:
-  audio-segments    — raw float32 PCM blobs (one object per WhisperX segment)
+Supabase Storage buckets (supabase-py):
+  audio-segments    — raw float32 PCM blobs
   report-exports    — generated markdown summary exports
 
-Schema migrations
-------------------
-No longer handled here. Schema migrations now run through Alembic —
-see app/db/migrations.py and alembic/versions/. This module is purely
-the runtime read/write data-access layer.
+Required environment variables
+-------------------------------
+  SUPABASE_DB_URL   postgresql+asyncpg://postgres:<pw>@db.<ref>.supabase.co:5432/postgres
+  SUPABASE_URL      https://<project>.supabase.co          (Storage only)
+  SUPABASE_KEY      service_role or anon key               (Storage only)
 
-Dual-write strategy
--------------------
-Every write goes to BOTH Supabase (primary) and the local SQLite lkc_graph
-(fallback / offline cache). Supabase errors are logged as warnings, never raised.
+Schema migrations
+-----------------
+Handled by Alembic — see app/db/migrations.py. This module is pure runtime
+read/write only.
 """
 
 from __future__ import annotations
 
 import asyncio
-import io
-import json
 import logging
 import os
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
+from sqlalchemy import func, select, delete
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+from .models import (
+    AgentReply,
+    ConsentRegistry,
+    EvalMetrics,
+    Session as SessionModel,
+    SessionSummary,
+    Transcript,
+    VisionFrame,
+)
+
 log = logging.getLogger(__name__)
 
-# ── Supabase client (graceful degradation) ────────────────────────────────────
-SUPABASE_AVAILABLE = False
-_client = None
+# ── Engine (lazy, singleton) ───────────────────────────────────────────────────
 
-try:
-    from supabase import create_client, Client
-    SUPABASE_AVAILABLE = True
-except ImportError:
-    log.warning(
-        "[supabase] supabase-py not installed — Supabase sync disabled. "
-        "Run: pip install supabase"
+_engine = None
+_session_factory: Optional[async_sessionmaker[AsyncSession]] = None
+
+
+def _get_engine():
+    global _engine, _session_factory
+    if _engine is not None:
+        return _engine
+
+    db_url = os.environ.get("SUPABASE_DB_URL", "")
+    if not db_url:
+        raise RuntimeError(
+            "SUPABASE_DB_URL is not set. "
+            "Set it to your Supabase Postgres connection string "
+            "(postgresql+asyncpg://postgres:<pw>@db.<ref>.supabase.co:5432/postgres)."
+        )
+
+    _engine = create_async_engine(
+        db_url,
+        pool_size=5,
+        max_overflow=10,
+        pool_pre_ping=True,
+        echo=False,
     )
+    _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
+    log.info("[supabase] async engine initialised")
+    return _engine
 
-# ── Client singleton ──────────────────────────────────────────────────────────
 
-def get_client():
-    """Return (or lazily create) the Supabase client using env vars."""
-    global _client
-    if _client is not None:
-        return _client
-    if not SUPABASE_AVAILABLE:
-        return None
+def get_session_factory() -> async_sessionmaker[AsyncSession]:
+    _get_engine()
+    return _session_factory
+
+
+# ── Supabase Storage client (for buckets only) ────────────────────────────────
+
+_storage_client = None
+
+
+def _get_storage_client():
+    global _storage_client
+    if _storage_client is not None:
+        return _storage_client
 
     url = os.environ.get("SUPABASE_URL", "")
     key = os.environ.get("SUPABASE_KEY", "")
-
     if not url or not key:
-        log.warning(
-            "[supabase] SUPABASE_URL or SUPABASE_KEY not set — "
-            "Supabase sync disabled."
-        )
+        log.warning("[supabase] SUPABASE_URL / SUPABASE_KEY not set — Storage disabled.")
         return None
 
     try:
-        _client = create_client(url, key)
-        log.info(f"[supabase] connected to {url}")
-        return _client
+        from supabase import create_client
+        _storage_client = create_client(url, key)
+        return _storage_client
     except Exception as exc:
-        log.warning(f"[supabase] client init failed: {exc}")
+        log.warning(f"[supabase] Storage client init failed: {exc}")
         return None
 
 
-# ── Internal helpers ──────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _safe_upsert(table: str, row: dict, on_conflict: str = "id") -> None:
-    client = get_client()
-    if client is None:
-        return
-    try:
-        client.table(table).upsert(row, on_conflict=on_conflict).execute()
-    except Exception as exc:
-        log.warning(f"[supabase] upsert {table} failed: {exc}")
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def _safe_insert(table: str, row: dict) -> None:
-    client = get_client()
-    if client is None:
-        return
-    try:
-        client.table(table).insert(row).execute()
-    except Exception as exc:
-        log.warning(f"[supabase] insert {table} failed: {exc}")
+def _from_unix(ts: float) -> datetime:
+    return datetime.fromtimestamp(ts, tz=timezone.utc)
 
 
 def _safe_storage_upload(
     bucket: str, path: str, data: bytes, content_type: str
 ) -> Optional[str]:
-    client = get_client()
+    client = _get_storage_client()
     if client is None:
         return None
     try:
@@ -127,10 +147,10 @@ def _safe_storage_upload(
         return None
 
 
-def _fire(fn, *args) -> None:
+def _fire_sync(fn, *args) -> None:
     """
-    Schedule a sync function in the thread-pool so Supabase HTTP calls
-    never block the async pipeline.
+    Run a sync function (Storage uploads) in a thread-pool so it never
+    blocks the async event loop.
     """
     try:
         loop = asyncio.get_running_loop()
@@ -143,7 +163,7 @@ def _fire(fn, *args) -> None:
 # Public write API
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def upsert_session(
+async def upsert_session(
     session_id: str,
     host_identity: str = "browser-user",
     started_at: Optional[float] = None,
@@ -151,20 +171,28 @@ def upsert_session(
     livekit_room_sid: Optional[str] = None,
     metadata: Optional[dict] = None,
 ) -> None:
-    row = {
-        "session_id":       session_id,
-        "host_identity":    host_identity,
-        "started_at":       datetime.utcfromtimestamp(started_at or time.time()).isoformat() + "Z",
+    values = {
+        "session_id":      session_id,
+        "host_identity":   host_identity,
+        "started_at":      _from_unix(started_at or time.time()),
         "livekit_room_sid": livekit_room_sid,
-        "metadata":         json.dumps(metadata or {}),
-        "updated_at":       _now_iso(),
+        "metadata_":       metadata or {},
+        "updated_at":      _utcnow(),
     }
     if ended_at is not None:
-        row["ended_at"] = datetime.utcfromtimestamp(ended_at).isoformat() + "Z"
-    _fire(_safe_upsert, "sessions", row, "session_id")
+        values["ended_at"] = _from_unix(ended_at)
+
+    stmt = (
+        pg_insert(SessionModel)
+        .values(**values)
+        .on_conflict_do_update(index_elements=["session_id"], set_=values)
+    )
+    async with get_session_factory()() as db:
+        await db.execute(stmt)
+        await db.commit()
 
 
-def insert_transcript(
+async def insert_transcript(
     session_id: str,
     speaker: str,
     text: str,
@@ -178,25 +206,27 @@ def insert_transcript(
     e2e_latency_ms: int = 0,
     segment_index: int = 0,
 ) -> None:
-    row = {
-        "session_id":      session_id,
-        "segment_index":   segment_index,
-        "speaker":         speaker,
-        "text":            text,
-        "language":        language,
-        "mode":            mode,
-        "timestamp_iso":   timestamp_iso,
-        "timestamp_unix":  round(timestamp_unix, 3),
-        "tags":            tags,
-        "word_timestamps": word_timestamps,
-        "asr_latency_ms":  asr_latency_ms,
-        "e2e_latency_ms":  e2e_latency_ms,
-        "created_at":      _now_iso(),
-    }
-    _fire(_safe_insert, "transcripts", row)
+    row = Transcript(
+        session_id=session_id,
+        segment_index=segment_index,
+        speaker=speaker,
+        text=text,
+        language=language,
+        mode=mode,
+        timestamp_iso=timestamp_iso,
+        timestamp_unix=round(timestamp_unix, 3),
+        tags=tags,
+        word_timestamps=word_timestamps,
+        asr_latency_ms=asr_latency_ms,
+        e2e_latency_ms=e2e_latency_ms,
+        created_at=_utcnow(),
+    )
+    async with get_session_factory()() as db:
+        db.add(row)
+        await db.commit()
 
 
-def insert_agent_reply(
+async def insert_agent_reply(
     session_id: str,
     text: str,
     mode: str,
@@ -204,20 +234,22 @@ def insert_agent_reply(
     grounded: bool = False,
     lkc_context: str = "",
 ) -> None:
-    row = {
-        "session_id":    session_id,
-        "text":          text,
-        "mode":          mode,
-        "timestamp_iso": datetime.utcfromtimestamp(timestamp_unix).isoformat() + "Z",
-        "timestamp_unix": round(timestamp_unix, 3),
-        "grounded":      grounded,
-        "lkc_context":   lkc_context,
-        "created_at":    _now_iso(),
-    }
-    _fire(_safe_insert, "agent_replies", row)
+    row = AgentReply(
+        session_id=session_id,
+        text=text,
+        mode=mode,
+        timestamp_iso=_from_unix(timestamp_unix).isoformat(),
+        timestamp_unix=round(timestamp_unix, 3),
+        grounded=grounded,
+        lkc_context=lkc_context,
+        created_at=_utcnow(),
+    )
+    async with get_session_factory()() as db:
+        db.add(row)
+        await db.commit()
 
 
-def insert_vision_frame(
+async def insert_vision_frame(
     session_id: str,
     timestamp_unix: float,
     scene_summary: str,
@@ -226,82 +258,115 @@ def insert_vision_frame(
     environment_state: dict,
     latency_ms: int = 0,
 ) -> None:
-    row = {
-        "session_id":        session_id,
-        "timestamp_iso":     datetime.utcfromtimestamp(timestamp_unix).isoformat() + "Z",
-        "timestamp_unix":    round(timestamp_unix, 3),
-        "scene_summary":     scene_summary,
-        "present_speakers":  present_speakers,
-        "engagement_cues":   engagement_cues,
-        "environment_state": environment_state,
-        "latency_ms":        latency_ms,
-        "created_at":        _now_iso(),
-    }
-    _fire(_safe_insert, "vision_frames", row)
+    row = VisionFrame(
+        session_id=session_id,
+        timestamp_iso=_from_unix(timestamp_unix).isoformat(),
+        timestamp_unix=round(timestamp_unix, 3),
+        scene_summary=scene_summary,
+        present_speakers=present_speakers,
+        engagement_cues=engagement_cues,
+        environment_state=environment_state,
+        latency_ms=latency_ms,
+        created_at=_utcnow(),
+    )
+    async with get_session_factory()() as db:
+        db.add(row)
+        await db.commit()
 
 
-def upsert_session_summary(session_id: str, summary_md: str, tags: dict) -> None:
-    row = {
+async def upsert_session_summary(session_id: str, summary_md: str, tags: dict) -> None:
+    values = {
         "session_id": session_id,
         "summary_md": summary_md,
         "tags":       tags,
-        "created_at": _now_iso(),
-        "updated_at": _now_iso(),
+        "updated_at": _utcnow(),
     }
-    _fire(_safe_upsert, "session_summaries", row, "session_id")
-    md_bytes     = summary_md.encode("utf-8")
-    storage_path = f"{session_id}/summary.md"
-    _fire(_safe_storage_upload, "report-exports", storage_path, md_bytes, "text/markdown")
+    stmt = (
+        pg_insert(SessionSummary)
+        .values(**values, created_at=_utcnow())
+        .on_conflict_do_update(index_elements=["session_id"], set_=values)
+    )
+    async with get_session_factory()() as db:
+        await db.execute(stmt)
+        await db.commit()
+
+    # Mirror to Storage bucket
+    _fire_sync(
+        _safe_storage_upload,
+        "report-exports",
+        f"{session_id}/summary.md",
+        summary_md.encode("utf-8"),
+        "text/markdown",
+    )
 
 
-def upsert_eval_metrics(session_id: str, metrics_dict: dict) -> None:
-    row = {
+async def upsert_eval_metrics(session_id: str, metrics_dict: dict) -> None:
+    now = _utcnow()
+    values = {
         "session_id":  session_id,
         "snapshot":    metrics_dict,
-        "snapshot_at": _now_iso(),
-        "updated_at":  _now_iso(),
+        "snapshot_at": now,
+        "updated_at":  now,
     }
-    _fire(_safe_upsert, "eval_metrics", row, "session_id")
+    stmt = (
+        pg_insert(EvalMetrics)
+        .values(**values)
+        .on_conflict_do_update(index_elements=["session_id"], set_=values)
+    )
+    async with get_session_factory()() as db:
+        await db.execute(stmt)
+        await db.commit()
 
 
-def upsert_consent(
+async def upsert_consent(
     speaker_label: str,
     consented: bool,
     real_name: Optional[str] = None,
 ) -> None:
-    row = {
+    values = {
         "speaker_label": speaker_label,
         "consented":     consented,
         "real_name":     real_name,
-        "updated_at":    _now_iso(),
+        "updated_at":    _utcnow(),
     }
-    _fire(_safe_upsert, "consent_registry", row, "speaker_label")
+    stmt = (
+        pg_insert(ConsentRegistry)
+        .values(**values)
+        .on_conflict_do_update(index_elements=["speaker_label"], set_=values)
+    )
+    async with get_session_factory()() as db:
+        await db.execute(stmt)
+        await db.commit()
 
 
-def upload_audio_segment(
+async def upload_audio_segment(
     session_id: str,
     segment_index: int,
     pcm_float32,  # np.ndarray
 ) -> Optional[str]:
-    client = get_client()
+    import numpy as np
+
+    raw_bytes = pcm_float32.astype(np.float32).tobytes()
+    path = f"{session_id}/{segment_index:05d}.f32"
+
+    _fire_sync(
+        _safe_storage_upload,
+        "audio-segments",
+        path,
+        raw_bytes,
+        "application/octet-stream",
+    )
+
+    client = _get_storage_client()
     if client is None:
         return None
-
-    import numpy as np
-    raw_bytes = pcm_float32.astype(np.float32).tobytes()
-    path      = f"{session_id}/{segment_index:05d}.f32"
-
-    def _upload():
-        return _safe_storage_upload("audio-segments", path, raw_bytes, "application/octet-stream")
-
-    _fire(_upload)
     try:
-        return get_client().storage.from_("audio-segments").get_public_url(path)
+        return client.storage.from_("audio-segments").get_public_url(path)
     except Exception:
         return None
 
 
-def export_report(
+async def export_report(
     session_id: str,
     summary_md: str,
     tags: dict,
@@ -317,22 +382,26 @@ def export_report(
         *[f"- {d}" for d in tags.get("decisions", [])],
         "\n## Transcript\n",
         *[
-            f"**[{r.get('timestamp_iso','')[:19]}] {r.get('speaker','?')}:** {r.get('text','')}\n"
+            f"**[{r.get('timestamp_iso', '')[:19]}] {r.get('speaker', '?')}:** {r.get('text', '')}\n"
             for r in transcript_rows
         ],
     ]
     report_md = "\n".join(lines)
-    path      = f"{session_id}/report.md"
+    path = f"{session_id}/report.md"
 
-    def _up():
-        return _safe_storage_upload(
-            "report-exports", path,
-            report_md.encode("utf-8"), "text/markdown",
-        )
+    _fire_sync(
+        _safe_storage_upload,
+        "report-exports",
+        path,
+        report_md.encode("utf-8"),
+        "text/markdown",
+    )
 
-    _fire(_up)
+    client = _get_storage_client()
+    if client is None:
+        return None
     try:
-        return get_client().storage.from_("report-exports").get_public_url(path)
+        return client.storage.from_("report-exports").get_public_url(path)
     except Exception:
         return None
 
@@ -341,63 +410,71 @@ def export_report(
 # Public read API
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def get_sessions(limit: int = 50) -> list[dict]:
-    client = get_client()
-    if client is None:
-        return []
-    try:
-        res = (
-            client.table("sessions")
-            .select("*")
-            .order("started_at", desc=True)
-            .limit(limit)
-            .execute()
-        )
-        return res.data or []
-    except Exception as exc:
-        log.warning(f"[supabase] get_sessions failed: {exc}")
-        return []
+async def get_sessions(limit: int = 50) -> list[dict]:
+    stmt = select(SessionModel).order_by(SessionModel.started_at.desc()).limit(limit)
+    async with get_session_factory()() as db:
+        result = await db.execute(stmt)
+        rows = result.scalars().all()
+    return [
+        {
+            "session_id":       r.session_id,
+            "host_identity":    r.host_identity,
+            "started_at":       r.started_at.isoformat() if r.started_at else None,
+            "ended_at":         r.ended_at.isoformat() if r.ended_at else None,
+            "livekit_room_sid": r.livekit_room_sid,
+            "metadata":         r.metadata_,
+        }
+        for r in rows
+    ]
 
 
-def get_transcripts(session_id: str, limit: int = 2000) -> list[dict]:
-    client = get_client()
-    if client is None:
-        return []
-    try:
-        res = (
-            client.table("transcripts")
-            .select("*")
-            .eq("session_id", session_id)
-            .order("timestamp_unix")
-            .limit(limit)
-            .execute()
-        )
-        return res.data or []
-    except Exception as exc:
-        log.warning(f"[supabase] get_transcripts failed: {exc}")
-        return []
+async def get_transcripts(session_id: str, limit: int = 2000) -> list[dict]:
+    stmt = (
+        select(Transcript)
+        .where(Transcript.session_id == session_id)
+        .order_by(Transcript.timestamp_unix)
+        .limit(limit)
+    )
+    async with get_session_factory()() as db:
+        result = await db.execute(stmt)
+        rows = result.scalars().all()
+    return [
+        {
+            "session_id":      r.session_id,
+            "segment_index":   r.segment_index,
+            "speaker":         r.speaker,
+            "text":            r.text,
+            "language":        r.language,
+            "mode":            r.mode,
+            "timestamp_iso":   r.timestamp_iso,
+            "timestamp_unix":  r.timestamp_unix,
+            "tags":            r.tags,
+            "word_timestamps": r.word_timestamps,
+            "asr_latency_ms":  r.asr_latency_ms,
+            "e2e_latency_ms":  r.e2e_latency_ms,
+        }
+        for r in rows
+    ]
 
 
-def get_session_summary(session_id: str) -> Optional[dict]:
-    client = get_client()
-    if client is None:
+async def get_session_summary(session_id: str) -> Optional[dict]:
+    stmt = select(SessionSummary).where(SessionSummary.session_id == session_id)
+    async with get_session_factory()() as db:
+        result = await db.execute(stmt)
+        row = result.scalar_one_or_none()
+    if row is None:
         return None
-    try:
-        res = (
-            client.table("session_summaries")
-            .select("*")
-            .eq("session_id", session_id)
-            .single()
-            .execute()
-        )
-        return res.data
-    except Exception as exc:
-        log.warning(f"[supabase] get_session_summary failed: {exc}")
-        return None
+    return {
+        "session_id": row.session_id,
+        "summary_md": row.summary_md,
+        "tags":       row.tags,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
 
 
 def get_report_url(session_id: str) -> Optional[str]:
-    client = get_client()
+    client = _get_storage_client()
     if client is None:
         return None
     try:
@@ -409,7 +486,7 @@ def get_report_url(session_id: str) -> Optional[str]:
 
 
 def get_audio_segment_url(session_id: str, segment_index: int) -> Optional[str]:
-    client = get_client()
+    client = _get_storage_client()
     if client is None:
         return None
     try:
@@ -420,24 +497,24 @@ def get_audio_segment_url(session_id: str, segment_index: int) -> Optional[str]:
         return None
 
 
-def connectivity_status() -> dict:
-    """Return connectivity and configuration status."""
-    url       = os.environ.get("SUPABASE_URL", "")
-    key_set   = bool(os.environ.get("SUPABASE_KEY", ""))
-    client    = get_client()
+async def connectivity_status() -> dict:
+    db_url = os.environ.get("SUPABASE_DB_URL", "")
     reachable = False
 
-    if client is not None:
+    if db_url:
         try:
-            client.table("sessions").select("session_id").limit(1).execute()
+            async with get_session_factory()() as db:
+                await db.execute(select(func.now()))
             reachable = True
         except Exception as exc:
-            log.debug(f"[supabase] ping failed: {exc}")
+            log.debug(f"[supabase] DB ping failed: {exc}")
+
+    client = _get_storage_client()
 
     return {
-        "supabase_available": SUPABASE_AVAILABLE,
-        "url_configured":     bool(url),
-        "key_configured":     key_set,
-        "reachable":          reachable,
-        "url":                url or None,
+        "db_url_configured":     bool(db_url),
+        "storage_url_configured": bool(os.environ.get("SUPABASE_URL")),
+        "storage_key_configured": bool(os.environ.get("SUPABASE_KEY")),
+        "db_reachable":          reachable,
+        "storage_available":     client is not None,
     }

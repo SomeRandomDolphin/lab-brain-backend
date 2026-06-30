@@ -71,12 +71,12 @@ async def _handle_qa_sse(session_id, dlg, full_text, retriever, mode, tts_queue)
     reply = await generate_response(dlg, full_text, lkc_context)
     if reply:
         ts = time.time()
-        lkc_graph.write_to_lkc(_agent_record(session_id, ts, reply, mode.value))
+        await lkc_graph.write_to_lkc(_agent_record(session_id, ts, reply, mode.value))
         tts_queue.put_nowait(reply)
-        broadcast(session_id, {"type": "agent_reply", "text": reply,
-                               "mode": mode.value, "grounded": bool(lkc_context.strip())})
-        broadcast(session_id, {"type": "speak", "text": reply})
-        supabase_client.insert_agent_reply(
+        await broadcast(session_id, {"type": "agent_reply", "text": reply,
+                                     "mode": mode.value, "grounded": bool(lkc_context.strip())})
+        await broadcast(session_id, {"type": "speak", "text": reply})
+        await supabase_client.insert_agent_reply(
             session_id=session_id, text=reply, mode=mode.value,
             timestamp_unix=ts, grounded=bool(lkc_context.strip()), lkc_context=lkc_context,
         )
@@ -105,7 +105,7 @@ async def livekit_pipeline(
     _wx_align_cache: dict     = {}
 
     log.info(f"[pipeline:{session_id}] started")
-    broadcast(session_id, {"type": "session", "session_id": session_id})
+    await broadcast(session_id, {"type": "session", "session_id": session_id})
 
     # ── Audio processor ───────────────────────────────────────────────────────
 
@@ -117,7 +117,7 @@ async def livekit_pipeline(
         segment_audio = chunker.push(pcm_f32)
 
         if segment_audio is None:
-            broadcast(session_id, {
+            await broadcast(session_id, {
                 "type":     "listening",
                 "mode":     dlg.mode.value,
                 "summoned": _capture.is_summoned(session_id),
@@ -175,7 +175,7 @@ async def livekit_pipeline(
         )
         if new_mode != prev_mode:
             metrics.record_mode_switch(new_mode.value)
-            broadcast(session_id, {"type": "mode_change", "mode": new_mode.value})
+            await broadcast(session_id, {"type": "mode_change", "mode": new_mode.value})
 
         # Write to LKC graph
         record = _capture.process_segment(
@@ -191,7 +191,7 @@ async def livekit_pipeline(
         metrics.record_e2e(e2e)
 
         # Persist to Supabase
-        supabase_client.insert_transcript(
+        await supabase_client.insert_transcript(
             session_id=session_id, speaker=speaker, text=redacted_text,
             language=detected_lang, mode=new_mode.value,
             timestamp_unix=seg_start, timestamp_iso=record["timestamp_iso"],
@@ -200,7 +200,7 @@ async def livekit_pipeline(
             segment_index=segment_index,
         )
         if cfg.supabase.store_audio:
-            supabase_client.upload_audio_segment(session_id, segment_index, segment_audio)
+            await supabase_client.upload_audio_segment(session_id, segment_index, segment_audio)
 
         log.info(
             f"[{session_id}] seg#{segment_index} "
@@ -209,7 +209,7 @@ async def livekit_pipeline(
         )
 
         # Broadcast transcript via SSE
-        broadcast(session_id, {
+        await broadcast(session_id, {
             "type":            "transcript",
             "segment":         segment_index,
             "session_id":      session_id,
@@ -230,10 +230,10 @@ async def livekit_pipeline(
         # Entry utterance (greeting / confirmation)
         if entry_utterance:
             ts = time.time()
-            lkc_graph.write_to_lkc(_agent_record(session_id, ts, entry_utterance, new_mode.value))
+            await lkc_graph.write_to_lkc(_agent_record(session_id, ts, entry_utterance, new_mode.value))
             tts_queue.put_nowait(entry_utterance)
-            broadcast(session_id, {"type": "agent_reply", "text": entry_utterance, "mode": new_mode.value})
-            broadcast(session_id, {"type": "speak", "text": entry_utterance})
+            await broadcast(session_id, {"type": "agent_reply", "text": entry_utterance, "mode": new_mode.value})
+            await broadcast(session_id, {"type": "speak", "text": entry_utterance})
 
         # QA reply
         if new_mode == ConvMode.QA:
@@ -268,14 +268,14 @@ async def livekit_pipeline(
         stub_marker = "[Vision stub"
         if state.scene_summary and not state.scene_summary.startswith(stub_marker):
             ts = time.time()
-            lkc_graph.write_to_lkc(
+            await lkc_graph.write_to_lkc(
                 _vision_record(
                     session_id, ts, state.scene_summary,
                     state.present_speakers, state.engagement_cues, state.environment_state,
                 )
             )
             if cfg.supabase.store_vision:
-                supabase_client.insert_vision_frame(
+                await supabase_client.insert_vision_frame(
                     session_id=session_id, timestamp_unix=ts,
                     scene_summary=state.scene_summary,
                     present_speakers=state.present_speakers,
@@ -284,7 +284,7 @@ async def livekit_pipeline(
                     latency_ms=latency_ms,
                 )
 
-        broadcast(session_id, {
+        await broadcast(session_id, {
             "type":              "perception",
             "session_id":        session_id,
             "present_speakers":  state.present_speakers,

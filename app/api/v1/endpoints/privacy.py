@@ -34,7 +34,7 @@ async def post_consent(req: ConsentRequest):
 async def sync_consent(req: ConsentSyncRequest):
     """Dual-write: local consent.json + Supabase consent_registry table."""
     entry = _privacy.register_consent(req.speaker, req.consented, req.real_name)
-    supabase_client.upsert_consent(req.speaker, req.consented, req.real_name)
+    await supabase_client.upsert_consent(req.speaker, req.consented, req.real_name)
     return {"speaker": req.speaker, **entry}
 
 

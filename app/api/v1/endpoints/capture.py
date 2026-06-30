@@ -73,7 +73,7 @@ async def poll_confirmations(session_id: str):
 
 @capture_router.get("/tags/{session_id}")
 async def get_session_tags(session_id: str):
-    records = lkc_graph.read_lkc(session_id=session_id, record_type="transcript")
+    records = await lkc_graph.read_lkc(session_id=session_id, record_type="transcript")
 
     action_items: list[str] = []
     decisions:    list[str] = []

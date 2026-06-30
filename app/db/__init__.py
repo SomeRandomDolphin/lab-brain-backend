@@ -1,6 +1,5 @@
-from .lkc_graph import write_to_lkc, read_lkc, configure as configure_lkc
+from .lkc_graph import write_to_lkc, read_lkc as configure_lkc
 from .supabase_client import (
-    get_client as get_supabase_client,
     connectivity_status,
 )
 

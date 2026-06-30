@@ -116,7 +116,7 @@ class LKCRetriever:
         self._global: Optional[_IndexEntry] = None
         self._global_record_count: int = 0
 
-    def query(
+    async def query(
         self,
         question: str,
         top_k: int = 4,
@@ -125,7 +125,7 @@ class LKCRetriever:
         if session_id is not None:
             entry = self._get_session_entry(session_id)
         else:
-            entry = self._get_global_entry()
+            entry = await self._get_global_entry()
         if entry is None or not entry.records:
             return ""
         return entry.search(question, top_k)
@@ -139,8 +139,8 @@ class LKCRetriever:
             self._sessions[session_id] = entry
         return self._sessions.get(session_id)
 
-    def _get_global_entry(self) -> Optional[_IndexEntry]:
-        all_records = lkc_graph.read_lkc(record_type="transcript")
+    async def _get_global_entry(self) -> Optional[_IndexEntry]:     
+        all_records = await lkc_graph.read_lkc(record_type="transcript")
         if len(all_records) == self._global_record_count and self._global is not None:
             return self._global
         lightweight = [

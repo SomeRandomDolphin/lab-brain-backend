@@ -5,6 +5,7 @@ Revises: 0002
 Create Date: 2026-06-25
 """
 
+import sqlalchemy as sa
 from alembic import op
 
 # ---------------------------------------------------------------------------
@@ -17,7 +18,7 @@ depends_on = None
 
 def upgrade() -> None:
     # ── session_overview ──────────────────────────────────────────────────────
-    op.execute("""
+    op.execute(sa.text("""
         CREATE OR REPLACE VIEW session_overview AS
         SELECT
             s.session_id,
@@ -37,10 +38,10 @@ def upgrade() -> None:
         LEFT JOIN session_summaries ss ON ss.session_id = s.session_id
         GROUP BY
             s.session_id, s.host_identity, s.started_at, s.ended_at, ss.summary_md
-    """)
+    """))
 
     # ── action_items_all ──────────────────────────────────────────────────────
-    op.execute("""
+    op.execute(sa.text("""
         CREATE OR REPLACE VIEW action_items_all AS
         SELECT
             session_id,
@@ -50,10 +51,10 @@ def upgrade() -> None:
         FROM transcripts
         WHERE tags ? 'action_items'
           AND jsonb_array_length(tags->'action_items') > 0
-    """)
+    """))
 
     # ── decisions_all ─────────────────────────────────────────────────────────
-    op.execute("""
+    op.execute(sa.text("""
         CREATE OR REPLACE VIEW decisions_all AS
         SELECT
             session_id,
@@ -63,10 +64,10 @@ def upgrade() -> None:
         FROM transcripts
         WHERE tags ? 'decisions'
           AND jsonb_array_length(tags->'decisions') > 0
-    """)
+    """))
 
     # ── latency_stats ─────────────────────────────────────────────────────────
-    op.execute("""
+    op.execute(sa.text("""
         CREATE OR REPLACE VIEW latency_stats AS
         SELECT
             session_id,
@@ -79,11 +80,11 @@ def upgrade() -> None:
             PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY e2e_latency_ms)     AS p95_e2e_ms
         FROM transcripts
         GROUP BY session_id
-    """)
+    """))
 
 
 def downgrade() -> None:
-    op.execute("DROP VIEW IF EXISTS latency_stats")
-    op.execute("DROP VIEW IF EXISTS decisions_all")
-    op.execute("DROP VIEW IF EXISTS action_items_all")
-    op.execute("DROP VIEW IF EXISTS session_overview")
+    op.execute(sa.text("DROP VIEW IF EXISTS latency_stats"))
+    op.execute(sa.text("DROP VIEW IF EXISTS decisions_all"))
+    op.execute(sa.text("DROP VIEW IF EXISTS action_items_all"))
+    op.execute(sa.text("DROP VIEW IF EXISTS session_overview"))

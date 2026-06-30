@@ -22,7 +22,7 @@ router = APIRouter(prefix="/lkc", tags=["lkc"])
 
 @router.get("", response_class=HTMLResponse)
 async def lkc_viewer():
-    records = lkc_graph.read_lkc(limit=500)
+    records = await lkc_graph.read_lkc(limit=500)
     return HTMLResponse(
         f"<pre style='font-family:monospace;font-size:13px'>"
         f"{json.dumps(records, indent=2, ensure_ascii=False)}</pre>"
@@ -31,12 +31,12 @@ async def lkc_viewer():
 
 @router.get("/stats")
 async def lkc_stats():
-    return lkc_graph.graph_stats()
+    return await lkc_graph.graph_stats()
 
 
 @router.get("/sessions")
 async def list_sessions():
-    return {"sessions": lkc_graph.read_sessions()}
+    return {"sessions": await lkc_graph.read_sessions()}
 
 
 @router.get("/sessions/{session_id}")
@@ -46,7 +46,7 @@ async def get_session_records(
     since_unix:  Optional[float] = Query(default=None),
     limit:       int             = Query(default=200, le=2000),
 ):
-    records = lkc_graph.read_lkc(
+    records = await lkc_graph.read_lkc(
         session_id=session_id,
         record_type=record_type,
         since_unix=since_unix,
@@ -57,11 +57,11 @@ async def get_session_records(
 
 @router.delete("")
 async def clear_lkc():
-    count = lkc_graph.clear_all()
+    count = await lkc_graph.clear_all()
     return {"cleared": True, "records_deleted": count}
 
 
 @router.delete("/sessions/{session_id}")
 async def delete_session(session_id: str):
-    count = lkc_graph.clear_session(session_id)
+    count = await lkc_graph.clear_session(session_id)
     return {"session_id": session_id, "records_deleted": count}

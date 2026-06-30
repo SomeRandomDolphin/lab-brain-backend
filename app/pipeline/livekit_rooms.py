@@ -25,8 +25,14 @@ log = logging.getLogger(__name__)
 LIVEKIT_AVAILABLE = False
 try:
     from livekit import rtc as lk_rtc
-    from livekit.api import AccessToken, VideoGrants
-    from livekit.api import LiveKitAPI
+    from livekit.api import (
+        AccessToken,
+        VideoGrants,
+        LiveKitAPI,
+        CreateRoomRequest,
+        ListRoomsRequest,
+        DeleteRoomRequest,
+    )
     LIVEKIT_AVAILABLE = True
     log.info("[livekit] SDK loaded.")
 except ImportError:
@@ -103,7 +109,7 @@ async def create_room(session_id: str) -> dict:
         api_secret=cfg.livekit.api_secret,
     ) as api:
         room = await api.room.create_room(
-            lk_rtc.CreateRoomRequest(name=session_id, empty_timeout=300)
+            CreateRoomRequest(name=session_id, empty_timeout=300)
         )
     return {"name": room.name, "sid": room.sid}
 
@@ -117,7 +123,7 @@ async def get_room(session_id: str) -> Optional[dict]:
             api_key=cfg.livekit.api_key,
             api_secret=cfg.livekit.api_secret,
         ) as api:
-            rooms = await api.room.list_rooms(lk_rtc.ListRoomsRequest(names=[session_id]))
+            rooms = await api.room.list_rooms(ListRoomsRequest(names=[session_id]))
             if not rooms.rooms:
                 return None
             r          = rooms.rooms[0]
@@ -144,7 +150,7 @@ async def delete_room(session_id: str) -> bool:
             api_key=cfg.livekit.api_key,
             api_secret=cfg.livekit.api_secret,
         ) as api:
-            await api.room.delete_room(lk_rtc.DeleteRoomRequest(name=session_id))
+            await api.room.delete_room(DeleteRoomRequest(name=session_id))
         log.info(f"[livekit] room {session_id} deleted")
         return True
     except Exception as exc:

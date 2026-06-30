@@ -1,8 +1,9 @@
 """
-app/db/supabase_auth.py — Auth persistence layer (Supabase Auth).
+app/db/supabase_auth.py — Auth persistence layer (Supabase Auth / GoTrue).
 
-Replaces the old SQLite auth_store.py. All identity operations are delegated
-to Supabase Auth (GoTrue). The local SQLite auth.db is no longer needed.
+This module is already Supabase-only and requires no ORM layer — all identity
+operations are delegated directly to Supabase Auth via supabase-py. It is
+reproduced here unchanged for completeness alongside the SQLAlchemy migration.
 
 Supabase Auth gives us for free:
   • bcrypt password hashing
@@ -11,7 +12,7 @@ Supabase Auth gives us for free:
   • single-use, time-limited password-reset emails (sent by Supabase)
   • per-user session revocation
 
-Required environment variables (same ones used by supabase_client.py):
+Required environment variables:
   SUPABASE_URL          https://<project>.supabase.co
   SUPABASE_SERVICE_KEY  service_role key  (bypasses Row-Level Security — keep secret)
 
@@ -57,7 +58,7 @@ def _get_admin():
 
 
 def _get_anon():
-    """Return an anon-key Supabase client (lazy init). Falls back to admin key."""
+    """Return an anon-key Supabase client (lazy init). Falls back to service key."""
     global _anon_client
     if _anon_client is not None:
         return _anon_client
@@ -75,13 +76,10 @@ def _get_anon():
 
 def _user_to_dict(supa_user) -> dict:
     """
-    Map a Supabase User object to the app's internal user dict shape,
-    which matches the frontend's User interface:
+    Map a Supabase User object to the app's internal user dict shape:
       { id, name, email, avatarUrl, createdAt }
-
-    Supabase stores extra profile fields in user_metadata.
     """
-    meta       = supa_user.user_metadata or {}
+    meta = supa_user.user_metadata or {}
     created_at = (
         supa_user.created_at.isoformat()
         if hasattr(supa_user.created_at, "isoformat")
@@ -111,8 +109,8 @@ def get_user_by_id(user_id: str) -> Optional[dict]:
 def get_user_by_email(email: str) -> Optional[dict]:
     """
     Fetch a user by email via the admin API.
-    Supabase doesn't expose a direct get-by-email, so we list and filter.
-    (Fine for low-volume auth flows — not intended for bulk queries.)
+    Supabase doesn't expose a direct get-by-email endpoint, so we list and filter.
+    Suitable for low-volume auth flows only — not intended for bulk queries.
     """
     try:
         resp = _get_admin().auth.admin.list_users()
@@ -127,15 +125,15 @@ def get_user_by_email(email: str) -> Optional[dict]:
 
 def create_user(name: str, email: str, password: str) -> dict:
     """
-    Create a new Supabase Auth user. Raises ValueError if email is taken.
+    Create a new Supabase Auth user. Raises ValueError if the email is taken.
     Returns the internal user dict.
     """
     try:
         resp = _get_admin().auth.admin.create_user({
-            "email":          email.lower().strip(),
-            "password":       password,
-            "email_confirm":  True,          # skip email-confirmation loop
-            "user_metadata":  {"name": name.strip()},
+            "email":         email.lower().strip(),
+            "password":      password,
+            "email_confirm": True,           # skip email-confirmation loop
+            "user_metadata": {"name": name.strip()},
         })
         if resp.user is None:
             raise ValueError("User creation returned no user object.")
@@ -153,8 +151,7 @@ def authenticate_user(email: str, password: str) -> Optional[tuple[dict, str, st
     Sign in with email + password via Supabase Auth.
 
     Returns (user_dict, access_token, refresh_token) on success, None on failure.
-    The access_token is a signed JWT; store it in the Authorization header.
-    The refresh_token is opaque and can be used to get a new access_token.
+    The access_token is a signed JWT; pass it in the Authorization header.
     """
     try:
         resp = _get_anon().auth.sign_in_with_password({
@@ -179,14 +176,9 @@ def create_session_for_user(user_id: str) -> tuple[str, str]:
     return a token immediately without a separate sign-in round-trip).
 
     Returns (access_token, refresh_token).
+    Requires supabase-py >= 2.4 for admin.create_session().
     """
-    resp = _get_admin().auth.admin.generate_link({
-        "type":    "magiclink",
-        "email":   _get_admin().auth.admin.get_user_by_id(user_id).user.email,
-    })
-    # generate_link gives a link, not tokens — use sign_in_with_otp pattern.
-    # Instead, the simpler approach: create a session directly via admin API.
-    resp = _get_admin().auth.admin.create_session(user_id)   # supabase-py ≥ 2.4
+    resp = _get_admin().auth.admin.create_session(user_id)
     return resp.session.access_token, resp.session.refresh_token
 
 
@@ -194,8 +186,7 @@ def verify_session_token(access_token: str) -> Optional[dict]:
     """
     Validate a Supabase JWT and return the user dict, or None if invalid/expired.
 
-    Supabase JWTs are self-contained; get_user() does a server-side check
-    which also handles revoked tokens.
+    get_user() performs a server-side check and handles revoked tokens.
     """
     try:
         resp = _get_anon().auth.get_user(access_token)
@@ -207,9 +198,7 @@ def verify_session_token(access_token: str) -> Optional[dict]:
 def revoke_session_token(access_token: str) -> None:
     """Sign out the session associated with this access token."""
     try:
-        # sign_out with a specific JWT requires the token to be set on the client.
-        client = _get_anon()
-        client.auth.sign_out()          # signs out the current session on this client
+        _get_anon().auth.sign_out()
     except Exception as exc:
         log.debug(f"[supabase_auth] sign_out failed: {exc}")
 
@@ -242,25 +231,23 @@ def create_reset_token(user_id: str) -> str:
     """
     Trigger Supabase's built-in password-recovery email flow.
 
-    Supabase generates, stores, and emails the reset link itself.
-    Returns the raw reset token extracted from the generated link so callers
-    that want to send a custom email still can.
-
-    If you're relying on Supabase's email delivery, just call
-    `trigger_password_recovery_email()` instead and ignore the return value.
+    Returns the raw token extracted from the generated link so callers
+    that want to send a custom email still can. If you're relying on
+    Supabase's email delivery, call this and ignore the return value.
     """
+    from urllib.parse import parse_qs, urlparse
+
     user = _get_admin().auth.admin.get_user_by_id(user_id).user
     resp = _get_admin().auth.admin.generate_link({
-        "type":             "recovery",
-        "email":            user.email,
+        "type":  "recovery",
+        "email": user.email,
         "options": {
-            "redirect_to":  os.environ.get("FRONTEND_URL", "http://localhost:5173")
-                            + "/auth/reset-password",
+            "redirect_to": (
+                os.environ.get("FRONTEND_URL", "http://localhost:5173")
+                + "/auth/reset-password"
+            ),
         },
     })
-    # The link looks like: https://<project>.supabase.co/auth/v1/verify?token=<token>&type=recovery
-    # Extract the raw token so the caller can embed it in a custom email.
-    from urllib.parse import urlparse, parse_qs
     qs    = parse_qs(urlparse(resp.properties.action_link).query)
     token = qs.get("token", [""])[0]
     return token
@@ -268,20 +255,16 @@ def create_reset_token(user_id: str) -> str:
 
 def consume_reset_token(raw_token: str) -> Optional[str]:
     """
-    Validate a recovery token and return the user_id.
+    Validate a recovery token and return the user_id, or None if invalid.
 
     Supabase verifies the token server-side via verify_otp().
-    On success the session is available but we only need the user_id here;
-    the password update happens via update_user_password().
     """
     try:
         resp = _get_anon().auth.verify_otp({
             "token_hash": raw_token,
             "type":       "recovery",
         })
-        if resp.user:
-            return resp.user.id
-        return None
+        return resp.user.id if resp.user else None
     except Exception as exc:
         log.debug(f"[supabase_auth] consume_reset_token failed: {exc}")
         return None

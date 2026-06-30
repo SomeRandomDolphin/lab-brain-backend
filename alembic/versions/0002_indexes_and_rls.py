@@ -5,6 +5,7 @@ Revises: 0001
 Create Date: 2026-06-25
 """
 
+import sqlalchemy as sa
 from alembic import op
 
 # ---------------------------------------------------------------------------
@@ -14,32 +15,49 @@ branch_labels = None
 depends_on = None
 # ---------------------------------------------------------------------------
 
+_RLS_TABLES = (
+    "sessions",
+    "transcripts",
+    "agent_replies",
+    "vision_frames",
+    "session_summaries",
+    "eval_metrics",
+    "consent_registry",
+)
+
 
 def upgrade() -> None:
     # ── Additional composite indexes ─────────────────────────────────────────
-    op.execute("""
-        CREATE INDEX IF NOT EXISTS idx_transcripts_speaker
-            ON transcripts (session_id, speaker)
-    """)
-    op.execute("""
-        CREATE INDEX IF NOT EXISTS idx_transcripts_text_fts
-            ON transcripts USING GIN (to_tsvector('english', text))
-    """)
-    op.execute("""
-        CREATE INDEX IF NOT EXISTS idx_transcripts_tags
-            ON transcripts USING GIN (tags)
-    """)
-    op.execute("""
-        CREATE INDEX IF NOT EXISTS idx_vision_frames_latest
-            ON vision_frames (session_id, timestamp_unix DESC)
-    """)
-    op.execute("""
-        CREATE INDEX IF NOT EXISTS idx_sessions_host
-            ON sessions (host_identity, started_at DESC)
-    """)
+    op.create_index(
+        "idx_transcripts_speaker",
+        "transcripts",
+        ["session_id", "speaker"],
+    )
+    op.create_index(
+        "idx_transcripts_text_fts",
+        "transcripts",
+        [sa.text("to_tsvector('english', text)")],
+        postgresql_using="gin",
+    )
+    op.create_index(
+        "idx_transcripts_tags",
+        "transcripts",
+        ["tags"],
+        postgresql_using="gin",
+    )
+    op.create_index(
+        "idx_vision_frames_latest",
+        "vision_frames",
+        ["session_id", sa.text("timestamp_unix DESC")],
+    )
+    op.create_index(
+        "idx_sessions_host",
+        "sessions",
+        ["host_identity", sa.text("started_at DESC")],
+    )
 
     # ── updated_at trigger function ───────────────────────────────────────────
-    op.execute("""
+    op.execute(sa.text("""
         CREATE OR REPLACE FUNCTION set_updated_at()
         RETURNS TRIGGER LANGUAGE plpgsql AS $$
         BEGIN
@@ -47,10 +65,10 @@ def upgrade() -> None:
             RETURN NEW;
         END;
         $$
-    """)
+    """))
 
     # ── Attach triggers (idempotent via DO block) ─────────────────────────────
-    op.execute("""
+    op.execute(sa.text("""
         DO $$ BEGIN
           IF NOT EXISTS (
             SELECT 1 FROM pg_trigger WHERE tgname = 'sessions_set_updated_at'
@@ -60,8 +78,8 @@ def upgrade() -> None:
               FOR EACH ROW EXECUTE FUNCTION set_updated_at();
           END IF;
         END $$
-    """)
-    op.execute("""
+    """))
+    op.execute(sa.text("""
         DO $$ BEGIN
           IF NOT EXISTS (
             SELECT 1 FROM pg_trigger WHERE tgname = 'session_summaries_set_updated_at'
@@ -71,22 +89,14 @@ def upgrade() -> None:
               FOR EACH ROW EXECUTE FUNCTION set_updated_at();
           END IF;
         END $$
-    """)
+    """))
 
     # ── Row Level Security ────────────────────────────────────────────────────
-    for table in (
-        "sessions",
-        "transcripts",
-        "agent_replies",
-        "vision_frames",
-        "session_summaries",
-        "eval_metrics",
-        "consent_registry",
-    ):
-        op.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
+    for table in _RLS_TABLES:
+        op.execute(sa.text(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY"))
 
     # Deny anon key access to every table; service role bypasses RLS.
-    op.execute("""
+    op.execute(sa.text("""
         DO $$ BEGIN
           DROP POLICY IF EXISTS sessions_deny_anon          ON sessions;
           DROP POLICY IF EXISTS transcripts_deny_anon       ON transcripts;
@@ -111,32 +121,22 @@ def upgrade() -> None:
           CREATE POLICY consent_registry_deny_anon
               ON consent_registry FOR ALL TO anon USING (false);
         END $$
-    """)
+    """))
 
 
 def downgrade() -> None:
     # Disable RLS
-    for table in (
-        "sessions",
-        "transcripts",
-        "agent_replies",
-        "vision_frames",
-        "session_summaries",
-        "eval_metrics",
-        "consent_registry",
-    ):
-        op.execute(f"ALTER TABLE {table} DISABLE ROW LEVEL SECURITY")
+    for table in _RLS_TABLES:
+        op.execute(sa.text(f"ALTER TABLE {table} DISABLE ROW LEVEL SECURITY"))
 
     # Drop triggers
-    op.execute("DROP TRIGGER IF EXISTS sessions_set_updated_at ON sessions")
-    op.execute(
-        "DROP TRIGGER IF EXISTS session_summaries_set_updated_at ON session_summaries"
-    )
-    op.execute("DROP FUNCTION IF EXISTS set_updated_at()")
+    op.execute(sa.text("DROP TRIGGER IF EXISTS sessions_set_updated_at ON sessions"))
+    op.execute(sa.text("DROP TRIGGER IF EXISTS session_summaries_set_updated_at ON session_summaries"))
+    op.execute(sa.text("DROP FUNCTION IF EXISTS set_updated_at()"))
 
     # Drop extra indexes
-    op.execute("DROP INDEX IF EXISTS idx_sessions_host")
-    op.execute("DROP INDEX IF EXISTS idx_vision_frames_latest")
-    op.execute("DROP INDEX IF EXISTS idx_transcripts_tags")
-    op.execute("DROP INDEX IF EXISTS idx_transcripts_text_fts")
-    op.execute("DROP INDEX IF EXISTS idx_transcripts_speaker")
+    op.drop_index("idx_sessions_host",          table_name="sessions")
+    op.drop_index("idx_vision_frames_latest",   table_name="vision_frames")
+    op.drop_index("idx_transcripts_tags",       table_name="transcripts")
+    op.drop_index("idx_transcripts_text_fts",   table_name="transcripts")
+    op.drop_index("idx_transcripts_speaker",    table_name="transcripts")

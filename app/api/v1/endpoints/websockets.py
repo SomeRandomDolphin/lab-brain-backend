@@ -171,7 +171,7 @@ async def asr_endpoint(ws: WebSocket):
             })
 
             if entry_utterance:
-                lkc_graph.write_to_lkc(
+                await lkc_graph.write_to_lkc(
                     _make_agent_record(session_id, time.time(), entry_utterance, new_mode.value)
                 )
                 get_tts_queue(session_id).put_nowait(entry_utterance)
@@ -204,7 +204,7 @@ async def _handle_qa_ws(session_id, ws, dlg, full_text, retriever, metrics, mode
     reply = await generate_response(dlg, full_text, lkc_context)
     if reply:
         ts = time.time()
-        lkc_graph.write_to_lkc(_make_agent_record(session_id, ts, reply, mode.value))
+        await lkc_graph.write_to_lkc(_make_agent_record(session_id, ts, reply, mode.value))
         get_tts_queue(session_id).put_nowait(reply)
         try:
             await ws.send_json({"type": "agent_reply", "text": reply,
@@ -243,7 +243,7 @@ async def vision_endpoint(ws: WebSocket):
             stub_marker = "[Vision stub"
             if state.scene_summary and not state.scene_summary.startswith(stub_marker):
                 from datetime import datetime
-                lkc_graph.write_to_lkc({
+                await lkc_graph.write_to_lkc({
                     "type":             "vision",
                     "session_id":       session_id,
                     "timestamp_iso":    datetime.utcfromtimestamp(time.time()).isoformat() + "Z",

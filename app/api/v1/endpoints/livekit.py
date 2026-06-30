@@ -38,7 +38,6 @@ def _get_pipeline():
 
 @router.post("/room", response_model=RoomCreateResponse)
 async def create_room(req: RoomCreateRequest = None):
-    """Create a LiveKit room, start backend subscriber, persist session to Supabase."""
     if req is None:
         req = RoomCreateRequest()
 
@@ -53,16 +52,26 @@ async def create_room(req: RoomCreateRequest = None):
     try:
         await livekit_rooms.create_room(session_id)
     except Exception as exc:
-        return JSONResponse(status_code=503, content={"error": str(exc)})
+        log.error(f"[livekit] create_room failed: {exc}", exc_info=True)
+        return JSONResponse(status_code=503, content={"error": f"LiveKit error: {exc}"})
 
-    token = livekit_rooms.create_token(session_id, identity=req.display_name)
+    try:
+        token = livekit_rooms.create_token(session_id, identity=req.display_name)
+    except Exception as exc:
+        log.error(f"[livekit] create_token failed: {exc}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": f"Token error: {exc}"})
+
     livekit_rooms.start_subscriber(session_id, _get_pipeline())
 
-    supabase_client.upsert_session(
-        session_id=session_id,
-        host_identity=req.display_name,
-        started_at=time.time(),
-    )
+    try:
+        await supabase_client.upsert_session(
+            session_id=session_id,
+            host_identity=req.display_name,
+            started_at=time.time(),
+        )
+    except Exception as exc:
+        # Non-fatal: room is live, don't kill the session over a DB write
+        log.error(f"[livekit] upsert_session failed (non-fatal): {exc}", exc_info=True)
 
     log.info(f"[livekit] room created: {session_id} host={req.display_name}")
     return RoomCreateResponse(session_id=session_id, token=token, lk_url=cfg.livekit.url)
@@ -105,8 +114,8 @@ async def delete_room(session_id: str):
 
     ended_ts      = time.time()
     metrics_snap  = eval_metrics.get_metrics(session_id).summary()
-    supabase_client.upsert_session(session_id=session_id, ended_at=ended_ts)
-    supabase_client.upsert_eval_metrics(session_id, metrics_snap)
+    await supabase_client.upsert_session(session_id=session_id, ended_at=ended_ts)
+    await supabase_client.upsert_eval_metrics(session_id, metrics_snap)
 
     # Clean up session state
     vision.clear_state(session_id)

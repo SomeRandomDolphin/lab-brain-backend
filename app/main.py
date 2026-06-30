@@ -26,9 +26,11 @@ from pathlib import Path
 from app.core.env import load_env
 load_env()
 
-from fastapi import FastAPI
+import traceback
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.core.config import cfg
@@ -52,15 +54,28 @@ def create_app() -> FastAPI:
     )
 
     # ── CORS ──────────────────────────────────────────────────────────────────
-    # "*" is suitable for local dev. In production, replace with explicit
-    # frontend origin(s) and set allow_credentials=False or use an allowlist.
+    # allow_origins=["*"] and allow_credentials=True cannot be used together —
+    # browsers reject that combination. Use an explicit allowlist with credentials.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=[
+            "http://localhost:5173",
+            "http://localhost:3000",
+        ],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # ── Debug: surface real 500 errors ────────────────────────────────────────
+    @app.exception_handler(Exception)
+    async def _debug_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+        tb = traceback.format_exc()
+        log.error(f"[500] {request.method} {request.url}\n{tb}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": type(exc).__name__, "detail": str(exc), "traceback": tb},
+        )
 
     # ── Static files ──────────────────────────────────────────────────────────
     static_dir = Path(__file__).parent.parent / "static"
@@ -83,14 +98,6 @@ def create_app() -> FastAPI:
     async def startup() -> None:
         from pathlib import Path as _Path
         from app.db import lkc_graph
-
-        # Configure LKC knowledge graph paths
-        lkc_log = _Path(cfg.lkc.log_file)
-        lkc_graph.configure(
-            db_path=lkc_log.with_suffix(".db"),
-            jsonl_path=lkc_log,
-        )
-        log.info(f"[startup] LKC graph configured at {cfg.lkc.db_file}")
 
         # Warm up the Supabase auth client so the first request doesn't pay
         # the cold-start cost and misconfiguration is caught at boot time.
