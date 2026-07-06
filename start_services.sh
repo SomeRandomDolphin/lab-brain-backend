@@ -203,6 +203,67 @@ SUPABASE_API_PORT=8000
 # Compose project name — controls the container name prefix
 SUPABASE_COMPOSE_PROJECT="lab-brain-supabase"
 
+# Patches the Supabase docker-compose.yml so Postgres is reachable directly
+# on the host instead of only through the Supavisor pooler:
+#   1. Comments out the entire `supavisor:` service block.
+#   2. Adds `ports: ["${POSTGRES_PORT}:${POSTGRES_PORT}"]` under `db:`.
+# Matches by service-name boundaries (not fixed line numbers) so it keeps
+# working if the upstream supabase/supabase compose file is reformatted on
+# a future sparse-clone, and is safe to re-run (no-ops if already patched).
+patch_supabase_compose() {
+  local compose_file="$1"
+  [[ -f "$compose_file" ]] || die "Compose file not found: ${compose_file}"
+
+  python3 - "$compose_file" <<'PYEOF'
+import re
+import sys
+
+path = sys.argv[1]
+with open(path, "r") as fh:
+    lines = fh.readlines()
+
+# ── 1. Comment out the `supavisor:` service block ──────────────────────────
+out = []
+in_block = False
+pooler_changed = False
+for line in lines:
+    if re.match(r"^  supavisor:\s*$", line):
+        in_block = True
+    elif in_block and re.match(r"^\S", line):
+        # Dedented to a new top-level key (e.g. "volumes:") — block is over.
+        in_block = False
+
+    if in_block and not line.lstrip().startswith("#"):
+        if line.strip():
+            line = "# " + line
+        pooler_changed = True
+    out.append(line)
+lines = out
+
+# ── 2. Expose `db` directly on POSTGRES_PORT ────────────────────────────────
+text = "".join(lines)
+db_changed = False
+marker = "  db:\n    container_name: supabase-db\n"
+if marker in text and "- ${POSTGRES_PORT}:${POSTGRES_PORT}" not in text:
+    text = text.replace(
+        marker,
+        marker + "    ports:\n      - ${POSTGRES_PORT}:${POSTGRES_PORT}\n",
+        1,
+    )
+    db_changed = True
+
+with open(path, "w") as fh:
+    fh.write(text)
+
+if pooler_changed:
+    print("[patch_supabase_compose] commented out the supavisor service block")
+if db_changed:
+    print("[patch_supabase_compose] exposed db on ${POSTGRES_PORT}:${POSTGRES_PORT}")
+if not pooler_changed and not db_changed:
+    print("[patch_supabase_compose] already patched — nothing to do")
+PYEOF
+}
+
 start_supabase() {
   info "Setting up Supabase (official self-hosting guide)..."
 
@@ -240,6 +301,17 @@ start_supabase() {
   local env_file="${SUPABASE_PROJECT_DIR}/.env"
   local run_sh="${SUPABASE_PROJECT_DIR}/run.sh"
   local compose_file="${SUPABASE_PROJECT_DIR}/docker-compose.yml"
+
+  # ── Step 2b: expose Postgres directly, bypass Supavisor ──────────────────
+  # Per https://supabase.com/docs/guides/self-hosting/docker#exposing-your-postgres-database
+  # Alembic runs DDL migrations, which don't work reliably through Supavisor's
+  # transaction-mode pooler (and its username needs a tenant-id suffix that
+  # alembic/env.py has no reason to know about). Comment out the `supavisor`
+  # service entirely and expose `db` on POSTGRES_PORT directly instead.
+  # Idempotent + resilient to upstream compose-file changes: matches by
+  # service name rather than hardcoded line numbers, since this file is
+  # re-cloned from supabase/supabase on a fresh setup.
+  patch_supabase_compose "$compose_file"
 
   # ── Step 3: generate secrets (first-time only) ───────────────────────────
   # Detect whether this is a first-time setup by checking if POSTGRES_PASSWORD

@@ -42,7 +42,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import func, select, delete
+from sqlalchemy import func, select, delete, text as sa_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -105,9 +105,9 @@ def _get_storage_client():
         return _storage_client
 
     url = os.environ.get("SUPABASE_URL", "")
-    key = os.environ.get("SUPABASE_KEY", "")
+    key = os.environ.get("SUPABASE_SERVICE_KEY", "")
     if not url or not key:
-        log.warning("[supabase] SUPABASE_URL / SUPABASE_KEY not set — Storage disabled.")
+        log.warning("[supabase] SUPABASE_URL / SUPABASE_SERVICE_KEY not set — Storage disabled.")
         return None
 
     try:
@@ -157,6 +157,30 @@ def _fire_sync(fn, *args) -> None:
         loop.run_in_executor(None, fn, *args)
     except RuntimeError:
         fn(*args)
+
+
+async def _ensure_session_row(session_id: str, db: AsyncSession) -> None:
+    """
+    Guarantee a sessions row exists for *session_id* without overwriting any
+    real session data that may already be there.
+
+    Called by upsert_session_summary and upsert_eval_metrics, which can be
+    invoked by the frontend before POST /sessions has been called (the client
+    generates IDs locally and may send summary/metrics for a session that was
+    never explicitly persisted).  A bare INSERT … ON CONFLICT DO NOTHING is the
+    lightest-weight way to satisfy the FK constraint.
+
+    We use raw SQL rather than pg_insert(SessionModel.__table__) to sidestep
+    the SQLAlchemy metadata/metadata_ column naming quirk entirely.
+    """
+    await db.execute(
+        sa_text("""
+            INSERT INTO sessions (session_id, host_identity, started_at, metadata, updated_at)
+            VALUES (:sid, 'browser-user', NOW(), '{}', NOW())
+            ON CONFLICT (session_id) DO NOTHING
+        """),
+        {"sid": session_id},
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -281,12 +305,22 @@ async def upsert_session_summary(session_id: str, summary_md: str, tags: dict) -
         "tags":       tags,
         "updated_at": _utcnow(),
     }
+    # Use __table__ (the raw SA Table object) instead of the ORM class so that
+    # SQLAlchemy does NOT auto-append "RETURNING session_summaries.id".  The ORM
+    # model declares `id` as its primary key, but the actual table's PK is
+    # session_id — a RETURNING on a non-existent column raises
+    # asyncpg.UndefinedColumnError.  Table-level inserts never add RETURNING.
     stmt = (
-        pg_insert(SessionSummary)
+        pg_insert(SessionSummary.__table__)
         .values(**values, created_at=_utcnow())
         .on_conflict_do_update(index_elements=["session_id"], set_=values)
     )
     async with get_session_factory()() as db:
+        # Ensure the parent sessions row exists before inserting the FK-dependent
+        # summary.  The client generates session IDs locally and may call this
+        # endpoint before the session has been persisted — ON CONFLICT DO NOTHING
+        # is a no-op when the row is already there.
+        await _ensure_session_row(session_id, db)
         await db.execute(stmt)
         await db.commit()
 
@@ -308,12 +342,16 @@ async def upsert_eval_metrics(session_id: str, metrics_dict: dict) -> None:
         "snapshot_at": now,
         "updated_at":  now,
     }
+    # Same __table__ pattern as upsert_session_summary — see comment there.
     stmt = (
-        pg_insert(EvalMetrics)
+        pg_insert(EvalMetrics.__table__)
         .values(**values)
         .on_conflict_do_update(index_elements=["session_id"], set_=values)
     )
     async with get_session_factory()() as db:
+        # Same FK-safety pattern as upsert_session_summary — ensure the parent
+        # sessions row exists before writing eval_metrics.
+        await _ensure_session_row(session_id, db)
         await db.execute(stmt)
         await db.commit()
 
@@ -329,8 +367,9 @@ async def upsert_consent(
         "real_name":     real_name,
         "updated_at":    _utcnow(),
     }
+    # Same __table__ pattern as upsert_session_summary — see comment there.
     stmt = (
-        pg_insert(ConsentRegistry)
+        pg_insert(ConsentRegistry.__table__)
         .values(**values)
         .on_conflict_do_update(index_elements=["speaker_label"], set_=values)
     )

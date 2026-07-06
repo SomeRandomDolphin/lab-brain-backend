@@ -68,14 +68,26 @@ def create_app() -> FastAPI:
     )
 
     # ── Debug: surface real 500 errors ────────────────────────────────────────
+    _ALLOWED_ORIGINS = {"http://localhost:5173", "http://localhost:3000"}
+
     @app.exception_handler(Exception)
     async def _debug_exception_handler(request: Request, exc: Exception) -> JSONResponse:
         tb = traceback.format_exc()
         log.error(f"[500] {request.method} {request.url}\n{tb}")
-        return JSONResponse(
+        response = JSONResponse(
             status_code=500,
             content={"error": type(exc).__name__, "detail": str(exc), "traceback": tb},
         )
+        # NOTE: responses built inside exception handlers don't reliably pick up
+        # CORSMiddleware's headers (a known Starlette/FastAPI gotcha), which makes
+        # genuine 500s show up in the browser as misleading "blocked by CORS
+        # policy" errors instead of the real error. Attach the headers manually
+        # so the frontend can actually see and report the real status/body.
+        origin = request.headers.get("origin")
+        if origin in _ALLOWED_ORIGINS:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+        return response
 
     # ── Static files ──────────────────────────────────────────────────────────
     static_dir = Path(__file__).parent.parent / "static"

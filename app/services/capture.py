@@ -206,15 +206,40 @@ async def process_segment(
     confirm_agent: bool = True,
     word_timestamps: Optional[list[dict]] = None,
 ) -> dict:
+    # Drop empty transcriptions early — these are silence flushes from the VAD
+    # and would pollute the LKC graph and the SSE stream with blank records.
+    if not text.strip():
+        return {}
+
     tags   = tag_segment(text)
     ts_iso = datetime.utcfromtimestamp(timestamp_unix).isoformat() + "Z"
+
+    # ── Speaker consistency check ─────────────────────────────────────────────
+    # The segment-level speaker (from pyannote coarse diarization) and the
+    # word-level speakers (from whisperx.assign_word_speakers fine diarization)
+    # can disagree when a turn boundary falls mid-segment.  When they conflict,
+    # use the majority-vote word-level speaker as the authoritative label and
+    # log a warning so the diarization pipeline can be audited.
+    resolved_speaker = speaker
+    if word_timestamps:
+        word_speakers = [w.get("speaker") for w in word_timestamps if w.get("speaker")]
+        if word_speakers:
+            # Majority vote among word-level speaker labels
+            majority = max(set(word_speakers), key=word_speakers.count)
+            if majority != speaker:
+                log.warning(
+                    f"[capture:{session_id}] speaker mismatch — "
+                    f"segment={speaker!r}, word-level majority={majority!r} "
+                    f"(votes: {word_speakers}). Using word-level majority."
+                )
+                resolved_speaker = majority
 
     record: dict = {
         "type":           "transcript",
         "session_id":     session_id,
         "timestamp_iso":  ts_iso,
         "timestamp_unix": round(timestamp_unix, 3),
-        "speaker":        speaker,
+        "speaker":        resolved_speaker,
         "text":           text,
         "mode":           mode,
         "language":       language,
@@ -223,7 +248,15 @@ async def process_segment(
     if word_timestamps:
         record["word_timestamps"] = word_timestamps
 
-    await lkc_graph.write_to_lkc(record)
+    try:
+        await lkc_graph.write_to_lkc(record)
+    except Exception as exc:
+        # Log but do NOT propagate — the record is still valid.  Callers must
+        # be able to broadcast it to SSE even when LKC persistence is degraded.
+        log.error(
+            f"[capture:{session_id}] lkc_graph.write_to_lkc failed: {exc}",
+            exc_info=True,
+        )
 
     if confirm_agent and has_tags(tags):
         parts: list[str] = []

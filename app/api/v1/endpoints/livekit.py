@@ -109,20 +109,38 @@ async def room_status(session_id: str):
 @router.delete("/room/{session_id}")
 async def delete_room(session_id: str):
     """End a session: stop subscriber, delete room, snapshot metrics to Supabase."""
+    # Stop subscriber and delete LiveKit room — always run these first.
     await livekit_rooms.stop_subscriber(session_id)
     deleted = await livekit_rooms.delete_room(session_id)
 
-    ended_ts      = time.time()
-    metrics_snap  = eval_metrics.get_metrics(session_id).summary()
-    await supabase_client.upsert_session(session_id=session_id, ended_at=ended_ts)
-    await supabase_client.upsert_eval_metrics(session_id, metrics_snap)
+    ended_ts     = time.time()
+    metrics_snap = eval_metrics.get_metrics(session_id).summary()
+    db_errors    = []
 
-    # Clean up session state
+    # DB writes are best-effort — a ProgrammingError or schema mismatch
+    # must never cause a 500 that blocks the frontend from completing teardown.
+    try:
+        await supabase_client.upsert_session(session_id=session_id, ended_at=ended_ts)
+    except Exception as exc:
+        db_errors.append(f"upsert_session: {exc}")
+        log.error(f"[livekit] delete_room upsert_session failed: {exc}", exc_info=True)
+
+    try:
+        await supabase_client.upsert_eval_metrics(session_id, metrics_snap)
+    except Exception as exc:
+        db_errors.append(f"upsert_eval_metrics: {exc}")
+        log.error(f"[livekit] delete_room upsert_eval_metrics failed: {exc}", exc_info=True)
+
+    # Clean up in-memory session state regardless of DB outcome.
     vision.clear_state(session_id)
     clear_dialogue(session_id)
     clear_summon(session_id)
 
-    return {"session_id": session_id, "deleted": deleted}
+    return {
+        "session_id": session_id,
+        "deleted":    deleted,
+        **({"db_warnings": db_errors} if db_errors else {}),
+    }
 
 
 @sse_router.get("/events/{session_id}")

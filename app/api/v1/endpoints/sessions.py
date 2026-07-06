@@ -32,42 +32,69 @@ router = APIRouter(tags=["sessions"])
 
 @router.post("/summary/{session_id}")
 async def post_summary(session_id: str):
-    dialogue = _get_dialogue_module()
-    dlg_state = dialogue.get_dialogue(session_id)
-    records   = await lkc_graph.read_lkc(session_id=session_id, record_type="transcript")
+    import logging
+    _log = logging.getLogger(__name__)
+    try:
+        dialogue = _get_dialogue_module()
+        dlg_state = dialogue.get_dialogue(session_id)
+        records   = await lkc_graph.read_lkc(session_id=session_id, record_type="transcript")
 
-    tags: dict = {"action_items": [], "decisions": [], "deadlines": [], "entities": []}
-    for r in records:
-        t = r.get("tags", {})
-        tags["action_items"].extend(t.get("action_items", []))
-        tags["decisions"].extend(t.get("decisions",    []))
-        tags["deadlines"].extend(t.get("deadlines",    []))
-        tags["entities"].extend(t.get("entities",      []))
-    tags["entities"] = sorted(set(tags["entities"]))
+        tags: dict = {"action_items": [], "decisions": [], "deadlines": [], "entities": []}
+        for r in records:
+            t = r.get("tags", {})
+            tags["action_items"].extend(t.get("action_items", []))
+            tags["decisions"].extend(t.get("decisions",    []))
+            tags["deadlines"].extend(t.get("deadlines",    []))
+            tags["entities"].extend(t.get("entities",      []))
+        tags["entities"] = sorted(set(tags["entities"]))
 
-    summary_md = await dialogue.generate_summary(dlg_state, tags)
-    await lkc_graph.write_to_lkc({
-        "type":          "session_summary",
-        "session_id":    session_id,
-        "timestamp_iso": datetime.utcnow().isoformat() + "Z",
-        "summary":       summary_md,
-        "tags":          tags,
-    })
+        try:
+            summary_md = await dialogue.generate_summary(dlg_state, tags)
+        except Exception as exc:
+            # LLM unavailable (e.g. Ollama not running) — return a graceful
+            # stub so the frontend session teardown can still complete cleanly.
+            _log.warning(f"[summary:{session_id}] generate_summary failed (LLM unavailable?): {exc}")
+            summary_md = (
+                "## Session Summary\n\n"
+                "_Summary generation failed — the local LLM may not be running._\n\n"
+                f"**Action items captured:** {len(tags.get('action_items', []))}\n"
+                f"**Decisions captured:** {len(tags.get('decisions', []))}\n"
+                f"**Entities mentioned:** {', '.join(tags.get('entities', [])) or 'none'}\n"
+            )
 
-    await supabase_client.upsert_session_summary(session_id, summary_md, tags)
-    transcript_rows = await supabase_client.get_transcripts(session_id) or [
-        {"timestamp_iso": r.get("timestamp_iso", ""),
-         "speaker": r.get("speaker", ""),
-         "text": r.get("text", "")}
-        for r in records
-    ]
-    report_url = await supabase_client.export_report(session_id, summary_md, tags, transcript_rows)
+        await lkc_graph.write_to_lkc({
+            "type":          "session_summary",
+            "session_id":    session_id,
+            "timestamp_iso": datetime.utcnow().isoformat() + "Z",
+            "summary":       summary_md,
+            "tags":          tags,
+        })
 
-    return {
-        "session_id": session_id,
-        "summary":    summary_md,
-        "report_url": report_url,
-    }
+        await supabase_client.upsert_session_summary(session_id, summary_md, tags)
+        transcript_rows = await supabase_client.get_transcripts(session_id) or [
+            {"timestamp_iso": r.get("timestamp_iso", ""),
+             "speaker": r.get("speaker", ""),
+             "text": r.get("text", "")}
+            for r in records
+        ]
+        report_url = await supabase_client.export_report(session_id, summary_md, tags, transcript_rows)
+
+        return {
+            "session_id": session_id,
+            "summary":    summary_md,
+            "report_url": report_url,
+        }
+    except Exception as exc:
+        _log.error(f"[summary:{session_id}] post_summary failed: {exc}", exc_info=True)
+        return JSONResponse(
+            status_code=200,  # Return 200 so frontend teardown is not blocked
+            content={
+                "session_id": session_id,
+                "summary":    "_Summary unavailable — an error occurred during generation._",
+                "report_url": None,
+                "error":      str(exc),
+            }
+        )
 
 
 @router.get("/mode/{session_id}")

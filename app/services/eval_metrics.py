@@ -200,11 +200,11 @@ def get_metrics(session_id: str) -> SessionMetrics:
     return _sessions[session_id]
 
 
-def all_summaries() -> list[dict]:
+async def all_summaries() -> list[dict]:
     return [m.summary() for m in _sessions.values()]
 
 
-def all_csv() -> str:
+async def all_csv() -> str:
     rows = []
     for m in _sessions.values():
         rows.extend(m.to_csv_rows())

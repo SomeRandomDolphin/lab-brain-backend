@@ -73,9 +73,9 @@ async def _handle_qa_sse(session_id, dlg, full_text, retriever, mode, tts_queue)
         ts = time.time()
         await lkc_graph.write_to_lkc(_agent_record(session_id, ts, reply, mode.value))
         tts_queue.put_nowait(reply)
-        await broadcast(session_id, {"type": "agent_reply", "text": reply,
-                                     "mode": mode.value, "grounded": bool(lkc_context.strip())})
-        await broadcast(session_id, {"type": "speak", "text": reply})
+        broadcast(session_id, {"type": "agent_reply", "text": reply,
+                               "mode": mode.value, "grounded": bool(lkc_context.strip())})
+        broadcast(session_id, {"type": "speak", "text": reply})
         await supabase_client.insert_agent_reply(
             session_id=session_id, text=reply, mode=mode.value,
             timestamp_unix=ts, grounded=bool(lkc_context.strip()), lkc_context=lkc_context,
@@ -105,7 +105,7 @@ async def livekit_pipeline(
     _wx_align_cache: dict     = {}
 
     log.info(f"[pipeline:{session_id}] started")
-    await broadcast(session_id, {"type": "session", "session_id": session_id})
+    broadcast(session_id, {"type": "session", "session_id": session_id})
 
     # ── Audio processor ───────────────────────────────────────────────────────
 
@@ -117,14 +117,25 @@ async def livekit_pipeline(
         segment_audio = chunker.push(pcm_f32)
 
         if segment_audio is None:
-            await broadcast(session_id, {
+            broadcast(session_id, {
                 "type":     "listening",
                 "mode":     dlg.mode.value,
                 "summoned": _capture.is_summoned(session_id),
             })
             return
 
-        if float(np.sqrt(np.mean(segment_audio ** 2))) < SILENCE_THRESHOLD * 2:
+        seg_rms = float(np.sqrt(np.mean(segment_audio ** 2)))
+        if seg_rms < SILENCE_THRESHOLD * 2:
+            # log.info(
+            #     f"[pipeline:{session_id}] segment dropped as silence "
+            #     f"(rms={seg_rms:.5f} < {SILENCE_THRESHOLD * 2:.5f}, "
+            #     f"{len(segment_audio)} samples / {len(segment_audio) / SAMPLE_RATE:.2f}s)"
+            # )
+            broadcast(session_id, {
+                "type":     "listening",
+                "mode":     dlg.mode.value,
+                "summoned": _capture.is_summoned(session_id),
+            })
             return
 
         seg_start = time.time()
@@ -175,10 +186,11 @@ async def livekit_pipeline(
         )
         if new_mode != prev_mode:
             metrics.record_mode_switch(new_mode.value)
-            await broadcast(session_id, {"type": "mode_change", "mode": new_mode.value})
+            broadcast(session_id, {"type": "mode_change", "mode": new_mode.value})
 
-        # Write to LKC graph
-        record = _capture.process_segment(
+        # Write to LKC graph (failure is caught inside process_segment and logged;
+        # the record dict is always returned so the broadcast below is never blocked)
+        record = await _capture.process_segment(
             session_id, speaker, redacted_text,
             seg_start, new_mode.value, detected_lang,
             confirm_agent=True,
@@ -190,26 +202,18 @@ async def livekit_pipeline(
         e2e = round((time.time() - request_received_at) * 1000)
         metrics.record_e2e(e2e)
 
-        # Persist to Supabase
-        await supabase_client.insert_transcript(
-            session_id=session_id, speaker=speaker, text=redacted_text,
-            language=detected_lang, mode=new_mode.value,
-            timestamp_unix=seg_start, timestamp_iso=record["timestamp_iso"],
-            tags=record.get("tags", {}), word_timestamps=word_timestamps,
-            asr_latency_ms=asr_latency, e2e_latency_ms=e2e,
-            segment_index=segment_index,
-        )
-        if cfg.supabase.store_audio:
-            await supabase_client.upload_audio_segment(session_id, segment_index, segment_audio)
-
         log.info(
             f"[{session_id}] seg#{segment_index} "
             f"asr={asr_latency}ms e2e={e2e}ms [{detected_lang}] "
             f"mode={new_mode.value} summoned={summoned}: {full_text[:60]}"
         )
 
-        # Broadcast transcript via SSE
-        await broadcast(session_id, {
+        # ── SSE broadcast — happens FIRST, before any persistence ────────────
+        # Previously the broadcast was the last line, so any Supabase/LKC
+        # exception caused _audio_consumer to catch-and-log, skip the rest of
+        # _process_audio, and leave the frontend with no transcript at all.
+        # Now the frontend always receives the event regardless of DB health.
+        broadcast(session_id, {
             "type":            "transcript",
             "segment":         segment_index,
             "session_id":      session_id,
@@ -219,7 +223,7 @@ async def livekit_pipeline(
             "latency_ms":      asr_latency,
             "e2e_ms":          e2e,
             "mode":            new_mode.value,
-            "timestamp":       record["timestamp_iso"],
+            "timestamp":       record.get("timestamp_iso", ""),
             "engagement":      perc_state.engagement_cues.get(speaker, "unknown"),
             "tags":            record.get("tags", {}),
             "environment":     perc_state.environment_state,
@@ -227,13 +231,35 @@ async def livekit_pipeline(
             "summoned":        summoned,
         })
 
+        # ── Supabase persistence — isolated so failures never block SSE ───────
+        try:
+            await supabase_client.insert_transcript(
+                session_id=session_id, speaker=speaker, text=redacted_text,
+                language=detected_lang, mode=new_mode.value,
+                timestamp_unix=seg_start,
+                timestamp_iso=record.get("timestamp_iso", ""),
+                tags=record.get("tags", {}), word_timestamps=word_timestamps,
+                asr_latency_ms=asr_latency, e2e_latency_ms=e2e,
+                segment_index=segment_index,
+            )
+            if cfg.supabase.store_audio:
+                await supabase_client.upload_audio_segment(
+                    session_id, segment_index, segment_audio
+                )
+        except Exception as exc:
+            log.error(
+                f"[pipeline:{session_id}] Supabase persist failed for "
+                f"seg#{segment_index}: {exc}",
+                exc_info=True,
+            )
+
         # Entry utterance (greeting / confirmation)
         if entry_utterance:
             ts = time.time()
             await lkc_graph.write_to_lkc(_agent_record(session_id, ts, entry_utterance, new_mode.value))
             tts_queue.put_nowait(entry_utterance)
-            await broadcast(session_id, {"type": "agent_reply", "text": entry_utterance, "mode": new_mode.value})
-            await broadcast(session_id, {"type": "speak", "text": entry_utterance})
+            broadcast(session_id, {"type": "agent_reply", "text": entry_utterance, "mode": new_mode.value})
+            broadcast(session_id, {"type": "speak", "text": entry_utterance})
 
         # QA reply
         if new_mode == ConvMode.QA:
@@ -284,7 +310,7 @@ async def livekit_pipeline(
                     latency_ms=latency_ms,
                 )
 
-        await broadcast(session_id, {
+        broadcast(session_id, {
             "type":              "perception",
             "session_id":        session_id,
             "present_speakers":  state.present_speakers,
@@ -295,24 +321,46 @@ async def livekit_pipeline(
         })
 
     # ── Main loop ─────────────────────────────────────────────────────────────
-    try:
-        while True:
-            done, pending = await asyncio.wait(
-                [
-                    asyncio.ensure_future(audio_q.get()),
-                    asyncio.ensure_future(video_q.get()),
-                ],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for future in done:
-                item = future.result()
-                if isinstance(item, bytes):
-                    await _process_video(item)
-                else:
-                    await _process_audio(item)
-            for future in pending:
-                future.cancel()
+    # FIXED: asyncio.wait on ensure_future(queue.get()) is fatally broken —
+    # cancelling a pending get() drops the item silently, and a cancelled
+    # future from the previous iteration can re-raise CancelledError via
+    # future.result(), which propagates out and calls room.disconnect(),
+    # making the agent disappear. Two persistent consumer tasks fix both.
 
+    async def _audio_consumer() -> None:
+        while True:
+            frame = await audio_q.get()
+            try:
+                await _process_audio(frame)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception(f"[pipeline:{session_id}] _process_audio raised unexpectedly")
+
+    async def _video_consumer() -> None:
+        while True:
+            jpeg = await video_q.get()
+            try:
+                await _process_video(jpeg)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception(f"[pipeline:{session_id}] _process_video raised unexpectedly")
+
+    audio_task = asyncio.create_task(_audio_consumer(), name=f"audio-{session_id}")
+    video_task = asyncio.create_task(_video_consumer(), name=f"video-{session_id}")
+
+    try:
+        results = await asyncio.gather(audio_task, video_task, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
+                log.error(
+                    f"[pipeline:{session_id}] consumer task exited with error: {result!r}",
+                    exc_info=result,
+                )
     except asyncio.CancelledError:
         log.info(f"[pipeline:{session_id}] cancelled")
+        audio_task.cancel()
+        video_task.cancel()
+        await asyncio.gather(audio_task, video_task, return_exceptions=True)
         raise

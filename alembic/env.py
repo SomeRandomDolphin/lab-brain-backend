@@ -30,6 +30,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.core.env import load_env  # noqa: E402
 load_env()
 
+import logging
+
 from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
@@ -38,7 +40,24 @@ from sqlalchemy.ext.asyncio import create_async_engine
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
+
+# fileConfig() above reconfigures Python's entire logging system from
+# alembic.ini, which sets the root logger to WARN. Logger-level filtering
+# happens first, but handler-level filtering happens *after* — so even if
+# this logger's own level is INFO, root's WARN-level handler would still
+# swallow the records before they're emitted. Give this logger its own
+# handler and disable propagation so its output is independent of whatever
+# alembic.ini does (now or after future edits to it).
+log = logging.getLogger("alembic.env")
+log.setLevel(logging.INFO)
+log.propagate = False
+if not log.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)-8s [env_py] %(message)s")
+    )
+    log.addHandler(_handler)
 
 target_metadata = None
 
@@ -87,6 +106,8 @@ def do_run_migrations(connection: Connection) -> None:
 
 async def run_migrations_online() -> None:
     """Apply migrations using an async engine (the normal runtime path)."""
+    import time
+
     connectable = create_async_engine(
         _resolve_db_url(),
         poolclass=pool.NullPool,
@@ -94,14 +115,30 @@ async def run_migrations_online() -> None:
         # that rewrites the username to "postgres.<tenant-id>", which breaks
         # local Docker Supabase where the user is plain "postgres".
         connect_args={
+            # "command_timeout" only bounds an individual query/DDL statement
+            # once a connection is already established — it does NOT cover the
+            # initial TCP handshake + Postgres auth. asyncpg's own "timeout"
+            # kwarg covers that connect phase specifically. Without it, a
+            # connection attempt to a host/port that's silently dropping
+            # packets (e.g. a port conflict, firewall, or wrong host) can hang
+            # indefinitely with zero error and zero log output.
+            "timeout": 10,
             "command_timeout": 60,
         },
     )
 
-    async with connectable.connect() as connection:
-        await connection.run_sync(do_run_migrations)
-
-    await connectable.dispose()
+    log.info("[alembic.env] connecting to database ...")
+    t0 = time.monotonic()
+    try:
+        async with connectable.connect() as connection:
+            log.info(f"[alembic.env] connected in {time.monotonic() - t0:.2f}s — running migrations ...")
+            await connection.run_sync(do_run_migrations)
+            log.info("[alembic.env] migrations applied successfully")
+    except Exception:
+        log.error(f"[alembic.env] failed after {time.monotonic() - t0:.2f}s", exc_info=True)
+        raise
+    finally:
+        await connectable.dispose()
 
 
 if context.is_offline_mode():

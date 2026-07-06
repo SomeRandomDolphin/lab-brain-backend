@@ -15,8 +15,10 @@ import asyncio
 import json
 import logging
 import time
+import io
 from datetime import timedelta
 from typing import AsyncIterator, Optional
+from PIL import Image
 
 from app.core.config import cfg
 
@@ -150,7 +152,7 @@ async def delete_room(session_id: str) -> bool:
             api_key=cfg.livekit.api_key,
             api_secret=cfg.livekit.api_secret,
         ) as api:
-            await api.room.delete_room(DeleteRoomRequest(name=session_id))
+            await api.room.delete_room(DeleteRoomRequest(room=session_id))
         log.info(f"[livekit] room {session_id} deleted")
         return True
     except Exception as exc:
@@ -160,6 +162,10 @@ async def delete_room(session_id: str) -> bool:
 
 # ── Active subscriber tasks ───────────────────────────────────────────────────
 _subscriber_tasks: dict[str, asyncio.Task] = {}
+
+# Strong references to per-session drain tasks so the GC cannot silently
+# collect them while they are still awaiting frames from the LiveKit streams.
+_drain_tasks: dict[str, list[asyncio.Task]] = {}
 
 
 def start_subscriber(session_id: str, pipeline_fn) -> None:
@@ -171,7 +177,29 @@ def start_subscriber(session_id: str, pipeline_fn) -> None:
         name=f"lk-sub-{session_id}",
     )
     _subscriber_tasks[session_id] = task
-    task.add_done_callback(lambda t: _subscriber_tasks.pop(session_id, None))
+
+    def _on_subscriber_done(t: asyncio.Task) -> None:
+        _subscriber_tasks.pop(session_id, None)
+        if t.cancelled():
+            log.warning(f"[livekit:{session_id}] subscriber task was CANCELLED")
+            return
+        exc = t.exception()
+        if exc:
+            import traceback
+            tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            log.error(
+                f"[livekit:{session_id}] *** SUBSCRIBER TASK CRASHED ***\n"
+                f"  type : {type(exc).__name__}\n"
+                f"  value: {exc!r}\n"
+                f"  traceback:\n{tb}"
+            )
+        else:
+            log.warning(
+                f"[livekit:{session_id}] subscriber task finished WITHOUT exception "
+                f"(pipeline_fn returned or an except clause swallowed the error)"
+            )
+
+    task.add_done_callback(_on_subscriber_done)
     log.info(f"[livekit] subscriber task started for {session_id}")
 
 
@@ -183,6 +211,12 @@ async def stop_subscriber(session_id: str) -> None:
             await task
         except asyncio.CancelledError:
             pass
+
+    # Cancel any drain tasks that are still alive and drop the strong refs.
+    for drain in _drain_tasks.pop(session_id, []):
+        if not drain.done():
+            drain.cancel()
+
     log.info(f"[livekit] subscriber task stopped for {session_id}")
 
 
@@ -194,7 +228,12 @@ async def _subscriber_loop(session_id: str, pipeline_fn) -> None:
     audio_q: asyncio.Queue = asyncio.Queue(maxsize=256)
     video_q: asyncio.Queue = asyncio.Queue(maxsize=32)
 
-    server_token   = create_token(session_id, identity="lab-brain-server", ttl_seconds=7200)
+    try:
+        server_token = create_token(session_id, identity="lab-brain-server", ttl_seconds=7200)
+    except Exception as exc:
+        log.error(f"[livekit:{session_id}] create_token (server identity) failed: {exc}", exc_info=True)
+        return
+
     SERVER_IDENTITY = "lab-brain-server"
     room = lk_rtc.Room()
 
@@ -206,24 +245,103 @@ async def _subscriber_loop(session_id: str, pipeline_fn) -> None:
             f"[livekit:{session_id}] track subscribed: "
             f"kind={track.kind} participant={participant.identity}"
         )
+
+        def _on_drain_done(t: asyncio.Task, kind=track.kind) -> None:  # noqa: B023
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc:
+                log.error(
+                    f"[livekit:{session_id}] drain task ({kind}) crashed: {exc!r}",
+                    exc_info=exc,
+                )
+
         if track.kind == lk_rtc.TrackKind.KIND_AUDIO:
-            asyncio.ensure_future(_drain_audio(track, audio_q))
+            t = asyncio.create_task(_drain_audio(track, audio_q))
         elif track.kind == lk_rtc.TrackKind.KIND_VIDEO:
-            asyncio.ensure_future(_drain_video(track, video_q))
+            t = asyncio.create_task(_drain_video(track, video_q))
+        else:
+            return
+
+        # Keep a strong reference so the GC cannot silently cancel the task
+        # while it is awaiting frames. Cleaned up in stop_subscriber().
+        _drain_tasks.setdefault(session_id, []).append(t)
+
+        def _on_drain_done_and_remove(
+            finished: asyncio.Task,
+            kind=track.kind,
+            session=session_id,
+        ) -> None:
+            _on_drain_done(finished, kind)
+            try:
+                _drain_tasks.get(session, []).remove(finished)
+            except ValueError:
+                pass
+
+        t.add_done_callback(_on_drain_done_and_remove)
 
     @room.on("disconnected")
     def on_disconnect(reason=None):
-        log.info(f"[livekit:{session_id}] room disconnected: {reason}")
+        log.error(f"[livekit:{session_id}] *** ROOM DISCONNECTED *** reason={reason!r}")
+
+    @room.on("connection_state_changed")
+    def on_conn_state(state):
+        log.warning(f"[livekit:{session_id}] connection_state_changed -> {state!r}")
+
+    @room.on("reconnecting")
+    def on_reconnecting():
+        log.warning(f"[livekit:{session_id}] reconnecting...")
+
+    @room.on("participant_disconnected")
+    def on_participant_left(participant):
+        log.warning(f"[livekit:{session_id}] participant left: {participant.identity!r}")
+
+    _MAX_CONNECT_ATTEMPTS = 3
+    _CONNECT_BACKOFF_BASE = 2.0  # seconds; attempt n waits backoff_base ** (n-1)
 
     try:
-        await room.connect(cfg.livekit.url, server_token)
-        log.info(f"[livekit:{session_id}] server participant connected")
+        for attempt in range(1, _MAX_CONNECT_ATTEMPTS + 1):
+            try:
+                log.info(
+                    f"[livekit:{session_id}] room.connect attempt {attempt}/{_MAX_CONNECT_ATTEMPTS} "
+                    f"→ {cfg.livekit.url!r}"
+                )
+                await room.connect(cfg.livekit.url, server_token)
+                log.info(
+                    f"[livekit:{session_id}] *** CONNECTED *** "
+                    f"sid={room.local_participant.sid}"
+                )
+                break  # success
+            except asyncio.CancelledError:
+                raise
+            except Exception as connect_exc:
+                if attempt == _MAX_CONNECT_ATTEMPTS:
+                    log.error(
+                        f"[livekit:{session_id}] room.connect failed after "
+                        f"{_MAX_CONNECT_ATTEMPTS} attempts: {connect_exc!r}"
+                    )
+                    raise
+                wait = _CONNECT_BACKOFF_BASE ** (attempt - 1)
+                log.warning(
+                    f"[livekit:{session_id}] room.connect attempt {attempt} failed "
+                    f"({connect_exc!r}), retrying in {wait:.0f}s …"
+                )
+                await asyncio.sleep(wait)
+
+        log.info(f"[livekit:{session_id}] calling pipeline_fn={pipeline_fn!r} ...")
         await pipeline_fn(session_id, audio_q, video_q)
+        log.info(f"[livekit:{session_id}] pipeline_fn returned normally (unexpected)")
     except asyncio.CancelledError:
-        log.info(f"[livekit:{session_id}] subscriber cancelled")
+        log.info(f"[livekit:{session_id}] subscriber CancelledError (clean shutdown)")
+        raise
     except Exception as exc:
-        log.error(f"[livekit:{session_id}] subscriber error: {exc}", exc_info=True)
+        log.error(
+            f"[livekit:{session_id}] *** SUBSCRIBER CRASHED *** "
+            f"{type(exc).__name__}: {exc}",
+            exc_info=True,
+        )
     finally:
+        log.info(f"[livekit:{session_id}] finally: calling room.disconnect()")
         await room.disconnect()
 
 
@@ -237,9 +355,16 @@ async def _drain_audio(track, q: asyncio.Queue) -> None:
 
 
 async def _drain_video(track, q: asyncio.Queue) -> None:
-    video_stream = lk_rtc.VideoStream(track, format=lk_rtc.VideoBufferType.JPEG)
+    video_stream = lk_rtc.VideoStream(track, format=lk_rtc.VideoBufferType.I420)
     async for event in video_stream:
+        frame = event.frame
+        rgba = frame.convert(lk_rtc.VideoBufferType.RGBA)
+        img = Image.frombuffer(
+            "RGBA", (rgba.width, rgba.height), rgba.data, "raw", "RGBA", 0, 1
+        )
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=70)
         try:
-            q.put_nowait(bytes(event.frame.data))
+            q.put_nowait(buf.getvalue())
         except asyncio.QueueFull:
             pass

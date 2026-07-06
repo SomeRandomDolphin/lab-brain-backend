@@ -18,6 +18,16 @@ SILENCE_THRESHOLD  = cfg.vad.silence_threshold
 VAD_SILENCE_CHUNKS = cfg.vad.silence_chunks
 MAX_SEGMENT_CHUNKS = cfg.vad.max_segment_chunks
 
+# Minimum audio length before we attempt transcription.
+# WhisperX hallucinates common phrases ("Thank you.", "Thanks for watching.")
+# on segments shorter than ~1 s; discard anything below this floor.
+MIN_SEGMENT_SAMPLES = SAMPLE_RATE  # 1 second at 16 kHz = 16 000 samples
+
+# Minimum mean word-alignment score to accept a WhisperX result.
+# Alignment scores < 0.40 indicate the model found no real speech and invented
+# text — the canonical hallucination signature.
+MIN_WORD_SCORE = 0.40
+
 # ── ASR backend ───────────────────────────────────────────────────────────────
 try:
     import whisperx
@@ -65,7 +75,7 @@ class VadChunker:
             self.silent_count >= VAD_SILENCE_CHUNKS
             or self.chunk_count >= MAX_SEGMENT_CHUNKS
         )
-        if should_flush and len(self.buffer) > VAD_SILENCE_CHUNKS:
+        if should_flush and len(self.buffer) >= VAD_SILENCE_CHUNKS:
             segment           = np.concatenate(self.buffer)
             self.buffer       = []
             self.silent_count = 0
@@ -86,7 +96,20 @@ async def transcribe(
 
     Returns (full_text, detected_lang, word_timestamps).
     word_timestamps is a list of {word, start, end, score} dicts (WhisperX only).
+    Returns ("", detected_lang, []) when the segment is too short or the
+    result is detected as a hallucination.
     """
+    # ── Guard: segment too short ──────────────────────────────────────────────
+    # Whisper hallucinates on anything under ~1 s.  Reject early so we never
+    # even run inference on noise blips that slipped past the VAD.
+    if len(segment_audio) < MIN_SEGMENT_SAMPLES:
+        log.info(
+            f"[asr] segment too short ({len(segment_audio)} samples, "
+            f"{len(segment_audio) / SAMPLE_RATE:.2f}s < "
+            f"{MIN_SEGMENT_SAMPLES / SAMPLE_RATE:.2f}s min); skipping transcription."
+        )
+        return "", cfg.whisper.language or "en", []
+
     if WHISPERX_AVAILABLE:
         wx_result = await loop.run_in_executor(
             None,
@@ -126,20 +149,36 @@ async def transcribe(
             for seg in wx_segments
             for w in seg.get("words", [])
         ]
+
+        # ── Guard: hallucination filter ───────────────────────────────────────
+        # WhisperX alignment scores reflect how well each word anchors to the
+        # audio.  A mean score below MIN_WORD_SCORE means the model invented
+        # text (e.g. "Thank you.", "Thanks for watching.") on near-silence.
+        if raw_word_ts:
+            avg_score = sum(w["score"] for w in raw_word_ts) / len(raw_word_ts)
+            if avg_score < MIN_WORD_SCORE:
+                log.warning(
+                    f"[asr] hallucination detected — avg word score {avg_score:.3f} "
+                    f"< {MIN_WORD_SCORE}; discarding: {full_text!r}"
+                )
+                return "", detected_lang, []
+
         return full_text, detected_lang, raw_word_ts
 
     else:
-        segments_iter, info = await loop.run_in_executor(
-            None,
-            lambda: _fw_model.transcribe(
+        # faster-whisper returns a lazy generator — the actual inference is driven
+        # by iterating it.  We must consume the generator *inside* the executor
+        # so all CPU work stays off the event loop thread.
+        def _fw_transcribe() -> tuple[str, str]:
+            segs, info = _fw_model.transcribe(
                 segment_audio,
                 language=cfg.whisper.language,
                 vad_filter=False,
                 beam_size=cfg.whisper.beam_size,
             )
-        )
-        full_text     = " ".join(seg.text for seg in segments_iter).strip()
-        detected_lang = info.language
+            return " ".join(seg.text for seg in segs).strip(), info.language
+
+        full_text, detected_lang = await loop.run_in_executor(None, _fw_transcribe)
         return full_text, detected_lang, []
 
 

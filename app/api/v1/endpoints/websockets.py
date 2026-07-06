@@ -147,7 +147,7 @@ async def asr_endpoint(ws: WebSocket):
             if new_mode != prev_mode:
                 metrics.record_mode_switch(new_mode.value)
 
-            record = _capture.process_segment(
+            record = await _capture.process_segment(   # was missing `await` — returned a coroutine
                 session_id, speaker, redacted_text, seg_start,
                 new_mode.value, detected_lang,
                 confirm_agent=True,

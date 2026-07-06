@@ -50,7 +50,7 @@ class WhisperConfig:
 @dataclass
 class VadConfig:
     sample_rate:        int   = 16000
-    silence_threshold:  float = 0.01
+    silence_threshold:  float = 0.03   # float32 norm audio; 0.01 was too low and classified speech as silence
     silence_chunks:     int   = 4
     max_segment_chunks: int   = 30
 
@@ -182,13 +182,13 @@ def load(path: Path = CONFIG_PATH) -> Config:
     # Env vars always take precedence over config.json values for secrets
     if os.environ.get("SUPABASE_URL"):
         c.supabase.url = os.environ["SUPABASE_URL"]
-    if os.environ.get("SUPABASE_KEY"):
-        c.supabase.key = os.environ["SUPABASE_KEY"]
+    if os.environ.get("SUPABASE_SERVICE_KEY"):
+        c.supabase.key = os.environ["SUPABASE_SERVICE_KEY"]
     # Push resolved values back into env so the supabase client picks them up
     if c.supabase.url:
         os.environ.setdefault("SUPABASE_URL", c.supabase.url)
     if c.supabase.key:
-        os.environ.setdefault("SUPABASE_KEY", c.supabase.key)
+        os.environ.setdefault("SUPABASE_SERVICE_KEY", c.supabase.key)
 
     log.info(
         f"Config loaded. LLM: {c.local_llm.base_url} | "

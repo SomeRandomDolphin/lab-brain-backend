@@ -1,10 +1,5 @@
 """
 main.py — Project root entry point.
-
-Run:
-    python main.py
-    # or
-    uvicorn main:app --reload
 """
 
 import uvicorn
@@ -13,8 +8,9 @@ from app.core.config import cfg
 
 if __name__ == "__main__":
     uvicorn.run(
-        "main:app",
+        app,
         host=cfg.server.host,
         port=cfg.server.port,
         reload=False,
+        log_config=None,   # don't let uvicorn's dictConfig override setup_logging()
     )

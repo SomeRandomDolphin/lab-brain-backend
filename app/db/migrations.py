@@ -42,6 +42,8 @@ from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from app.core.logging import setup_logging
+
 log = logging.getLogger(__name__)
 
 PROJECT_ROOT           = Path(__file__).resolve().parent.parent.parent
@@ -90,18 +92,36 @@ def run_migrations() -> None:
     cfg = _alembic_config(db_url)
     log.info("[migrations] running `alembic upgrade head` ...")
     command.upgrade(cfg, "head")
+    setup_logging()  # ← alembic's env.py just clobbered root's handlers via fileConfig(); reclaim it
     log.info("[migrations] database is up to date.")
 
 
-async def run_migrations_async() -> None:
+async def run_migrations_async(timeout_seconds: float = 30.0) -> None:
     """
     Async-safe wrapper around run_migrations().
 
     Runs the blocking Alembic call in a worker thread via asyncio.to_thread,
     so the running event loop is not blocked and Alembic's own asyncio.run()
     call inside alembic/env.py has a fresh loop to work with.
+
+    Wrapped in asyncio.wait_for() because asyncpg has no default connection
+    timeout: a silently-dropped connection (port conflict, firewall, stale
+    Postgres lock on alembic_version, etc.) will otherwise hang this call —
+    and therefore the whole FastAPI startup — forever with no error or log
+    output. If this fires, the underlying worker thread is NOT killed (Python
+    threads can't be force-cancelled); it will keep running in the background
+    until the OS-level connection attempt itself times out, but the app can
+    at least continue starting up and surface a clear error now.
     """
-    await asyncio.to_thread(run_migrations)
+    try:
+        await asyncio.wait_for(asyncio.to_thread(run_migrations), timeout=timeout_seconds)
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(
+            f"[migrations] 'alembic upgrade head' did not complete within "
+            f"{timeout_seconds}s — the DB connection is likely hanging "
+            f"(check for a port conflict on the Postgres port, or a stale "
+            f"lock on the alembic_version table from a previous interrupted run)."
+        ) from exc
 
 
 async def get_migration_status() -> dict:
