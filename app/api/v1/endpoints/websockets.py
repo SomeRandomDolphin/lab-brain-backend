@@ -200,7 +200,7 @@ async def asr_endpoint(ws: WebSocket):
 
 async def _handle_qa_ws(session_id, ws, dlg, full_text, retriever, metrics, mode):
     from app.pipeline.dialogue_service import generate_response, ConvMode
-    lkc_context = retriever.query(full_text, top_k=cfg.lkc.retrieval_top_k, session_id=session_id)
+    lkc_context = await retriever.query(full_text, top_k=cfg.lkc.retrieval_top_k, session_id=session_id)
     reply = await generate_response(dlg, full_text, lkc_context)
     if reply:
         ts = time.time()

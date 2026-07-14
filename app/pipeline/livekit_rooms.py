@@ -242,8 +242,8 @@ async def _subscriber_loop(session_id: str, pipeline_fn) -> None:
         if participant.identity == SERVER_IDENTITY:
             return
         log.info(
-            f"[livekit:{session_id}] track subscribed: "
-            f"kind={track.kind} participant={participant.identity}"
+            f"[livekit:{session_id}] track subscribed: kind={track.kind} "
+            f"participant={participant.identity} muted={publication.muted}"
         )
 
         def _on_drain_done(t: asyncio.Task, kind=track.kind) -> None:  # noqa: B023
@@ -279,6 +279,14 @@ async def _subscriber_loop(session_id: str, pipeline_fn) -> None:
                 pass
 
         t.add_done_callback(_on_drain_done_and_remove)
+
+    @room.on("track_muted")
+    def on_track_muted(participant, publication):
+        log.warning(f"[livekit:{session_id}] track MUTED: {participant.identity} / {publication.kind}")
+
+    @room.on("track_unmuted")
+    def on_track_unmuted(participant, publication):
+        log.warning(f"[livekit:{session_id}] track UNMUTED: {participant.identity} / {publication.kind}")
 
     @room.on("disconnected")
     def on_disconnect(reason=None):
@@ -347,24 +355,47 @@ async def _subscriber_loop(session_id: str, pipeline_fn) -> None:
 
 async def _drain_audio(track, q: asyncio.Queue) -> None:
     audio_stream = lk_rtc.AudioStream(track)
+    dropped = 0
     async for event in audio_stream:
         try:
             q.put_nowait(event.frame)
         except asyncio.QueueFull:
-            pass
+            dropped += 1
+            if dropped == 1 or dropped % 50 == 0:
+                log.warning(
+                    f"[livekit] audio_q full — dropped {dropped} frame(s) so far "
+                    f"(consumer is falling behind real time)"
+                )
+
+
+def _encode_frame(rgba) -> bytes:
+    img = Image.frombuffer(
+        "RGBA", (rgba.width, rgba.height), rgba.data, "raw", "RGBA", 0, 1
+    )
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=70)
+    return buf.getvalue()
 
 
 async def _drain_video(track, q: asyncio.Queue) -> None:
     video_stream = lk_rtc.VideoStream(track, format=lk_rtc.VideoBufferType.I420)
+    dropped = 0
+    loop = asyncio.get_event_loop()
     async for event in video_stream:
         frame = event.frame
         rgba = frame.convert(lk_rtc.VideoBufferType.RGBA)
-        img = Image.frombuffer(
-            "RGBA", (rgba.width, rgba.height), rgba.data, "raw", "RGBA", 0, 1
-        )
-        buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="JPEG", quality=70)
+        # PIL conversion + JPEG encode is CPU-bound. Doing it inline used to
+        # block this loop from pulling the next frame off the LiveKit stream,
+        # which is why the SDK's own internal buffer overflowed within a
+        # couple of seconds of subscribing — before any ASR/diarization work
+        # even started. Offloading it lets frames keep draining in real time.
+        jpeg_bytes = await loop.run_in_executor(None, _encode_frame, rgba)
         try:
-            q.put_nowait(buf.getvalue())
+            q.put_nowait(jpeg_bytes)
         except asyncio.QueueFull:
-            pass
+            dropped += 1
+            if dropped == 1 or dropped % 50 == 0:
+                log.warning(
+                    f"[livekit] video_q full — dropped {dropped} frame(s) so far "
+                    f"(consumer is falling behind real time)"
+                )

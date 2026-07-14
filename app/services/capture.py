@@ -11,6 +11,7 @@ Responsibilities:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -19,37 +20,43 @@ from pathlib import Path
 from typing import Optional
 
 from app.db import lkc_graph
+from app.core.config import cfg
 
 log = logging.getLogger(__name__)
 
-
 # ── spaCy NER ─────────────────────────────────────────────────────────────────
+# Loaded eagerly at import time (mirrors asr.py's WhisperX load) so the model
+# is warm before the first meeting starts. Previously this module loaded spaCy
+# here and then immediately overwrote `_nlp` back to None two lines later,
+# which forced a ~60s synchronous re-load on the first transcribed segment of
+# every meeting — during which incoming audio silently piled up and dropped.
+_SPACY_ENTITY_TYPES = {"PERSON", "ORG", "PRODUCT", "GPE", "DATE", "EVENT", "WORK_OF_ART"}
+
 SPACY_AVAILABLE = False
 _nlp = None
 
-_SPACY_ENTITY_TYPES = {"PERSON", "ORG", "PRODUCT", "GPE", "DATE", "EVENT", "WORK_OF_ART"}
+try:
+    import spacy
+    log.info(f"[capture] loading spaCy NER model '{cfg.spacy.model}'…")
+    try:
+        _nlp = spacy.load(cfg.spacy.model)
+        SPACY_AVAILABLE = True
+        log.info("[capture] spaCy NER loaded.")
+    except OSError:
+        log.warning(
+            f"[capture] spaCy model '{cfg.spacy.model}' not found. "
+            f"Run: python -m spacy download {cfg.spacy.model}"
+        )
+except ImportError:
+    log.warning("[capture] spaCy not installed — using regex NER.")
 
 
 def _load_spacy():
-    global _nlp, SPACY_AVAILABLE
-    if _nlp is not None:
-        return _nlp
-    try:
-        import spacy
-        try:
-            _nlp = spacy.load("en_core_web_sm")
-        except OSError:
-            log.warning(
-                "[capture] spaCy model not found. "
-                "Run: python -m spacy download en_core_web_sm"
-            )
-            return None
-        SPACY_AVAILABLE = True
-        log.info("[capture] spaCy NER loaded (en_core_web_sm).")
-        return _nlp
-    except ImportError:
-        log.warning("[capture] spaCy not installed — using regex NER.")
-        return None
+    """Returns the eagerly-loaded model, or None if it failed/isn't installed.
+    Kept as a function (rather than inlining `_nlp`) so call sites don't need
+    to change, but it no longer does any loading itself — that always happens
+    once, at import time, above."""
+    return _nlp
 
 
 # ── Regex patterns (fallback) ──────────────────────────────────────────────────
@@ -211,7 +218,16 @@ async def process_segment(
     if not text.strip():
         return {}
 
-    tags   = tag_segment(text)
+    # tag_segment() is synchronous CPU work — critically, _extract_entities
+    # runs a real spaCy inference pass (nlp(text)) when spaCy is available.
+    # Calling it inline here (as before) blocks the ENTIRE event loop for its
+    # duration: not just this session's next segment, but every other
+    # session's audio/video consumers and any in-flight SSE/metrics request,
+    # process-wide. asr.py already guards against exactly this for
+    # WhisperX/faster-whisper via run_in_executor; tag_segment never got the
+    # same treatment. Offloading it here fixes that.
+    loop = asyncio.get_event_loop()
+    tags = await loop.run_in_executor(None, tag_segment, text)
     ts_iso = datetime.utcfromtimestamp(timestamp_unix).isoformat() + "Z"
 
     # ── Speaker consistency check ─────────────────────────────────────────────

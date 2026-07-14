@@ -8,6 +8,7 @@ Fallback: all-MiniLM-L6-v2 (~22 MB) → TF-IDF.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -38,6 +39,21 @@ if not SBERT_AVAILABLE:
 
 _embed_model = None
 _embed_model_name: str = ""
+
+
+def warmup() -> None:
+    """
+    Force-load the embedding model synchronously. Call this from the
+    FastAPI startup hook (via run_in_executor, since this is a blocking
+    ~420MB download/load) so the cost is paid once at boot instead of
+    mid-meeting on the first QA/summon segment.
+    """
+    model = _get_embed_model()
+    if model is None:
+        log.warning(
+            "[retrieval] warmup: no SBERT backend available "
+            "(falling back to TF-IDF, or retrieval disabled if sklearn is also missing)."
+        )
 
 
 def _get_embed_model():
@@ -123,19 +139,42 @@ class LKCRetriever:
         session_id: Optional[str] = None,
     ) -> str:
         if session_id is not None:
-            entry = self._get_session_entry(session_id)
+            entry = await self._get_session_entry(session_id)
         else:
             entry = await self._get_global_entry()
         if entry is None or not entry.records:
             return ""
-        return entry.search(question, top_k)
+        # entry.search() calls SentenceTransformer.encode() (or, in the
+        # TF-IDF fallback path, sklearn's transform), both of which are
+        # CPU-bound and were previously called directly on the event loop —
+        # blocking every other coroutine (segment processing, SSE, HTTP
+        # handling) for however long that encode took. Offloading it here
+        # matters most on longer sessions, where build() below re-embeds a
+        # growing transcript on nearly every QA turn.
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, entry.search, question, top_k)
 
-    def _get_session_entry(self, session_id: str) -> Optional[_IndexEntry]:
-        records = lkc_graph.session_text_corpus(session_id)
+    async def _get_session_entry(self, session_id: str) -> Optional[_IndexEntry]:
+        # session_text_corpus is a coroutine function — this was previously
+        # called without `await`, which silently handed a coroutine object
+        # (instead of the list of records) straight into _IndexEntry(...),
+        # blowing up on `len(records)` the moment any QA request came in
+        # (every "mode=qa" segment in the logs hit this and was swallowed by
+        # the fire-and-forget asyncio.create_task in _handle_qa_sse).
+        records = await lkc_graph.session_text_corpus(session_id)
         cached  = self._sessions.get(session_id)
         if cached is None or len(records) != cached.record_count:
+            # NOTE: this cache check invalidates on ANY change in record
+            # count — and a new transcript record lands after nearly every
+            # segment, so in practice this re-embeds the ENTIRE session
+            # transcript from scratch on almost every single QA call, not
+            # just the new records. Combined with build() being CPU-bound,
+            # this was blocking the event loop for longer and longer as a
+            # meeting went on. Not rewritten to be incremental here (that's
+            # a bigger change), but at minimum it's now off the event loop.
             entry = _IndexEntry(records)
-            entry.build()
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, entry.build)
             self._sessions[session_id] = entry
         return self._sessions.get(session_id)
 
@@ -151,7 +190,8 @@ class LKCRetriever:
             if r.get("text")
         ]
         self._global = _IndexEntry(lightweight)
-        self._global.build()
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._global.build)
         self._global_record_count = len(all_records)
         return self._global
 

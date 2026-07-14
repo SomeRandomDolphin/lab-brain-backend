@@ -51,7 +51,7 @@ class WhisperConfig:
 class VadConfig:
     sample_rate:        int   = 16000
     silence_threshold:  float = 0.03   # float32 norm audio; 0.01 was too low and classified speech as silence
-    silence_chunks:     int   = 4
+    silence_chunks:     int   = 40
     max_segment_chunks: int   = 30
 
 
@@ -151,6 +151,20 @@ def _apply(dataclass_obj, raw: dict) -> None:
 
 
 def load(path: Path = CONFIG_PATH) -> Config:
+    # Don't rely on main.py having already called load_env() before this
+    # module gets imported. `cfg = load()` below runs exactly once, at
+    # whatever moment ANYTHING in the process first imports app.core.config
+    # — if that happens to occur before main.py's load_env() call (e.g. via
+    # some other import chain, a package __init__.py, alembic's own env.py,
+    # a test importing this module directly, etc.), this singleton would
+    # otherwise lock in a stale, empty environment permanently, with no
+    # error — just a fallback to config.json that looks like ".env isn't
+    # being read" when it's really an import-order race. load_env() is
+    # documented as idempotent/cheap to call repeatedly, so calling it here
+    # too removes the dependency on being imported after main.py's call.
+    from app.core.env import load_env
+    load_env()
+
     if not path.exists():
         log.warning(f"config.json not found at {path} — using defaults.")
         return Config()
@@ -179,16 +193,42 @@ def load(path: Path = CONFIG_PATH) -> Config:
         if section in raw:
             _apply(obj, raw[section])
 
-    # Env vars always take precedence over config.json values for secrets
-    if os.environ.get("SUPABASE_URL"):
-        c.supabase.url = os.environ["SUPABASE_URL"]
-    if os.environ.get("SUPABASE_SERVICE_KEY"):
-        c.supabase.key = os.environ["SUPABASE_SERVICE_KEY"]
-    # Push resolved values back into env so the supabase client picks them up
+    # Env vars always take precedence over config.json values for secrets.
+    # Blank/whitespace-only values are treated as "not set" so a stray empty
+    # env var doesn't shadow a real one from .env or config.json.
+    env_url = (os.environ.get("SUPABASE_URL") or "").strip()
+    env_key = (os.environ.get("SUPABASE_SERVICE_KEY") or "").strip()
+
+    url_source = "env"
+    key_source = "env"
+    if env_url:
+        c.supabase.url = env_url
+    elif c.supabase.url:
+        url_source = "config.json"
+    if env_key:
+        c.supabase.key = env_key
+    elif c.supabase.key:
+        key_source = "config.json"
+
+    # Push the *resolved* values back into os.environ so every module that
+    # reads os.environ directly (supabase_client.py, etc.) sees exactly what
+    # cfg resolved to — using setdefault() here would silently keep a blank
+    # pre-existing env var instead of the correct fallback.
     if c.supabase.url:
-        os.environ.setdefault("SUPABASE_URL", c.supabase.url)
+        os.environ["SUPABASE_URL"] = c.supabase.url
     if c.supabase.key:
-        os.environ.setdefault("SUPABASE_SERVICE_KEY", c.supabase.key)
+        os.environ["SUPABASE_SERVICE_KEY"] = c.supabase.key
+
+    if c.supabase.url or c.supabase.key:
+        log.info(
+            f"[config] supabase.url from {url_source}, supabase.key from {key_source}"
+        )
+    if key_source == "config.json" and c.supabase.key:
+        log.warning(
+            "[config] SUPABASE_SERVICE_KEY not found in the real environment or .env — "
+            "falling back to the key hardcoded in config.json. Set SUPABASE_SERVICE_KEY "
+            "in your .env instead; config.json is not meant to hold secrets long-term."
+        )
 
     log.info(
         f"Config loaded. LLM: {c.local_llm.base_url} | "

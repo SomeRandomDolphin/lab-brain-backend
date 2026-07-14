@@ -33,6 +33,28 @@ _diarization_pipeline: Optional["PyannotePipeline"] = None
 _diarization_pipeline_error: Optional[str] = None
 
 
+def _extract_turns(diarization) -> list[tuple[float, float, str]]:
+    """
+    Normalize pyannote diarization output across API versions into a flat
+    list of (start, end, speaker_label) tuples.
+
+    - pyannote.audio <= 3.x: pipeline(...) returns a pyannote.core.Annotation
+      directly, with turns via annotation.itertracks(yield_label=True) ->
+      (Segment, track_id, label).
+    - pyannote.audio 4.x (community-1 / precision-2 pipelines): pipeline(...)
+      returns a DiarizeOutput wrapper; the Annotation lives at
+      output.speaker_diarization, and per pyannote's own docs is iterated
+      directly as (Segment, label) pairs rather than via itertracks().
+    """
+    ann = getattr(diarization, "speaker_diarization", diarization)
+
+    if hasattr(ann, "itertracks"):
+        return [(turn.start, turn.end, speaker) for turn, _, speaker in ann.itertracks(yield_label=True)]
+
+    # Newer wrapper: iterate directly as (Segment, label) pairs.
+    return [(turn.start, turn.end, speaker) for turn, speaker in ann]
+
+
 def _get_diarization_pipeline():
     global _diarization_pipeline, _diarization_pipeline_error
     if _diarization_pipeline is not None:
@@ -50,7 +72,7 @@ def _get_diarization_pipeline():
             or os.environ.get("HF_TOKEN")
             or os.environ.get("HUGGINGFACE_TOKEN")
         )
-        use_auth  = {"use_auth_token": hf_token} if hf_token else {}
+        use_auth  = {"token": hf_token} if hf_token else {}
         pipeline  = PyannotePipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1", **use_auth
         )
@@ -63,6 +85,19 @@ def _get_diarization_pipeline():
         _diarization_pipeline_error = str(exc)
         log.warning(f"[diarization] pipeline load failed ({exc}) — using round-robin fallback")
         return None
+
+
+# Pre-load the diarization pipeline at process startup rather than lazily on
+# the first live audio segment. Loading it can trigger multi-file model
+# downloads (config.yaml, pytorch_model.bin, xvec_transform.npz, etc.) from
+# Hugging Face — if that happens on the first segment of a live meeting, it
+# blocks real-time speaker assignment for however long the download takes,
+# silently dropping speaker attribution (and, transitively, transcription
+# timing) for the start of the session. Doing it here means any download or
+# gating failure surfaces once at boot, not mid-meeting.
+if PYANNOTE_AVAILABLE:
+    log.info("[diarization] pre-loading pipeline at startup…")
+    _get_diarization_pipeline()
 
 
 # ── Local LLM client ──────────────────────────────────────────────────────────
@@ -169,7 +204,7 @@ def push_context(state: DialogueState, speaker: str, text: str) -> None:
 
 # ── Speaker assignment ────────────────────────────────────────────────────────
 
-def assign_speaker(
+async def assign_speaker(
     state: DialogueState,
     audio_segment=None,
 ) -> str:
@@ -186,12 +221,18 @@ def assign_speaker(
             if wav.size < min_samples:
                 raise ValueError(f"Segment too short ({wav.size} samples)")
 
-            waveform    = torch.from_numpy(wav).unsqueeze(0)
-            diarization = pipeline({"waveform": waveform, "sample_rate": _SAMPLE_RATE})
+            waveform = torch.from_numpy(wav).unsqueeze(0)
+            # Run the blocking pyannote inference in a thread so it doesn't
+            # freeze the event loop — this is what was starving the LiveKit
+            # audio/video drain coroutines and causing dropped frames.
+            loop = asyncio.get_event_loop()
+            diarization = await loop.run_in_executor(
+                None, lambda: pipeline({"waveform": waveform, "sample_rate": _SAMPLE_RATE})
+            )
 
             duration_per_speaker: dict[str, float] = {}
-            for turn, _, speaker in diarization.itertracks(yield_label=True):
-                duration_per_speaker[speaker] = duration_per_speaker.get(speaker, 0.0) + turn.duration
+            for start, end, speaker in _extract_turns(diarization):
+                duration_per_speaker[speaker] = duration_per_speaker.get(speaker, 0.0) + (end - start)
 
             if not duration_per_speaker:
                 raise ValueError("No speakers detected")
@@ -216,7 +257,7 @@ def assign_speaker(
     return label
 
 
-def assign_speaker_words(
+async def assign_speaker_words(
     state: DialogueState,
     word_timestamps: list[dict],
     audio_segment: np.ndarray,
@@ -226,33 +267,44 @@ def assign_speaker_words(
 
     pipeline = _get_diarization_pipeline()
     if pipeline is None:
-        fallback = assign_speaker(state, audio_segment)
+        fallback = await assign_speaker(state, audio_segment)
         return [{**w, "speaker": fallback} for w in word_timestamps]
 
     try:
         import torch
-        wav         = audio_segment.astype(np.float32)
-        diarization = pipeline({"waveform": torch.from_numpy(wav).unsqueeze(0), "sample_rate": _SAMPLE_RATE})
+        wav = audio_segment.astype(np.float32)
+        # Offload the blocking pyannote inference to a thread so it doesn't
+        # freeze the event loop (see assign_speaker for the same fix).
+        loop = asyncio.get_event_loop()
+        diarization = await loop.run_in_executor(
+            None,
+            lambda: pipeline({"waveform": torch.from_numpy(wav).unsqueeze(0), "sample_rate": _SAMPLE_RATE}),
+        )
 
         if not hasattr(state, "_speaker_map"):
             state._speaker_map = {}
 
         turns: list[tuple[float, float, str]] = []
-        for turn, _, raw_label in diarization.itertracks(yield_label=True):
+        for start, end, raw_label in _extract_turns(diarization):
             if raw_label not in state._speaker_map:
                 idx = len(state._speaker_map)
                 state._speaker_map[raw_label] = (
                     _SPEAKER_LABELS[idx] if idx < len(_SPEAKER_LABELS)
                     else f"Person {idx + 1}"
                 )
-            turns.append((turn.start, turn.end, state._speaker_map[raw_label]))
+            turns.append((start, end, state._speaker_map[raw_label]))
+
+        # Fallback label for words that fall outside every detected turn and
+        # there are no turns at all — resolved once, up front, since this
+        # helper must stay synchronous (it's used inside a list comprehension).
+        no_turns_fallback = await assign_speaker(state, None) if not turns else None
 
         def _speaker_at(t: float) -> str:
             for start, end, label in turns:
                 if start <= t <= end:
                     return label
             if not turns:
-                return assign_speaker(state, None)
+                return no_turns_fallback
             nearest = min(turns, key=lambda x: min(abs(x[0] - t), abs(x[1] - t)))
             return nearest[2]
 
@@ -268,7 +320,7 @@ def assign_speaker_words(
 
     except Exception as exc:
         log.warning(f"[diarization:{state.session_id}] word-level failed ({exc}) — segment fallback")
-        fallback = assign_speaker(state, audio_segment)
+        fallback = await assign_speaker(state, audio_segment)
         return [{**w, "speaker": fallback} for w in word_timestamps]
 
 

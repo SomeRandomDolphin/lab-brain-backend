@@ -303,19 +303,9 @@ start_supabase() {
   local compose_file="${SUPABASE_PROJECT_DIR}/docker-compose.yml"
 
   # ── Step 2b: expose Postgres directly, bypass Supavisor ──────────────────
-  # Per https://supabase.com/docs/guides/self-hosting/docker#exposing-your-postgres-database
-  # Alembic runs DDL migrations, which don't work reliably through Supavisor's
-  # transaction-mode pooler (and its username needs a tenant-id suffix that
-  # alembic/env.py has no reason to know about). Comment out the `supavisor`
-  # service entirely and expose `db` on POSTGRES_PORT directly instead.
-  # Idempotent + resilient to upstream compose-file changes: matches by
-  # service name rather than hardcoded line numbers, since this file is
-  # re-cloned from supabase/supabase on a fresh setup.
   patch_supabase_compose "$compose_file"
 
   # ── Step 3: generate secrets (first-time only) ───────────────────────────
-  # Detect whether this is a first-time setup by checking if POSTGRES_PASSWORD
-  # is still the placeholder from .env.example.
   local pg_pass
   pg_pass=$(grep '^POSTGRES_PASSWORD=' "$env_file" | cut -d= -f2- | tr -d '"' || true)
 
@@ -329,7 +319,6 @@ start_supabase() {
       (cd "$SUPABASE_PROJECT_DIR" && sh utils/generate-keys.sh) \
         || die "generate-keys.sh failed."
     else
-      # Fallback: generate minimal secrets inline with openssl
       warn "utils/generate-keys.sh not found — generating secrets with openssl."
       local jwt_secret
       jwt_secret=$(openssl rand -base64 48)
@@ -378,7 +367,6 @@ start_supabase() {
     (cd "$SUPABASE_PROJECT_DIR" && COMPOSE_PROJECT_NAME="$SUPABASE_COMPOSE_PROJECT" sh run.sh start) \
       || die "run.sh start failed. Check logs: cd ${SUPABASE_PROJECT_DIR} && COMPOSE_PROJECT_NAME=${SUPABASE_COMPOSE_PROJECT} sh run.sh logs"
   else
-    # run.sh missing (older repo checkout) — fall back to docker compose directly
     warn "run.sh not found — falling back to docker compose up -d --wait."
     (cd "$SUPABASE_PROJECT_DIR" && COMPOSE_PROJECT_NAME="$SUPABASE_COMPOSE_PROJECT" docker compose up -d --wait) \
       || die "docker compose up failed. Check logs: cd ${SUPABASE_PROJECT_DIR} && COMPOSE_PROJECT_NAME=${SUPABASE_COMPOSE_PROJECT} docker compose logs"
@@ -386,7 +374,6 @@ start_supabase() {
 
   # ── Step 6: extract keys and update config.json ──────────────────────────
   local anon_key publishable_key api_url
-  # The guide uses SUPABASE_PUBLISHABLE_KEY (new) or ANON_KEY (legacy)
   publishable_key=$(grep -E '^(SUPABASE_PUBLISHABLE_KEY|ANON_KEY)=' "$env_file" \
     | head -1 | cut -d= -f2- | tr -d '"' || true)
   anon_key="$publishable_key"
@@ -447,31 +434,59 @@ start_ollama() {
   echo "  vision_model   = ${vision_model}"
   echo "  dialogue_model = ${dialogue_model}"
 
-  # GPU passthrough — auto-detected, never required
-  local gpu_flags=()
-  if docker info 2>/dev/null | grep -qi "nvidia"; then
-    info "NVIDIA runtime detected — enabling GPU passthrough."
-    gpu_flags=(--gpus all)
-  else
-    warn "No NVIDIA Docker runtime found — Ollama will run on CPU (slower)."
-    warn "See: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html"
-  fi
-
+  # GPU passthrough — auto-detected, never required.
+  #
+  # NOTE: `docker info | grep -qi nvidia` only lights up when the
+  # nvidia-container-toolkit has registered a distinct "nvidia" OCI runtime,
+  # which is how GPU support works on native Linux Docker. Docker Desktop's
+  # WSL2 backend (Windows/Mac) exposes GPU passthrough transparently through
+  # `--gpus all` WITHOUT registering a runtime by that name — so this check
+  # reports "no GPU" on a perfectly capable Windows/WSL2 + Docker Desktop
+  # machine, silently falling back to CPU. That mismatch is almost certainly
+  # why Ollama was serving llama3.2:3b on CPU (~60s/reply) instead of GPU.
+  #
+  # Fix: don't pre-guess capability from `docker info` — just attempt
+  # `--gpus all` directly and fall back only if the run actually fails.
+  # Docker fails fast (no hang) when GPU passthrough genuinely isn't there.
   remove_container "$OLLAMA_CONTAINER"
 
-  info "Starting Ollama container..."
-  docker run -d \
-    --name "$OLLAMA_CONTAINER" \
-    "${gpu_flags[@]}" \
-    -p "${OLLAMA_PORT}:11434" \
-    -v ollama-models:/root/.ollama \
-    ollama/ollama
+  info "Starting Ollama container (attempting GPU passthrough)..."
+  gpu_err_log="$(mktemp)"
+  if docker run -d \
+      --name "$OLLAMA_CONTAINER" \
+      --gpus all \
+      -p "${OLLAMA_PORT}:11434" \
+      -v ollama-models:/root/.ollama \
+      ollama/ollama >/dev/null 2>"$gpu_err_log"; then
+    success "GPU passthrough accepted — Ollama container started with --gpus all."
+  else
+    warn "GPU passthrough unavailable: $(tail -n1 "$gpu_err_log")"
+    warn "Falling back to CPU. See notes below if you expected a GPU here."
+    remove_container "$OLLAMA_CONTAINER"
+    docker run -d \
+      --name "$OLLAMA_CONTAINER" \
+      -p "${OLLAMA_PORT}:11434" \
+      -v ollama-models:/root/.ollama \
+      ollama/ollama >/dev/null
+  fi
+  rm -f "$gpu_err_log"
 
   info "Waiting for Ollama on :${OLLAMA_PORT}..."
   if ! wait_for_http "http://localhost:${OLLAMA_PORT}/api/tags" 30 1; then
     die "Ollama didn't respond within 30 s. Check logs: docker logs ${OLLAMA_CONTAINER}"
   fi
   success "Ollama API is up."
+
+  # Confirm the container can actually see a GPU (passthrough can "succeed"
+  # at the docker-run level yet still land on a machine with no usable
+  # device, e.g. driver mismatch) — surface that clearly instead of staying
+  # silent until someone notices replies are slow.
+  if docker exec "$OLLAMA_CONTAINER" nvidia-smi >/dev/null 2>&1; then
+    success "GPU verified inside container: $(docker exec "$OLLAMA_CONTAINER" nvidia-smi --query-gpu=name --format=csv,noheader | head -n1)"
+  else
+    warn "Container is running but nvidia-smi isn't visible inside it — Ollama is likely on CPU."
+    warn "Run 'nvidia-smi' on the HOST first to confirm the driver sees a GPU at all."
+  fi
 
   # Pull each model inside the container so files land in the shared volume
   pull_model() {

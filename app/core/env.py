@@ -74,8 +74,17 @@ def load_env(
         return {}
 
     applied: dict[str, str] = {}
+    already_set: list[str] = []
+    malformed = 0
 
-    for lineno, raw_line in enumerate(env_path.read_text(encoding="utf-8").splitlines(), start=1):
+    # utf-8-sig strips a leading UTF-8 BOM if present (e.g. file saved by
+    # Notepad/VS Code as "UTF-8 with BOM"); it's a no-op otherwise, so this
+    # is safe either way and avoids a BOM silently glueing itself onto the
+    # first key (`\ufeffSUPABASE_URL`), which would fail key matching with
+    # no visible error.
+    lines = env_path.read_text(encoding="utf-8-sig").splitlines()
+
+    for lineno, raw_line in enumerate(lines, start=1):
         line = raw_line.strip()
 
         if not line or line.startswith("#"):
@@ -86,6 +95,7 @@ def load_env(
             line = line[len("export "):].lstrip()
 
         if "=" not in line:
+            malformed += 1
             log.warning(f"[env] {env_path.name}:{lineno} — skipping malformed line: {raw_line!r}")
             continue
 
@@ -96,14 +106,29 @@ def load_env(
         if not key:
             continue
 
-        if not override and key in os.environ:
-            log.debug(f"[env] {key} already set in environment — keeping existing value.")
+        # A key that's *present* in os.environ but blank (e.g. a stray
+        # `set VAR=` on Windows, or an empty exported value) is functionally
+        # unset — treat it as fillable rather than letting it silently block
+        # the .env value. Only a genuinely non-empty existing value wins.
+        if not override and os.environ.get(key):
+            already_set.append(key)
             continue
 
         os.environ[key] = value
         applied[key] = value
 
-    log.info(f"[env] loaded {len(applied)} variable(s) from {env_path}")
+    # Previously this only ever logged a count, which made a "0 loaded"
+    # result indistinguishable from "file is all comments/placeholders"
+    # vs "everything was already shadowed by real env vars" vs "every line
+    # was malformed" — you had to go hexdump the file to find out which.
+    # Surfacing the breakdown here means the next time this happens, the
+    # log line itself tells you why.
+    log.info(
+        f"[env] {env_path.name}: {len(lines)} line(s) read, {len(applied)} applied, "
+        f"{len(already_set)} already-set-in-environment, {malformed} malformed"
+    )
+    if already_set:
+        log.info(f"[env] kept pre-existing environment values for: {', '.join(already_set)}")
     return applied
 
 

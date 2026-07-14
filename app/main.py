@@ -111,6 +111,17 @@ def create_app() -> FastAPI:
         from pathlib import Path as _Path
         from app.db import lkc_graph
 
+        # Force app.services.capture to import now, not on first pipeline run.
+        # capture.py loads spaCy's NER model at module level (mirroring how
+        # asr.py loads WhisperX), but unlike asr.py it isn't on the router's
+        # import chain — nothing touches it until the first meeting's first
+        # segment reaches process_segment(). That deferred import was causing
+        # a ~60s synchronous spaCy load mid-meeting, during which incoming
+        # audio piled up in the queue and got dropped. Importing it here runs
+        # that load during startup instead, before any room connects.
+        import app.services.capture as _capture  # noqa: F401
+        log.info("[startup] app.services.capture imported (spaCy NER warm)")
+
         # Warm up the Supabase auth client so the first request doesn't pay
         # the cold-start cost and misconfiguration is caught at boot time.
         try:
@@ -120,6 +131,22 @@ def create_app() -> FastAPI:
             log.info("[startup] Supabase Auth clients ready")
         except RuntimeError as exc:
             log.warning(f"[startup] Supabase Auth not configured: {exc}")
+
+        # Warm the LKC retrieval embedding model now, off the event loop, so
+        # the first `mode=qa` segment of a meeting doesn't pay for a
+        # synchronous ~420MB sentence-transformers download+load. This is
+        # exactly what fired mid-summon in a previous log (modules.json,
+        # model.safetensors, etc. downloading while a live segment was in
+        # flight). run_in_executor keeps the load off the event loop so it
+        # doesn't block /metrics or SSE polling while it happens — same
+        # reasoning as the spaCy warm-up above.
+        import asyncio
+        from app.services.lkc_retrieval import warmup as _warmup_retrieval
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, _warmup_retrieval)
+            log.info("[startup] LKC retrieval embedding model warmed")
+        except Exception as exc:
+            log.error(f"[startup] LKC retrieval warmup failed: {exc}")
 
         # Run pending Alembic migrations on every startup (idempotent).
         # Replaces the old custom exec_sql-based SQL-file runner.

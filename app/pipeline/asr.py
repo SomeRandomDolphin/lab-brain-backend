@@ -10,6 +10,8 @@ from typing import Optional
 import numpy as np
 
 from app.core.config import cfg
+import torch
+torch.set_num_threads(cfg.whisper.cpu_threads)
 
 log = logging.getLogger(__name__)
 
@@ -17,6 +19,7 @@ SAMPLE_RATE        = cfg.vad.sample_rate
 SILENCE_THRESHOLD  = cfg.vad.silence_threshold
 VAD_SILENCE_CHUNKS = cfg.vad.silence_chunks
 MAX_SEGMENT_CHUNKS = cfg.vad.max_segment_chunks
+MIN_FLUSH_CHUNKS = 5  # ~50ms; just prevents flushing a near-empty buffer
 
 # Minimum audio length before we attempt transcription.
 # WhisperX hallucinates common phrases ("Thank you.", "Thanks for watching.")
@@ -38,9 +41,17 @@ try:
         device=cfg.whisper.device,
         compute_type=cfg.whisper.compute_type,
         language=cfg.whisper.language,
+        asr_options={"beam_size": cfg.whisper.beam_size},
     )
     _wx_align_cache: dict = {}
     log.info("WhisperX ready.")
+    if cfg.whisper.language:
+        log.info(f"Pre-loading alignment model for '{cfg.whisper.language}'…")
+        _align_model, _align_meta = whisperx.load_align_model(
+            language_code=cfg.whisper.language, device=cfg.whisper.device
+        )
+        _wx_align_cache[cfg.whisper.language] = (_align_model, _align_meta)
+        log.info("Alignment model ready.")
 except ImportError:
     WHISPERX_AVAILABLE = False
     from faster_whisper import WhisperModel
@@ -75,7 +86,10 @@ class VadChunker:
             self.silent_count >= VAD_SILENCE_CHUNKS
             or self.chunk_count >= MAX_SEGMENT_CHUNKS
         )
-        if should_flush and len(self.buffer) >= VAD_SILENCE_CHUNKS:
+        # Minimum buffer length is just a sanity floor to avoid flushing an
+        # almost-empty buffer right after a reset — NOT tied to the silence
+        # or max-segment thresholds themselves.
+        if should_flush and len(self.buffer) >= MIN_FLUSH_CHUNKS:
             segment           = np.concatenate(self.buffer)
             self.buffer       = []
             self.silent_count = 0
@@ -187,6 +201,12 @@ def resample_livekit_frame(raw_frame) -> np.ndarray:
     Convert a LiveKit AudioFrame (48kHz int16 stereo) to 16kHz mono float32.
     """
     pcm_int16 = np.frombuffer(bytes(raw_frame.data), dtype=np.int16)
+    # log.info(
+    #     f"[asr:debug] channels={raw_frame.num_channels} "
+    #     f"rate={raw_frame.sample_rate} raw_len={len(pcm_int16)} "
+    #     f"raw_max_abs={np.abs(pcm_int16).max() if len(pcm_int16) else 0} "
+    #     f"raw_rms={np.sqrt(np.mean(pcm_int16.astype(np.float64)**2)):.2f}"
+    # )
     if raw_frame.num_channels > 1:
         pcm_int16 = pcm_int16.reshape(-1, raw_frame.num_channels).mean(axis=1)
     pcm_f32 = pcm_int16.astype(np.float32) / 32768.0

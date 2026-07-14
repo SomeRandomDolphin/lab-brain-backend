@@ -12,7 +12,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 
@@ -32,6 +32,16 @@ log = logging.getLogger(__name__)
 SAMPLE_RATE           = cfg.vad.sample_rate
 SILENCE_THRESHOLD     = cfg.vad.silence_threshold
 VISION_FRAME_INTERVAL = cfg.vision.frame_interval
+
+# Sessions with a QA reply currently generating. generate_response() is a
+# slow local-LLM call (many seconds), and clear_summon() used to only run
+# once that call finished — so any speech captured while the first reply
+# was still generating was itself treated as a fresh summon and spawned a
+# SECOND concurrent _handle_qa_sse task for the same session. Those then
+# queue up behind each other against Ollama (which serves one request at a
+# time), roughly doubling (or worse) the wait for an answer to the question
+# actually asked. This set is a simple per-session guard against that.
+_qa_in_flight: set[str] = set()
 
 
 # ── LKC record builders ───────────────────────────────────────────────────────
@@ -65,7 +75,7 @@ def _agent_record(session_id, ts, reply_text, mode):
 # ── QA reply (SSE path) ───────────────────────────────────────────────────────
 
 async def _handle_qa_sse(session_id, dlg, full_text, retriever, mode, tts_queue):
-    lkc_context = retriever.query(
+    lkc_context = await retriever.query(
         full_text, top_k=cfg.lkc.retrieval_top_k, session_id=session_id
     )
     reply = await generate_response(dlg, full_text, lkc_context)
@@ -80,7 +90,9 @@ async def _handle_qa_sse(session_id, dlg, full_text, retriever, mode, tts_queue)
             session_id=session_id, text=reply, mode=mode.value,
             timestamp_unix=ts, grounded=bool(lkc_context.strip()), lkc_context=lkc_context,
         )
-    _capture.clear_summon(session_id)
+    # NOTE: clear_summon() used to live here, i.e. it only ran once the LLM
+    # reply finished. It's now consumed at task-creation time in
+    # _handle_segment instead — see _qa_in_flight comment above for why.
 
 
 # ── Main pipeline coroutine ───────────────────────────────────────────────────
@@ -107,7 +119,29 @@ async def livekit_pipeline(
     log.info(f"[pipeline:{session_id}] started")
     broadcast(session_id, {"type": "session", "session_id": session_id})
 
-    # ── Audio processor ───────────────────────────────────────────────────────
+    segment_q: asyncio.Queue = asyncio.Queue()
+
+    # Hard cap on how many completed-but-unprocessed segments may sit in
+    # segment_q at once. _handle_segment does transcribe + word-level
+    # diarization realignment + Supabase persistence + LKC writes, all
+    # awaited in sequence by a single consumer (_segment_consumer below).
+    # On CPU-only inference, total time-per-segment can end up exceeding the
+    # real-time duration of the segment's own audio — and because the queue
+    # was previously unbounded with no backlog handling, every later segment
+    # inherited the FULL accumulated backlog on top of its own processing.
+    # That's what made "asr_latency" (measured from enqueue time) look like
+    # it was climbing forever in one session (6s -> 78s) even though actual
+    # per-segment model inference time was roughly constant — it was queue
+    # wait time compounding, not the model getting slower. Capping the
+    # backlog and dropping stale segments once it's exceeded keeps the agent
+    # close to real-time instead of dutifully transcribing further and
+    # further into the past.
+    MAX_SEGMENT_BACKLOG = 10000
+
+    # ── Audio processor: fast stage (runs in the hot per-frame loop) ──────────
+    # This must never block on ASR/diarization — its only job is to keep
+    # draining audio_q in real time. Completed VAD segments are handed off to
+    # segment_q for the (slow) heavy stage below, rather than processed here.
 
     async def _process_audio(raw_frame) -> None:
         nonlocal segment_index
@@ -124,11 +158,20 @@ async def livekit_pipeline(
             })
             return
 
+        # NOTE: this used to gate on SILENCE_THRESHOLD * 2 (0.06 with the
+        # default config). VadChunker already gates individual chunks against
+        # SILENCE_THRESHOLD (0.03) before a segment is ever flushed here, so
+        # doubling it again on the segment-level RMS was stricter than the
+        # chunk-level gate that already ran — real speech segments in the
+        # 0.04-0.05 range (normal speaking volume / quieter mic) were passing
+        # VadChunker but then getting silently thrown away here. Use the
+        # configured threshold directly; tune cfg.vad.silence_threshold if
+        # you need this looser/stricter rather than re-multiplying here.
         seg_rms = float(np.sqrt(np.mean(segment_audio ** 2)))
-        if seg_rms < SILENCE_THRESHOLD * 2:
+        if seg_rms < SILENCE_THRESHOLD:
             # log.info(
             #     f"[pipeline:{session_id}] segment dropped as silence "
-            #     f"(rms={seg_rms:.5f} < {SILENCE_THRESHOLD * 2:.5f}, "
+            #     f"(rms={seg_rms:.5f} < {SILENCE_THRESHOLD:.5f}, "
             #     f"{len(segment_audio)} samples / {len(segment_audio) / SAMPLE_RATE:.2f}s)"
             # )
             broadcast(session_id, {
@@ -138,36 +181,79 @@ async def livekit_pipeline(
             })
             return
 
-        seg_start = time.time()
         segment_index += 1
+        # Handing off here (instead of `await`ing the heavy chain inline) is
+        # the fix: this coroutine returns immediately and _audio_consumer goes
+        # straight back to `audio_q.get()`, so real-time audio ingestion is
+        # never gated on how long ASR/diarization/persistence take.
+        segment_q.put_nowait((segment_index, segment_audio, time.time(), request_received_at))
+
+    # ── Audio processor: heavy stage (runs in its own worker, FIFO order) ────
+    # Processed one segment at a time, in submission order, by a dedicated
+    # worker — so segments never get reordered relative to each other, but a
+    # slow segment no longer stalls audio ingestion the way it did when this
+    # ran inline inside _process_audio.
+
+    async def _handle_segment(seg_idx: int, segment_audio, seg_start: float, dequeued_at: float, request_received_at: float) -> None:
         loop = asyncio.get_event_loop()
 
+        # Time spent sitting in segment_q behind earlier segments, before
+        # this one even started processing. This used to get silently
+        # folded into "asr_latency" below (which was measured from seg_start,
+        # i.e. enqueue time) — separating it out is what actually explains
+        # the growing numbers: it's backlog, not the model slowing down.
+        queue_wait_ms = round((dequeued_at - seg_start) * 1000)
+
+        transcribe_started_at = time.time()
         full_text, detected_lang, raw_word_ts = await transcribe(
             segment_audio, loop, _wx_align_cache
         )
         if not full_text:
             return
 
-        asr_latency = round((time.time() - seg_start) * 1000)
+        # Now measured purely around the transcribe() call — this is actual
+        # model inference time, not inference-time-plus-queue-wait.
+        asr_latency = round((time.time() - transcribe_started_at) * 1000)
         metrics.record_asr(asr_latency)
 
-        # Speaker
         perc_state = vision.get_state(session_id)
-        speaker    = assign_speaker(dlg, audio_segment=segment_audio)
-        if perc_state.present_speakers:
-            speaker = perc_state.present_speakers[segment_index % len(perc_state.present_speakers)]
 
-        # Word-level speaker alignment
+        # Word-level speaker alignment. This is the single (executor-offloaded)
+        # diarization pass for this segment — the segment-level speaker below
+        # is derived from it rather than re-running diarization a second time.
         word_timestamps = (
-            assign_speaker_words(dlg, raw_word_ts, segment_audio)
+            await assign_speaker_words(dlg, raw_word_ts, segment_audio)
             if raw_word_ts else raw_word_ts
         )
+
+        # Speaker (segment-level) — resolved as the majority vote across the
+        # word-level labels, which come from the same audio diarization pass.
+        # NOTE: this must NOT be overwritten with perc_state.present_speakers.
+        # present_speakers is vision-derived and indexes purely off
+        # segment_index, so it's uncorrelated with who is actually talking in
+        # this segment — using it here previously pinned every segment to
+        # whichever face vision happened to detect (e.g. a lone "Person
+        # (anon)"), which is what caused the audio/vision speaker mismatches.
+        if word_timestamps:
+            word_speakers = [w.get("speaker") for w in word_timestamps if w.get("speaker")]
+            speaker = (
+                max(set(word_speakers), key=word_speakers.count)
+                if word_speakers else await assign_speaker(dlg, audio_segment=segment_audio)
+            )
+        else:
+            speaker = await assign_speaker(dlg, audio_segment=segment_audio)
 
         # Privacy
         redacted_text = (
             _privacy.redact(full_text) if _privacy.check_consent(speaker) else full_text
         )
-        summoned = _capture.check_summon(session_id, full_text)
+        # summoned = wake-word spoken in THIS segment, OR the frontend's
+        # manual "summon agent" button was pressed (force_summon) and hasn't
+        # been consumed yet. Previously only the spoken wake-word was checked
+        # here, so pressing the manual summon button set a flag that nothing
+        # ever read — the next segment would only enter QA mode if the user
+        # also happened to say a wake-word in the same utterance.
+        summoned = _capture.is_summoned(session_id) or _capture.check_summon(session_id, full_text)
 
         # New speaker detection
         current_known = set(perc_state.present_speakers)
@@ -203,8 +289,8 @@ async def livekit_pipeline(
         metrics.record_e2e(e2e)
 
         log.info(
-            f"[{session_id}] seg#{segment_index} "
-            f"asr={asr_latency}ms e2e={e2e}ms [{detected_lang}] "
+            f"[{session_id}] seg#{seg_idx} "
+            f"queue_wait={queue_wait_ms}ms asr={asr_latency}ms e2e={e2e}ms [{detected_lang}] "
             f"mode={new_mode.value} summoned={summoned}: {full_text[:60]}"
         )
 
@@ -215,12 +301,13 @@ async def livekit_pipeline(
         # Now the frontend always receives the event regardless of DB health.
         broadcast(session_id, {
             "type":            "transcript",
-            "segment":         segment_index,
+            "segment":         seg_idx,
             "session_id":      session_id,
             "speaker":         speaker,
             "text":            full_text,
             "language":        detected_lang,
             "latency_ms":      asr_latency,
+            "queue_wait_ms":   queue_wait_ms,
             "e2e_ms":          e2e,
             "mode":            new_mode.value,
             "timestamp":       record.get("timestamp_iso", ""),
@@ -232,26 +319,39 @@ async def livekit_pipeline(
         })
 
         # ── Supabase persistence — isolated so failures never block SSE ───────
-        try:
-            await supabase_client.insert_transcript(
-                session_id=session_id, speaker=speaker, text=redacted_text,
-                language=detected_lang, mode=new_mode.value,
-                timestamp_unix=seg_start,
-                timestamp_iso=record.get("timestamp_iso", ""),
-                tags=record.get("tags", {}), word_timestamps=word_timestamps,
-                asr_latency_ms=asr_latency, e2e_latency_ms=e2e,
-                segment_index=segment_index,
-            )
-            if cfg.supabase.store_audio:
-                await supabase_client.upload_audio_segment(
-                    session_id, segment_index, segment_audio
+        # Fire-and-forget: this is network I/O (a DB insert + optional audio
+        # upload) with no downstream step in THIS function depending on its
+        # result, and it was previously awaited inline — meaning every ms
+        # this took was added directly onto _segment_consumer's per-segment
+        # time, which is exactly the budget that determines whether the
+        # pipeline keeps up with real-time audio (see MAX_SEGMENT_BACKLOG
+        # comment above). Moving it to a background task lets the consumer
+        # go straight back to segment_q.get() for the next segment while
+        # this persists. Errors are still caught and logged inside the task
+        # so a failure here can never surface as an unhandled exception.
+        async def _persist_to_supabase() -> None:
+            try:
+                await supabase_client.insert_transcript(
+                    session_id=session_id, speaker=speaker, text=redacted_text,
+                    language=detected_lang, mode=new_mode.value,
+                    timestamp_unix=seg_start,
+                    timestamp_iso=record.get("timestamp_iso", ""),
+                    tags=record.get("tags", {}), word_timestamps=word_timestamps,
+                    asr_latency_ms=asr_latency, e2e_latency_ms=e2e,
+                    segment_index=seg_idx,
                 )
-        except Exception as exc:
-            log.error(
-                f"[pipeline:{session_id}] Supabase persist failed for "
-                f"seg#{segment_index}: {exc}",
-                exc_info=True,
-            )
+                if cfg.supabase.store_audio:
+                    await supabase_client.upload_audio_segment(
+                        session_id, seg_idx, segment_audio
+                    )
+            except Exception as exc:
+                log.error(
+                    f"[pipeline:{session_id}] Supabase persist failed for "
+                    f"seg#{seg_idx}: {exc}",
+                    exc_info=True,
+                )
+
+        asyncio.create_task(_persist_to_supabase())
 
         # Entry utterance (greeting / confirmation)
         if entry_utterance:
@@ -263,18 +363,51 @@ async def livekit_pipeline(
 
         # QA reply
         if new_mode == ConvMode.QA:
-            asyncio.create_task(
-                _handle_qa_sse(session_id, dlg, full_text, retriever, new_mode, tts_queue)
-            )
+            # Consume the summon flag now, before the (slow) LLM call, not
+            # after it returns. Previously clear_summon() ran at the end of
+            # _handle_qa_sse, so any speech captured while a reply was still
+            # generating was still seen as "summoned" and could trigger a
+            # second, unrelated QA task for the same session.
+            _capture.clear_summon(session_id)
 
-    # ── Video processor ───────────────────────────────────────────────────────
+            if session_id in _qa_in_flight:
+                log.info(
+                    f"[{session_id}] QA reply already in flight — not spawning "
+                    f"a second one for: {full_text[:60]!r}"
+                )
+            else:
+                _qa_in_flight.add(session_id)
+                qa_task = asyncio.create_task(
+                    _handle_qa_sse(session_id, dlg, full_text, retriever, new_mode, tts_queue)
+                )
+                qa_task.add_done_callback(
+                    lambda _t, sid=session_id: _qa_in_flight.discard(sid)
+                )
+
+    # ── Video processor: fast stage (runs in the hot per-frame loop) ─────────
+    # Only selects every VISION_FRAME_INTERVAL-th frame and hands it off — it
+    # must never `await` vision inference directly, or it stalls draining
+    # video_q the same way the old inline ASR/diarization stalled audio_q.
+
+    _vision_latest: Optional[bytes] = None
+    _vision_event = asyncio.Event()
 
     async def _process_video(jpeg_bytes: bytes) -> None:
-        nonlocal frame_counter
+        nonlocal frame_counter, _vision_latest
         frame_counter += 1
         if frame_counter % VISION_FRAME_INTERVAL != 0:
             return
 
+        # Latest-frame-wins: if the vision worker is still busy with a
+        # previous frame, overwrite the pending slot rather than queuing —
+        # analysing a stale frame once the worker catches up is worse than
+        # just analysing whatever is current when it's ready.
+        _vision_latest = jpeg_bytes
+        _vision_event.set()
+
+    # ── Video processor: heavy stage (its own worker, latest-frame-wins) ─────
+
+    async def _run_vision_analysis(jpeg_bytes: bytes) -> None:
         t0         = time.time()
         state      = await vision.analyse_frame(session_id, jpeg_bytes)
         latency_ms = round((time.time() - t0) * 1000)
@@ -337,6 +470,38 @@ async def livekit_pipeline(
             except Exception:
                 log.exception(f"[pipeline:{session_id}] _process_audio raised unexpectedly")
 
+    async def _segment_consumer() -> None:
+        while True:
+            seg_idx, segment_audio, seg_start, request_received_at = await segment_q.get()
+            dequeued_at = time.time()
+
+            # If more items piled up behind this one while we were busy,
+            # drop the stale ones instead of dutifully working through the
+            # whole backlog in order. FIFO get_nowait() below removes from
+            # the front (the oldest remaining), so this keeps the freshest
+            # MAX_SEGMENT_BACKLOG segments and discards the staler ones —
+            # the fix for the compounding-delay pattern described above.
+            backlog = segment_q.qsize()
+            if backlog > MAX_SEGMENT_BACKLOG:
+                dropped = 0
+                while segment_q.qsize() > MAX_SEGMENT_BACKLOG:
+                    try:
+                        segment_q.get_nowait()
+                        dropped += 1
+                    except asyncio.QueueEmpty:
+                        break
+                log.warning(
+                    f"[pipeline:{session_id}] segment backlog was {backlog}, dropped "
+                    f"{dropped} stale segment(s) to catch back up to real-time"
+                )
+
+            try:
+                await _handle_segment(seg_idx, segment_audio, seg_start, dequeued_at, request_received_at)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception(f"[pipeline:{session_id}] _handle_segment raised unexpectedly (seg#{seg_idx})")
+
     async def _video_consumer() -> None:
         while True:
             jpeg = await video_q.get()
@@ -347,11 +512,29 @@ async def livekit_pipeline(
             except Exception:
                 log.exception(f"[pipeline:{session_id}] _process_video raised unexpectedly")
 
-    audio_task = asyncio.create_task(_audio_consumer(), name=f"audio-{session_id}")
-    video_task = asyncio.create_task(_video_consumer(), name=f"video-{session_id}")
+    async def _vision_worker() -> None:
+        while True:
+            await _vision_event.wait()
+            _vision_event.clear()
+            jpeg_bytes = _vision_latest
+            if jpeg_bytes is None:
+                continue
+            try:
+                await _run_vision_analysis(jpeg_bytes)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception(f"[pipeline:{session_id}] _run_vision_analysis raised unexpectedly")
+
+    audio_task   = asyncio.create_task(_audio_consumer(), name=f"audio-{session_id}")
+    segment_task = asyncio.create_task(_segment_consumer(), name=f"segment-{session_id}")
+    video_task   = asyncio.create_task(_video_consumer(), name=f"video-{session_id}")
+    vision_task  = asyncio.create_task(_vision_worker(), name=f"vision-{session_id}")
 
     try:
-        results = await asyncio.gather(audio_task, video_task, return_exceptions=True)
+        results = await asyncio.gather(
+            audio_task, segment_task, video_task, vision_task, return_exceptions=True
+        )
         for result in results:
             if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
                 log.error(
@@ -361,6 +544,8 @@ async def livekit_pipeline(
     except asyncio.CancelledError:
         log.info(f"[pipeline:{session_id}] cancelled")
         audio_task.cancel()
+        segment_task.cancel()
         video_task.cancel()
-        await asyncio.gather(audio_task, video_task, return_exceptions=True)
+        vision_task.cancel()
+        await asyncio.gather(audio_task, segment_task, video_task, vision_task, return_exceptions=True)
         raise

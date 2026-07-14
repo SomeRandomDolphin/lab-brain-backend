@@ -46,7 +46,7 @@ async def ingest_from_rifqi(seg: RifqiSegment):
         except Exception:
             pass
 
-    record = _capture.process_segment(
+    record = await _capture.process_segment(
         seg.session_id, seg.speaker, seg.text,
         ts_unix, seg.mode, seg.language,
         confirm_agent=False,
