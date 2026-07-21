@@ -429,8 +429,8 @@ start_ollama() {
 
   # Model names come directly from config.json — stays in sync with the backend
   local vision_model dialogue_model
-  vision_model=$(read_config   "['local_llm']['vision_model']"   "llava:7b")
-  dialogue_model=$(read_config "['local_llm']['dialogue_model']" "llama3.2:3b")
+  vision_model=$(read_config   "['local_llm']['vision_model']"   "qwen3-vl:4b")
+  dialogue_model=$(read_config "['local_llm']['dialogue_model']" "qwen3-vl:4b")
   echo "  vision_model   = ${vision_model}"
   echo "  dialogue_model = ${dialogue_model}"
 
@@ -443,11 +443,38 @@ start_ollama() {
   # `--gpus all` WITHOUT registering a runtime by that name — so this check
   # reports "no GPU" on a perfectly capable Windows/WSL2 + Docker Desktop
   # machine, silently falling back to CPU. That mismatch is almost certainly
-  # why Ollama was serving llama3.2:3b on CPU (~60s/reply) instead of GPU.
+  # why Ollama was serving qwen3-vl:4b on CPU (~60s/reply) instead of GPU.
   #
   # Fix: don't pre-guess capability from `docker info` — just attempt
   # `--gpus all` directly and fall back only if the run actually fails.
   # Docker fails fast (no hang) when GPU passthrough genuinely isn't there.
+  #
+  # OLLAMA_KEEP_ALIVE: Ollama's default is to unload a model after 5 minutes
+  # of inactivity. A meeting can easily go quieter than that between
+  # summons, so without this every subsequent QA reply pays the same
+  # multi-minute cold-load cost as the very first one, even with the
+  # server-side warmup() call. 1h keeps it resident for any realistic
+  # meeting length; adjust if RAM/VRAM is tight.
+  local ollama_keep_alive="1h"
+
+  # OLLAMA_MAX_LOADED_MODELS: this app runs TWO models against the same
+  # Ollama instance — dialogue_model (qwen3-vl:4b) for QA/summary, and
+  # vision_model (qwen3-vl:4b) for the periodic frame analysis in
+  # session_pipeline.py's _vision_worker. Ollama's default cap on
+  # simultaneously loaded models is 1 in CPU-only setups (which this
+  # already falls back to whenever GPU passthrough fails — see the
+  # nvidia-smi check below). With the cap at 1, any vision frame that
+  # comes in while the dialogue model is loaded forces Ollama to evict it
+  # and reload qwen3-vl:4b, and the next QA call then has to reload
+  # qwen3-vl:4b from scratch — a full cold-start, despite warmup() and
+  # OLLAMA_KEEP_ALIVE both being set correctly. That model-swap thrashing,
+  # not a slow model, is what actually produced a 147s "warm" QA reply in
+  # one observed session. Raising this to 2 lets both stay resident
+  # together as long as there's enough RAM/VRAM for both simultaneously —
+  # confirm afterwards with `docker exec lab-brain-ollama ollama ps`, which
+  # should list BOTH models at once instead of swapping between them.
+  local ollama_max_loaded_models="2"
+
   remove_container "$OLLAMA_CONTAINER"
 
   info "Starting Ollama container (attempting GPU passthrough)..."
@@ -455,6 +482,8 @@ start_ollama() {
   if docker run -d \
       --name "$OLLAMA_CONTAINER" \
       --gpus all \
+      -e OLLAMA_KEEP_ALIVE="${ollama_keep_alive}" \
+      -e OLLAMA_MAX_LOADED_MODELS="${ollama_max_loaded_models}" \
       -p "${OLLAMA_PORT}:11434" \
       -v ollama-models:/root/.ollama \
       ollama/ollama >/dev/null 2>"$gpu_err_log"; then
@@ -465,6 +494,8 @@ start_ollama() {
     remove_container "$OLLAMA_CONTAINER"
     docker run -d \
       --name "$OLLAMA_CONTAINER" \
+      -e OLLAMA_KEEP_ALIVE="${ollama_keep_alive}" \
+      -e OLLAMA_MAX_LOADED_MODELS="${ollama_max_loaded_models}" \
       -p "${OLLAMA_PORT}:11434" \
       -v ollama-models:/root/.ollama \
       ollama/ollama >/dev/null

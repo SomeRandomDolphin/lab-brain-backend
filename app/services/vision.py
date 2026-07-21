@@ -13,6 +13,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -132,6 +133,17 @@ async def analyse_frame(session_id: str, jpeg_bytes: bytes) -> PerceptionState:
 
     b64  = base64.b64encode(jpeg_bytes).decode()
     loop = asyncio.get_event_loop()
+
+    # Same instrumentation pattern as dialogue_service.py's qa/summary calls.
+    # Without this, a vision call hitting the same Ollama instance shows up
+    # in the httpx logger as an indistinguishable "200 OK" with no way to
+    # tell it apart from a dialogue call — which is exactly what made an
+    # earlier latency investigation (147s "warm" QA reply) take a file read
+    # to resolve instead of a log read. call_id + explicit elapsed time
+    # means the next one won't need that.
+    call_id = uuid.uuid4().hex[:8]
+    log.info(f"[vision:{session_id}] LLM dispatch frame call_id={call_id} model={cfg.local_llm.vision_model}")
+    t0 = time.perf_counter()
     try:
         response = await loop.run_in_executor(
             None,
@@ -146,8 +158,11 @@ async def analyse_frame(session_id: str, jpeg_bytes: bytes) -> PerceptionState:
                 }],
                 max_tokens=300,
                 temperature=0.0,
+                timeout=30,  # fail fast instead of silently retrying/hanging
             )
         )
+        elapsed = time.perf_counter() - t0
+        log.info(f"[vision:{session_id}] LLM complete frame call_id={call_id} ({elapsed:.1f}s)")
         raw    = response.choices[0].message.content.strip()
         parsed = _extract_json(session_id, raw)
 
@@ -182,6 +197,6 @@ async def analyse_frame(session_id: str, jpeg_bytes: bytes) -> PerceptionState:
         state.last_updated = time.time()
     except Exception as exc:
         state.error_count += 1
-        log.warning(f"[vision:{session_id}] frame analysis failed: {exc}")
+        log.warning(f"[vision:{session_id}] frame analysis failed call_id={call_id}: {exc}")
 
     return state

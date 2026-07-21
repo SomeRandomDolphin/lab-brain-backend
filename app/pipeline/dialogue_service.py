@@ -11,6 +11,7 @@ import asyncio
 import logging
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -117,6 +118,116 @@ _SYSTEM_PROMPT = (
     "and always grounded in the lab context provided. Never hallucinate "
     "citations or project details. You only respond when directly addressed."
 )
+
+
+def warmup() -> None:
+    """
+    Send a throwaway completion to the local LLM at startup so Ollama loads
+    the model into memory once, at boot, instead of on whoever's first real
+    summon.
+
+    Without this, the FIRST chat.completions.create() call of the server's
+    life is whatever the first user question happens to be — and that call
+    pays the full cost of Ollama reading the model off disk into RAM/VRAM
+    before it can generate a single token. On this setup that showed up as
+    a 259-second wait for one QA reply, versus ~2s for every call after the
+    model was already warm (see the 10:26:42 → 10:31:01 vs. 10:32:43 →
+    10:32:45 gap in the logs).
+
+    This is a blocking network call — run it via run_in_executor from the
+    FastAPI startup hook, the same way lkc_retrieval.warmup() is called:
+
+        await loop.run_in_executor(None, dialogue_service.warmup)
+
+    Also set OLLAMA_KEEP_ALIVE on the Ollama container to something longer
+    than its 5-minute default (see start_services.sh) — otherwise the model
+    gets evicted during any quiet stretch of a meeting and the next summon
+    pays the cold-start cost all over again, warmup or not.
+
+    NOTE: log the wall time this itself takes. In the 2026-07-14 log this
+    call spans ~11:00:48 → 11:03:51 (~3 min) — i.e. warmup() is *absorbing*
+    a cold load, not skipping one. That's expected once, at boot. If you
+    ever see that multi-minute span recur on a *later* warmup (e.g. after a
+    restart triggered mid-session), it means keep_alive lapsed or the
+    container was recreated — not a "the model got slower" problem.
+    """
+    if not LOCAL_LLM_AVAILABLE:
+        log.warning("[dialogue] warmup: local LLM client not available — skipping.")
+        return
+    t0 = time.perf_counter()
+    try:
+        _dialogue_client.chat.completions.create(
+            model=cfg.local_llm.dialogue_model,
+            messages=[{"role": "user", "content": "Hi"}],
+            max_tokens=1,
+        )
+        log.info(
+            f"[dialogue] local LLM warmed: {cfg.local_llm.dialogue_model} "
+            f"({time.perf_counter() - t0:.1f}s)"
+        )
+    except Exception as exc:
+        log.warning(f"[dialogue] warmup failed (non-fatal, first real call will be slow): {exc}")
+
+
+# Tiny 1x1 transparent PNG, just enough to make Ollama load the vision
+# projector/encoder weights — content is irrelevant, this is a throwaway.
+_WARMUP_IMAGE_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
+
+
+def warmup_vision() -> None:
+    """
+    Same rationale as warmup(), for the vision model.
+
+    Ollama keeps every model's weights in its own independent memory slot —
+    warming qwen3-vl:4b does NOT also warm the vision model (e.g. qwen3-vl:4b
+    from config.json). They're separate `ollama pull`s and separate
+    load-into-VRAM events. Whatever code path first sends a frame to vision
+    (screenshot description, slide capture, etc.) will otherwise eat the
+    exact same multi-minute cold-load penalty warmup() was written to avoid
+    for chat — just later, and probably mid-meeting instead of at boot.
+
+    Call this from the same FastAPI startup hook as warmup(), as its own
+    run_in_executor call so one failing doesn't block the other:
+
+        await loop.run_in_executor(None, dialogue_service.warmup)
+        await loop.run_in_executor(None, dialogue_service.warmup_vision)
+
+    Caveat: OLLAMA_KEEP_ALIVE (see start_services.sh) is a container-wide
+    default, so it applies to this model too — but keep_alive only stops
+    *time-based* eviction. If VRAM/RAM is too small to hold both the
+    dialogue model and the vision model resident at once, loading one can
+    still force Ollama to evict the other regardless of keep_alive, and
+    you'll pay a cold-load on whichever one got pushed out next time it's
+    summoned. `docker exec lab-brain-ollama ollama ps` shows what's
+    currently resident if replies start getting slow again after this.
+    """
+    if not LOCAL_LLM_AVAILABLE:
+        log.warning("[dialogue] vision warmup: local LLM client not available — skipping.")
+        return
+    t0 = time.perf_counter()
+    try:
+        _dialogue_client.chat.completions.create(
+            model=cfg.local_llm.vision_model,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Hi"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{_WARMUP_IMAGE_B64}"},
+                    },
+                ],
+            }],
+            max_tokens=1,
+        )
+        log.info(
+            f"[dialogue] local vision model warmed: {cfg.local_llm.vision_model} "
+            f"({time.perf_counter() - t0:.1f}s)"
+        )
+    except Exception as exc:
+        log.warning(f"[dialogue] vision warmup failed (non-fatal, first real call will be slow): {exc}")
 
 
 # ── Mode FSM ──────────────────────────────────────────────────────────────────
@@ -417,7 +528,18 @@ async def generate_response(
         history = state.get_chat_history()
         history.append({"role": "user", "content": user_message})
 
+        # Explicit dispatch/completion markers with a short call id. The
+        # httpx "HTTP Request: POST ... 200 OK" line only tells you a
+        # completion happened, not which code path issued it or whether the
+        # OpenAI SDK's built-in retry (max_retries=2 by default) fired
+        # underneath — which is exactly the ambiguity that made an earlier
+        # cluster of completions around a summary call impossible to
+        # attribute after the fact. This makes call count/origin explicit
+        # going forward instead of having to infer it from timestamps.
+        call_id = uuid.uuid4().hex[:8]
         loop = asyncio.get_event_loop()
+        log.info(f"[dialogue:{state.session_id}] LLM dispatch qa call_id={call_id}")
+        t0 = time.perf_counter()
         try:
             response = await loop.run_in_executor(
                 None,
@@ -426,8 +548,18 @@ async def generate_response(
                     messages=[{"role": "system", "content": _SYSTEM_PROMPT}] + history,
                     max_tokens=120,
                     temperature=0.4,
+                    timeout=30,  # fail fast instead of silently retrying/hanging
                 )
             )
+            # elapsed is the actual network+inference time for THIS call. If
+            # elapsed is small (a few seconds) but the gap between this log
+            # line's timestamp and the dispatch line above is large, the
+            # model/network wasn't the bottleneck — something else was
+            # hogging the event loop thread (or the default executor's
+            # thread pool) and delayed this coroutine from resuming. That's
+            # the distinction "warmed but still slow" needs to separate.
+            elapsed = time.perf_counter() - t0
+            log.info(f"[dialogue:{state.session_id}] LLM complete qa call_id={call_id} ({elapsed:.1f}s)")
             reply = response.choices[0].message.content.strip()
             history.append({"role": "assistant", "content": reply})
             max_turns = state.CONTEXT_WINDOW * 2
@@ -435,7 +567,7 @@ async def generate_response(
                 state._chat_history = history[-max_turns:]
             return reply
         except Exception as exc:
-            log.warning(f"[dialogue:{state.session_id}] LLM error: {exc}")
+            log.warning(f"[dialogue:{state.session_id}] LLM error call_id={call_id}: {exc}")
             return None
 
     return None
@@ -447,6 +579,31 @@ async def generate_summary(state: DialogueState, session_tags: dict) -> str:
     if not LOCAL_LLM_AVAILABLE:
         return "## Session Summary (stub)\nLocal LLM unavailable — configure local_llm.\n"
 
+    context = state.context_block()
+
+    # Hallucination guard. The prompt below demands 4 populated markdown
+    # sections no matter what — that's fine for a real meeting, but for a
+    # session with only a couple of test utterances (e.g. "This is a test
+    # from front end to back end.") there is nothing to summarize, and a
+    # small local model (qwen3-vl:4b) will not say "not enough content" on
+    # its own. It will pattern-match "research laboratory meeting" from the
+    # system prompt and invent a plausible-sounding agenda — fake findings,
+    # a fake grant request, a fake conference — to fill the sections it was
+    # told to produce. That's exactly what happened in the 2026-07-14 run.
+    # Short-circuit before the LLM call entirely rather than trying to
+    # prompt our way out of it once the transcript is already too thin.
+    MIN_SUMMARY_WORDS = 25
+    if len(context.split()) < MIN_SUMMARY_WORDS:
+        log.info(
+            f"[dialogue:{state.session_id}] summary skipped — transcript too short "
+            f"({len(context.split())} words < {MIN_SUMMARY_WORDS}); returning stub instead of risking hallucination"
+        )
+        return (
+            "## Summary\n"
+            "Not enough conversation was captured in this session to generate a meaningful summary.\n\n"
+            "## Decisions\nNone\n\n## Action Items\nNone\n\n## Open Questions\nNone\n"
+        )
+
     action_block   = "\n".join(f"- {a}" for a in session_tags.get("action_items", [])) or "None"
     decision_block = "\n".join(f"- {d}" for d in session_tags.get("decisions",    [])) or "None"
     deadline_block = "\n".join(f"- {d}" for d in session_tags.get("deadlines",    [])) or "None"
@@ -454,15 +611,24 @@ async def generate_summary(state: DialogueState, session_tags: dict) -> str:
 
     user_message = (
         f"You are Lab Brain summarising a research meeting.\n\n"
-        f"Recent transcript (last {state.CONTEXT_WINDOW} turns):\n{state.context_block()}\n\n"
+        f"The transcript below is the ONLY source of truth. Do not invent, "
+        f"assume, or infer any finding, decision, action item, deadline, or "
+        f"topic that is not explicitly present in it — even if it would be "
+        f"plausible for a research lab meeting. If a section has no "
+        f"supporting content in the transcript, write exactly 'None' for "
+        f"that section instead of fabricating something to fill it.\n\n"
+        f"Recent transcript (last {state.CONTEXT_WINDOW} turns):\n{context}\n\n"
         f"Action items:\n{action_block}\n\nDecisions:\n{decision_block}\n\n"
         f"Deadlines:\n{deadline_block}\n\nKey entities: {entity_block}\n\n"
         f"Produce a concise meeting summary in markdown: "
         f"## Summary, ## Decisions, ## Action Items, ## Open Questions. "
-        f"≤4 bullet points per section."
+        f"≤4 bullet points per section, each bullet traceable to the transcript above."
     )
 
+    call_id = uuid.uuid4().hex[:8]
     loop = asyncio.get_event_loop()
+    log.info(f"[dialogue:{state.session_id}] LLM dispatch summary call_id={call_id}")
+    t0 = time.perf_counter()
     try:
         response = await loop.run_in_executor(
             None,
@@ -473,12 +639,15 @@ async def generate_summary(state: DialogueState, session_tags: dict) -> str:
                     {"role": "user",   "content": user_message},
                 ],
                 max_tokens=400,
-                temperature=0.3,
+                temperature=0.1,  # was 0.3 — summarization should be low-creativity
+                timeout=30,
             )
         )
+        elapsed = time.perf_counter() - t0
+        log.info(f"[dialogue:{state.session_id}] LLM complete summary call_id={call_id} ({elapsed:.1f}s)")
         return response.choices[0].message.content.strip()
     except Exception as exc:
-        log.warning(f"[dialogue:{state.session_id}] summary failed: {exc}")
+        log.warning(f"[dialogue:{state.session_id}] summary failed call_id={call_id}: {exc}")
         return (
             f"## Session Summary (fallback)\n"
             f"**Action items:**\n{action_block}\n\n"

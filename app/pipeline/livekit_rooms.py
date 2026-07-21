@@ -290,7 +290,19 @@ async def _subscriber_loop(session_id: str, pipeline_fn) -> None:
 
     @room.on("disconnected")
     def on_disconnect(reason=None):
-        log.error(f"[livekit:{session_id}] *** ROOM DISCONNECTED *** reason={reason!r}")
+        # This fires for BOTH the normal, expected case (our own
+        # room.disconnect() call in the `finally` block below, once a
+        # session ends cleanly) and genuine failures — but it was logging
+        # every single one at ERROR, so every ordinary end-of-meeting showed
+        # up indistinguishable from an actual problem. reason 0/1
+        # (UNKNOWN/CLIENT_INITIATED in LiveKit's protocol) covers the
+        # expected paths; anything else is more likely a real disconnect
+        # (network drop, server-side issue, etc.) and stays loud.
+        reason_val = getattr(reason, "value", reason)
+        if reason_val in (0, 1):
+            log.info(f"[livekit:{session_id}] room disconnected (reason={reason!r})")
+        else:
+            log.error(f"[livekit:{session_id}] *** ROOM DISCONNECTED *** reason={reason!r}")
 
     @room.on("connection_state_changed")
     def on_conn_state(state):

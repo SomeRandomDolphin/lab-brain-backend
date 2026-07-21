@@ -148,6 +148,34 @@ def create_app() -> FastAPI:
         except Exception as exc:
             log.error(f"[startup] LKC retrieval warmup failed: {exc}")
 
+        # Warm the local dialogue LLM (Ollama) the same way — otherwise the
+        # first chat.completions.create() call of the process's life is
+        # whichever user's first real summon happens to be, and that call
+        # pays the full cost of Ollama loading the model off disk before it
+        # can generate anything. Measured at 259s cold vs. ~2s warm in one
+        # session's logs. Same run_in_executor reasoning as above: this is a
+        # blocking network call and must not run directly on the event loop.
+        from app.pipeline import dialogue_service
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, dialogue_service.warmup)
+        except Exception as exc:
+            log.error(f"[startup] Dialogue LLM warmup failed: {exc}")
+
+        # Warm the vision model (Ollama) too — separately from the dialogue
+        # warmup above, since Ollama loads/evicts each model independently.
+        # Without this, the first frame session_pipeline.py's _vision_worker
+        # sends to vision.analyse_frame() pays the same cold-load cost the
+        # dialogue warmup above exists to avoid — and worse, it can then
+        # evict the already-warmed dialogue model to make room, so a QA
+        # reply mid-meeting silently pays a second cold-load it should never
+        # have had to (see the 147s "warm" QA reply this was chasing down).
+        # Its own try/except so a vision warmup failure never blocks startup
+        # or masks the dialogue warmup above having already succeeded.
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, dialogue_service.warmup_vision)
+        except Exception as exc:
+            log.error(f"[startup] Vision LLM warmup failed: {exc}")
+
         # Run pending Alembic migrations on every startup (idempotent).
         # Replaces the old custom exec_sql-based SQL-file runner.
         # Uses run_migrations_async() (not run_migrations()) because we're

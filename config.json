@@ -1,8 +1,8 @@
 {
   "local_llm": {
     "base_url": "http://localhost:11434/v1",
-    "vision_model": "llava:7b",
-    "dialogue_model": "llama3.2:3b",
+    "vision_model": "qwen3-vl:4b",
+    "dialogue_model": "qwen3-vl:4b",
     "hf_token": ""
   },
   "whisper": {
@@ -51,7 +51,7 @@
     "_comment": "LiveKit SFU \u00e2\u20ac\u201d run: docker run --rm -p 7880:7880 livekit/livekit-server --dev",
     "url": "ws://localhost:7880",
     "api_key": "devkey",
-    "api_secret": "devsecret"
+    "api_secret": "QQYwEDWf1zeIPS90SP5AwEqflO+/xiz/0Gi1aOfEG9Y="
   },
   "supabase": {
     "_comment": "Set SUPABASE_URL and SUPABASE_KEY env vars \u00e2\u20ac\u201d never hardcode secrets here.",

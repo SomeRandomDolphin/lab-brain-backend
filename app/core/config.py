@@ -27,8 +27,8 @@ CONFIG_PATH = Path(__file__).parent.parent.parent / "config.json"
 class LocalLLMConfig:
     base_url:       str = "http://localhost:11434/v1"
     api_key:        str = "ollama"
-    vision_model:   str = "llava:7b"
-    dialogue_model: str = "llama3.2:3b"
+    vision_model:   str = "qwen3-vl:4b"
+    dialogue_model: str = "qwen3-vl:4b"
     hf_token:       str = ""
 
     @property
