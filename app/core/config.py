@@ -25,10 +25,10 @@ CONFIG_PATH = Path(__file__).parent.parent.parent / "config.json"
 
 @dataclass
 class LocalLLMConfig:
-    base_url:       str = "http://localhost:11434/v1"
+    base_url:       str = "http://100.118.203.111:11434/v1"
     api_key:        str = "ollama"
     vision_model:   str = "qwen3-vl:4b"
-    dialogue_model: str = "qwen3-vl:4b"
+    dialogue_model: str = "qwen3:4b"
     hf_token:       str = ""
 
     @property
@@ -107,7 +107,7 @@ class LiveKitConfig:
         docker run --rm -p 7880:7880 livekit/livekit-server --dev
     Then set api_key="devkey", api_secret="devsecret".
     """
-    url:        str = "ws://localhost:7880"
+    url:        str = "ws://100.118.203.111:7880"
     api_key:    str = "devkey"
     api_secret: str = "devsecret"
 

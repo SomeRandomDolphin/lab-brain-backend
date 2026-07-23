@@ -585,7 +585,7 @@ async def generate_summary(state: DialogueState, session_tags: dict) -> str:
     # sections no matter what — that's fine for a real meeting, but for a
     # session with only a couple of test utterances (e.g. "This is a test
     # from front end to back end.") there is nothing to summarize, and a
-    # small local model (qwen3-vl:4b) will not say "not enough content" on
+    # small local model (qwen3:4b) will not say "not enough content" on
     # its own. It will pattern-match "research laboratory meeting" from the
     # system prompt and invent a plausible-sounding agenda — fake findings,
     # a fake grant request, a fake conference — to fill the sections it was

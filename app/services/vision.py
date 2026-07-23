@@ -156,7 +156,7 @@ async def analyse_frame(session_id: str, jpeg_bytes: bytes) -> PerceptionState:
                         {"type": "text", "text": _VISION_PROMPT},
                     ],
                 }],
-                max_tokens=300,
+                max_tokens=2000,
                 temperature=0.0,
                 timeout=30,  # fail fast instead of silently retrying/hanging
             )

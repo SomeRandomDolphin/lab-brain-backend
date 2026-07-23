@@ -430,9 +430,22 @@ start_ollama() {
   # Model names come directly from config.json — stays in sync with the backend
   local vision_model dialogue_model
   vision_model=$(read_config   "['local_llm']['vision_model']"   "qwen3-vl:4b")
-  dialogue_model=$(read_config "['local_llm']['dialogue_model']" "qwen3-vl:4b")
+  dialogue_model=$(read_config "['local_llm']['dialogue_model']" "qwen3:4b")
   echo "  vision_model   = ${vision_model}"
   echo "  dialogue_model = ${dialogue_model}"
+
+  # GUARD: if config.json points both roles at the same model tag, every
+  # dialogue/QA call queues behind vision calls on the same model-runner
+  # (and vice versa) regardless of OLLAMA_MAX_LOADED_MODELS/NUM_PARALLEL —
+  # there's only one distinct model to load, so nothing here can help.
+  # This is the exact failure mode that produced 84s+ vision calls blocking
+  # ASR/QA in earlier sessions — catch it here instead of re-discovering it
+  # from a frozen frontend.
+  if [[ "$vision_model" == "$dialogue_model" ]]; then
+    die "config.json: local_llm.vision_model and local_llm.dialogue_model are both '${vision_model}'. \
+They must be different models — a VL model for vision_model, a text-only model (e.g. qwen3:4b) for \
+dialogue_model — or dialogue/QA calls will queue behind every vision call. Fix config.json and re-run."
+  fi
 
   # GPU passthrough — auto-detected, never required.
   #
@@ -458,14 +471,14 @@ start_ollama() {
   local ollama_keep_alive="1h"
 
   # OLLAMA_MAX_LOADED_MODELS: this app runs TWO models against the same
-  # Ollama instance — dialogue_model (qwen3-vl:4b) for QA/summary, and
+  # Ollama instance — dialogue_model (qwen3:4b) for QA/summary, and
   # vision_model (qwen3-vl:4b) for the periodic frame analysis in
   # session_pipeline.py's _vision_worker. Ollama's default cap on
   # simultaneously loaded models is 1 in CPU-only setups (which this
   # already falls back to whenever GPU passthrough fails — see the
   # nvidia-smi check below). With the cap at 1, any vision frame that
   # comes in while the dialogue model is loaded forces Ollama to evict it
-  # and reload qwen3-vl:4b, and the next QA call then has to reload
+  # and reload qwen3:4b, and the next QA call then has to reload
   # qwen3-vl:4b from scratch — a full cold-start, despite warmup() and
   # OLLAMA_KEEP_ALIVE both being set correctly. That model-swap thrashing,
   # not a slow model, is what actually produced a 147s "warm" QA reply in
@@ -474,6 +487,17 @@ start_ollama() {
   # confirm afterwards with `docker exec lab-brain-ollama ollama ps`, which
   # should list BOTH models at once instead of swapping between them.
   local ollama_max_loaded_models="2"
+
+  # OLLAMA_NUM_PARALLEL: number of concurrent requests a single loaded model
+  # will process at once (default 1). Each extra slot allocates its own
+  # KV-cache on top of the base context, so this is left at 1 unless you've
+  # confirmed spare VRAM/RAM headroom on the host — with vision_model and
+  # dialogue_model now split across two model slots (see guard above), 1 is
+  # usually enough: the two models already run independently of each other,
+  # this only matters if you expect >1 concurrent request to the SAME model
+  # (e.g. two simultaneous meetings). Bump to 2 and watch `ollama ps` /
+  # memory if you need that.
+  local ollama_num_parallel="1"
 
   remove_container "$OLLAMA_CONTAINER"
 
@@ -484,6 +508,7 @@ start_ollama() {
       --gpus all \
       -e OLLAMA_KEEP_ALIVE="${ollama_keep_alive}" \
       -e OLLAMA_MAX_LOADED_MODELS="${ollama_max_loaded_models}" \
+      -e OLLAMA_NUM_PARALLEL="${ollama_num_parallel}" \
       -p "${OLLAMA_PORT}:11434" \
       -v ollama-models:/root/.ollama \
       ollama/ollama >/dev/null 2>"$gpu_err_log"; then
@@ -496,6 +521,7 @@ start_ollama() {
       --name "$OLLAMA_CONTAINER" \
       -e OLLAMA_KEEP_ALIVE="${ollama_keep_alive}" \
       -e OLLAMA_MAX_LOADED_MODELS="${ollama_max_loaded_models}" \
+      -e OLLAMA_NUM_PARALLEL="${ollama_num_parallel}" \
       -p "${OLLAMA_PORT}:11434" \
       -v ollama-models:/root/.ollama \
       ollama/ollama >/dev/null
@@ -530,6 +556,26 @@ start_ollama() {
 
   pull_model "$vision_model"
   pull_model "$dialogue_model"
+
+  # Verify both models actually end up loaded SIMULTANEOUSLY, not just
+  # pulled — a bad OLLAMA_MAX_LOADED_MODELS value, insufficient RAM/VRAM for
+  # both at once, or the vision/dialogue-model-collision bug guarded against
+  # above could all still leave you with model-swap thrashing at runtime.
+  # A single pull doesn't load a model into memory, so ping each with a
+  # trivial generate call first.
+  info "Verifying both models can stay resident together..."
+  docker exec "$OLLAMA_CONTAINER" ollama run "$vision_model" "hi" >/dev/null 2>&1 || true
+  docker exec "$OLLAMA_CONTAINER" ollama run "$dialogue_model" "hi" >/dev/null 2>&1 || true
+  loaded="$(docker exec "$OLLAMA_CONTAINER" ollama ps)"
+  echo "$loaded"
+  if echo "$loaded" | grep -qF "$vision_model" && echo "$loaded" | grep -qF "$dialogue_model"; then
+    success "Both models resident simultaneously — no swap thrashing expected."
+  else
+    warn "Only one model shows as loaded. Either RAM/VRAM can't hold both at once, or"
+    warn "OLLAMA_MAX_LOADED_MODELS (${ollama_max_loaded_models}) is being capped by the runtime."
+    warn "Dialogue calls arriving while a vision call is in flight (or vice versa) will"
+    warn "trigger a cold reload each time. Check available memory / lower the models' size."
+  fi
 
   echo "  API endpoint → http://localhost:${OLLAMA_PORT}/v1  (OpenAI-compatible)"
   echo "  Models:        docker exec ${OLLAMA_CONTAINER} ollama list"
