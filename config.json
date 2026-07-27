@@ -55,7 +55,7 @@
   },
   "supabase": {
     "_comment": "Set SUPABASE_URL and SUPABASE_KEY env vars \u00e2\u20ac\u201d never hardcode secrets here.",
-    "url": "http://localhost:8000",
+    "url": "http://localhost:8080",
     "key": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzgyNzEyNDE4LCJleHAiOjE5NDAzOTI0MTh9.JRXxfOd3PEP8YBvoX_u6f7WYu6Mr2ZWJfvRqL-GkUyc",
     "store_audio": false,
     "store_vision": true

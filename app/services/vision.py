@@ -120,7 +120,7 @@ def _extract_json(session_id: str, raw: str) -> dict:
     }
 
 
-async def analyse_frame(session_id: str, jpeg_bytes: bytes) -> PerceptionState:
+async def analyse_frame(session_id: str, jpeg_bytes: bytes, known_identity: Optional[str] = None) -> PerceptionState:
     state = get_state(session_id)
     state.frame_count += 1
 
@@ -156,7 +156,7 @@ async def analyse_frame(session_id: str, jpeg_bytes: bytes) -> PerceptionState:
                         {"type": "text", "text": _VISION_PROMPT},
                     ],
                 }],
-                max_tokens=2000,
+                max_tokens=300,
                 temperature=0.0,
                 timeout=30,  # fail fast instead of silently retrying/hanging
             )
@@ -172,14 +172,29 @@ async def analyse_frame(session_id: str, jpeg_bytes: bytes) -> PerceptionState:
         # Privacy gate
         gated_speakers: list[str] = []
         gated_cues: dict[str, str] = {}
-        for sp in raw_speakers:
-            if _privacy.should_identify_face(sp):
-                gated_speakers.append(sp)
-                gated_cues[sp] = raw_cues.get(sp, "unknown")
-            else:
-                anon = "Person (anon)"
-                gated_speakers.append(anon)
-                gated_cues[anon] = "unknown"
+        # The VLM has no notion of real identity — "Person A"/"Person B" are
+        # arbitrary per-frame labels, not a persistent ID. The one case where
+        # we CAN safely attach a real name is a single detected person in a
+        # session where we know who actually joined the room (the logged-in
+        # account, via LiveKit's participant name) — there's no ambiguity
+        # about who that is, and it's their own account recording their own
+        # session, not a third party being identified without consent.
+        # Multiple simultaneous faces still go through the normal
+        # consent-registry gate below, since we can't tell which VLM label
+        # corresponds to which real person.
+        if known_identity and len(raw_speakers) == 1:
+            sp = raw_speakers[0]
+            gated_speakers.append(known_identity)
+            gated_cues[known_identity] = raw_cues.get(sp, "unknown")
+        else:
+            for sp in raw_speakers:
+                if _privacy.should_identify_face(sp):
+                    gated_speakers.append(sp)
+                    gated_cues[sp] = raw_cues.get(sp, "unknown")
+                else:
+                    anon = "Person (anon)"
+                    gated_speakers.append(anon)
+                    gated_cues[anon] = "unknown"
 
         state.present_speakers = gated_speakers
         state.engagement_cues  = gated_cues

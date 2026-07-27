@@ -519,6 +519,7 @@ async def generate_response(
             if lkc_context.strip() else ""
         )
         user_message = (
+            f"/no_think\n"
             f"Recent conversation:\n{state.context_block()}"
             f"{lkc_section}\n\n"
             f'The speaker directly addressed you and said: "{transcript}"\n'
@@ -546,7 +547,13 @@ async def generate_response(
                 lambda: _dialogue_client.chat.completions.create(
                     model=cfg.local_llm.dialogue_model,
                     messages=[{"role": "system", "content": _SYSTEM_PROMPT}] + history,
-                    max_tokens=120,
+                    # 120 was sized for the visible ≤2-sentence answer only.
+                    # Qwen3 thinks by default and was silently spending the
+                    # entire budget on the <think> block, leaving content=""
+                    # with no error anywhere (200 OK, clean elapsed time) —
+                    # the same failure mode vision.py had. Give it real
+                    # headroom for thinking + the short answer.
+                    max_tokens=700,
                     temperature=0.4,
                     timeout=30,  # fail fast instead of silently retrying/hanging
                 )
@@ -559,8 +566,28 @@ async def generate_response(
             # thread pool) and delayed this coroutine from resuming. That's
             # the distinction "warmed but still slow" needs to separate.
             elapsed = time.perf_counter() - t0
-            log.info(f"[dialogue:{state.session_id}] LLM complete qa call_id={call_id} ({elapsed:.1f}s)")
-            reply = response.choices[0].message.content.strip()
+            finish_reason = response.choices[0].finish_reason
+            log.info(
+                f"[dialogue:{state.session_id}] LLM complete qa call_id={call_id} "
+                f"({elapsed:.1f}s) finish_reason={finish_reason}"
+            )
+            raw = response.choices[0].message.content.strip()
+            # Defensive strip in case /no_think doesn't fully suppress
+            # thinking on this template/version — don't let a leaked
+            # <think> block get spoken or broadcast to the user.
+            reply = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+            if not reply:
+                # This used to fail silently: `if reply:` in
+                # _handle_qa_sse skips broadcast/speak/persist on an empty
+                # string with no error anywhere, which is exactly what made
+                # this bug invisible — clean 200 OK, clean elapsed time,
+                # user just never got an answer. Surface it loudly now.
+                log.warning(
+                    f"[dialogue:{state.session_id}] qa call_id={call_id} returned EMPTY "
+                    f"content (finish_reason={finish_reason}, raw={raw[:200]!r}) — "
+                    f"model likely exhausted max_tokens on thinking; returning fallback"
+                )
+                return "Sorry, I'm having trouble forming a reply right now — could you ask again?"
             history.append({"role": "assistant", "content": reply})
             max_turns = state.CONTEXT_WINDOW * 2
             if len(history) > max_turns:
@@ -610,6 +637,7 @@ async def generate_summary(state: DialogueState, session_tags: dict) -> str:
     entity_block   = ", ".join(session_tags.get("entities", [])) or "None"
 
     user_message = (
+        f"/no_think\n"
         f"You are Lab Brain summarising a research meeting.\n\n"
         f"The transcript below is the ONLY source of truth. Do not invent, "
         f"assume, or infer any finding, decision, action item, deadline, or "
@@ -638,14 +666,26 @@ async def generate_summary(state: DialogueState, session_tags: dict) -> str:
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user",   "content": user_message},
                 ],
-                max_tokens=400,
+                max_tokens=1200,  # same thinking-budget headroom as generate_response()
                 temperature=0.1,  # was 0.3 — summarization should be low-creativity
                 timeout=30,
             )
         )
         elapsed = time.perf_counter() - t0
-        log.info(f"[dialogue:{state.session_id}] LLM complete summary call_id={call_id} ({elapsed:.1f}s)")
-        return response.choices[0].message.content.strip()
+        finish_reason = response.choices[0].finish_reason
+        log.info(
+            f"[dialogue:{state.session_id}] LLM complete summary call_id={call_id} "
+            f"({elapsed:.1f}s) finish_reason={finish_reason}"
+        )
+        raw = response.choices[0].message.content.strip()
+        summary = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+        if not summary:
+            log.warning(
+                f"[dialogue:{state.session_id}] summary call_id={call_id} returned EMPTY "
+                f"content (finish_reason={finish_reason}) — falling back to tag-based summary"
+            )
+            raise ValueError("empty summary content")
+        return summary
     except Exception as exc:
         log.warning(f"[dialogue:{state.session_id}] summary failed call_id={call_id}: {exc}")
         return (

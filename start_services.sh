@@ -111,6 +111,30 @@ remove_container() {
   fi
 }
 
+# ── force_remove_dir <path> ───────────────────────────────────────────────────
+# Plain `rm -rf` on a git clone can fail with "Permission denied": git marks
+# .git/objects/** files 0444 (read-only) on purpose, and on some setups
+# (e.g. Docker Desktop's bind-mount layer) that's enough to block deletion.
+# Restore write permissions first, then remove; only reach for sudo if that
+# still isn't enough, and say so explicitly rather than failing silently.
+force_remove_dir() {
+  local dir="$1"
+  [[ -e "$dir" ]] || return 0
+
+  chmod -R u+w "$dir" 2>/dev/null || true
+  if rm -rf "$dir" 2>/dev/null; then
+    success "Removed ${dir}."
+    return
+  fi
+
+  warn "Couldn't remove ${dir} without elevated permissions — retrying with sudo."
+  if sudo rm -rf "$dir"; then
+    success "Removed ${dir} (via sudo)."
+  else
+    warn "Failed to remove ${dir} even with sudo. Remove it manually: sudo rm -rf ${dir}"
+  fi
+}
+
 # ── wait_for_http <url> <timeout_secs> <interval_secs> ───────────────────────
 wait_for_http() {
   local url="$1" timeout="$2" interval="${3:-1}"
@@ -198,8 +222,11 @@ start_livekit() {
 
 SUPABASE_PROJECT_DIR="${SCRIPT_DIR}/supabase-project"
 SUPABASE_REPO_DIR="${SCRIPT_DIR}/.supabase-repo"
-# The guide's API gateway (Kong) listens on port 8000
-SUPABASE_API_PORT=8000
+# The guide's API gateway (Kong) listens on this port.
+# This is the single source of truth for the port — changing it here also
+# patches supabase-project/.env (KONG_HTTP_PORT) on a fresh install via
+# set_kong_port() below, so the two never drift out of sync.
+SUPABASE_API_PORT=8080
 # Compose project name — controls the container name prefix
 SUPABASE_COMPOSE_PROJECT="lab-brain-supabase"
 
@@ -264,11 +291,40 @@ if not pooler_changed and not db_changed:
 PYEOF
 }
 
+# Patches supabase-project/.env so Kong's HTTP port matches SUPABASE_API_PORT
+# instead of the upstream default (8000). Kong's container-side port (8000)
+# is untouched — only the HOST-side KONG_HTTP_PORT env var changes, which is
+# the correct way to do this (see docker-compose.yml: "${KONG_HTTP_PORT}:8000").
+# Safe to re-run: no-ops if KONG_HTTP_PORT already matches.
+set_kong_port() {
+  local env_file="$1"
+  local port="$2"
+  [[ -f "$env_file" ]] || die ".env file not found: ${env_file}"
+
+  if grep -q "^KONG_HTTP_PORT=${port}$" "$env_file"; then
+    info "KONG_HTTP_PORT already set to ${port} — nothing to do."
+    return
+  fi
+
+  if grep -q '^KONG_HTTP_PORT=' "$env_file"; then
+    sed -i "s|^KONG_HTTP_PORT=.*|KONG_HTTP_PORT=${port}|" "$env_file"
+  else
+    echo "KONG_HTTP_PORT=${port}" >> "$env_file"
+  fi
+  success "Set KONG_HTTP_PORT=${port} in ${env_file}."
+}
+
 start_supabase() {
   info "Setting up Supabase (official self-hosting guide)..."
 
-  # ── Step 1: sparse-clone docker/ from supabase/supabase ─────────────────
-  if [[ ! -d "$SUPABASE_REPO_DIR" ]]; then
+  local env_file="${SUPABASE_PROJECT_DIR}/.env"
+  local run_sh="${SUPABASE_PROJECT_DIR}/run.sh"
+  local compose_file="${SUPABASE_PROJECT_DIR}/docker-compose.yml"
+
+  # ── Steps 1-2: sparse-clone docker/ from supabase/supabase, then copy the
+  #    compose files into supabase-project/. Only done on a fresh install —
+  #    if supabase-project/ already exists we skip straight past this.
+  if [[ ! -d "$SUPABASE_PROJECT_DIR" ]]; then
     info "Sparse-cloning supabase/supabase docker/ into ${SUPABASE_REPO_DIR}..."
     git clone \
       --filter=blob:none \
@@ -282,28 +338,27 @@ start_supabase() {
     git -C "$SUPABASE_REPO_DIR" sparse-checkout set docker
     git -C "$SUPABASE_REPO_DIR" checkout --quiet
     success "Cloned supabase/supabase docker/ directory."
-  else
-    info "Repo already present at ${SUPABASE_REPO_DIR} — skipping clone."
-  fi
 
-  # ── Step 2: copy compose files into supabase-project/ ───────────────────
-  if [[ ! -d "$SUPABASE_PROJECT_DIR" ]]; then
     info "Creating project directory: ${SUPABASE_PROJECT_DIR}"
     mkdir -p "$SUPABASE_PROJECT_DIR"
     cp -rf "${SUPABASE_REPO_DIR}/docker/." "$SUPABASE_PROJECT_DIR/"
     # Copy the example .env — real secrets generated in step 3
     cp "${SUPABASE_REPO_DIR}/docker/.env.example" "${SUPABASE_PROJECT_DIR}/.env"
     success "Compose files copied to ${SUPABASE_PROJECT_DIR}."
-  else
-    info "Project directory already exists at ${SUPABASE_PROJECT_DIR} — skipping copy."
-  fi
 
-  local env_file="${SUPABASE_PROJECT_DIR}/.env"
-  local run_sh="${SUPABASE_PROJECT_DIR}/run.sh"
-  local compose_file="${SUPABASE_PROJECT_DIR}/docker-compose.yml"
+    # The sparse clone was only ever a means to get docker-compose.yml/.env
+    # into supabase-project/ — nothing after this point reads from it, so
+    # remove it rather than leaving a stray .git checkout lying around.
+    force_remove_dir "$SUPABASE_REPO_DIR"
+  else
+    info "Project directory already exists at ${SUPABASE_PROJECT_DIR} — skipping clone/copy."
+  fi
 
   # ── Step 2b: expose Postgres directly, bypass Supavisor ──────────────────
   patch_supabase_compose "$compose_file"
+
+  # ── Step 2c: move Kong off its default port ──────────────────────────────
+  set_kong_port "$env_file" "$SUPABASE_API_PORT"
 
   # ── Step 3: generate secrets (first-time only) ───────────────────────────
   local pg_pass

@@ -25,7 +25,7 @@ from app.pipeline.dialogue_service import (
     get_dialogue, assign_speaker, assign_speaker_words,
     update_mode, push_context, generate_response, clear_dialogue, ConvMode,
 )
-from app.pipeline.livekit_rooms import broadcast
+from app.pipeline.livekit_rooms import broadcast, get_known_identity
 
 log = logging.getLogger(__name__)
 
@@ -409,7 +409,9 @@ async def livekit_pipeline(
 
     async def _run_vision_analysis(jpeg_bytes: bytes) -> None:
         t0         = time.time()
-        state      = await vision.analyse_frame(session_id, jpeg_bytes)
+        state      = await vision.analyse_frame(
+            session_id, jpeg_bytes, known_identity=get_known_identity(session_id)
+        )
         latency_ms = round((time.time() - t0) * 1000)
 
         m = eval_metrics.get_metrics(session_id)

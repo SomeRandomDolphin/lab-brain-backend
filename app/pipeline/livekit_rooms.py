@@ -81,7 +81,7 @@ async def sse_stream(session_id: str) -> AsyncIterator[str]:
 
 # ── Token generation ──────────────────────────────────────────────────────────
 
-def create_token(session_id: str, identity: str, ttl_seconds: int = 3600) -> str:
+def create_token(session_id: str, identity: str, ttl_seconds: int = 3600, display_name: Optional[str] = None) -> str:
     if not LIVEKIT_AVAILABLE:
         raise RuntimeError("livekit-api package not installed")
     grants = VideoGrants(
@@ -93,7 +93,7 @@ def create_token(session_id: str, identity: str, ttl_seconds: int = 3600) -> str
     return (
         AccessToken(cfg.livekit.api_key, cfg.livekit.api_secret)
         .with_identity(identity)
-        .with_name(identity)
+        .with_name(display_name or identity)
         .with_grants(grants)
         .with_ttl(timedelta(seconds=ttl_seconds))
         .to_jwt()
@@ -167,6 +167,19 @@ _subscriber_tasks: dict[str, asyncio.Task] = {}
 # collect them while they are still awaiting frames from the LiveKit streams.
 _drain_tasks: dict[str, list[asyncio.Task]] = {}
 
+# The real display name of the (non-server) participant currently in the
+# room, keyed by session_id. Populated from LiveKit's own participant object
+# — which carries the name set via create_token()'s display_name — rather
+# than anything vision.py can see, since the VLM only ever produces generic
+# "Person A"/"Person B" labels with no notion of who that actually is.
+# Session_pipeline reads this to substitute the real name in place of the
+# generic label for whoever is recognized as the account holder.
+_known_identities: dict[str, str] = {}
+
+
+def get_known_identity(session_id: str) -> Optional[str]:
+    return _known_identities.get(session_id)
+
 
 def start_subscriber(session_id: str, pipeline_fn) -> None:
     if session_id in _subscriber_tasks:
@@ -217,6 +230,8 @@ async def stop_subscriber(session_id: str) -> None:
         if not drain.done():
             drain.cancel()
 
+    _known_identities.pop(session_id, None)
+
     log.info(f"[livekit] subscriber task stopped for {session_id}")
 
 
@@ -229,7 +244,10 @@ async def _subscriber_loop(session_id: str, pipeline_fn) -> None:
     video_q: asyncio.Queue = asyncio.Queue(maxsize=32)
 
     try:
-        server_token = create_token(session_id, identity="lab-brain-server", ttl_seconds=7200)
+        server_token = create_token(
+            session_id, identity="lab-brain-server", ttl_seconds=7200,
+            display_name="Lab Brain Agent",
+        )
     except Exception as exc:
         log.error(f"[livekit:{session_id}] create_token (server identity) failed: {exc}", exc_info=True)
         return
@@ -241,6 +259,11 @@ async def _subscriber_loop(session_id: str, pipeline_fn) -> None:
     def on_track(track, publication, participant):
         if participant.identity == SERVER_IDENTITY:
             return
+        # participant.name is whatever create_token()'s display_name set —
+        # i.e. the real account name once useSession.ts/livekit.py pass it
+        # through, falling back to the raw identity for older/guest tokens
+        # that never got a real display_name.
+        _known_identities[session_id] = participant.name or participant.identity
         log.info(
             f"[livekit:{session_id}] track subscribed: kind={track.kind} "
             f"participant={participant.identity} muted={publication.muted}"
