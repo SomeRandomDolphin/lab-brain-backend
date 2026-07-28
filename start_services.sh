@@ -111,6 +111,35 @@ remove_container() {
   fi
 }
 
+# ── port_in_use <port> ────────────────────────────────────────────────────────
+port_in_use() {
+  timeout 1 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/$1" 2>/dev/null
+}
+
+# ── wait_for_port_free <port> <timeout_secs> ──────────────────────────────────
+# `docker rm -f` returns as soon as the container object is gone, but the
+# docker-proxy process handling a published port (`-p host:container`) can
+# take a beat longer to release the socket — especially for a container that
+# failed mid-startup (e.g. a GPU device request failing after the port was
+# already bound). Re-running `docker run -p <port>:...` immediately after
+# `remove_container` can lose that race and fail with "address already in
+# use" even though nothing is really still using it. This just gives it a
+# short grace window instead of failing immediately.
+wait_for_port_free() {
+  local port="$1" timeout_s="${2:-10}" waited=0
+  while port_in_use "$port"; do
+    if (( waited >= timeout_s )); then
+      warn "Port ${port} still appears to be in use after ${timeout_s}s. If the next" \
+           "step fails with 'address already in use', check what's actually holding it:" \
+           "sudo lsof -i:${port}  (or)  sudo ss -ltnp | grep ${port}"
+      return 1
+    fi
+    sleep 0.5
+    waited=$((waited + 1))
+  done
+  return 0
+}
+
 # ── force_remove_dir <path> ───────────────────────────────────────────────────
 # Plain `rm -rf` on a git clone can fail with "Permission denied": git marks
 # .git/objects/** files 0444 (read-only) on purpose, and on some setups
@@ -413,7 +442,7 @@ start_supabase() {
     warn "IMPORTANT: Never run Supabase with the default .env.example passwords."
     echo ""
 
-    if [[ -x "${SUPABASE_PROJECT_DIR}/utils/generate-keys.sh" ]]; then
+    if [[ -f "${SUPABASE_PROJECT_DIR}/utils/generate-keys.sh" ]]; then
       info "Running utils/generate-keys.sh..."
       (cd "$SUPABASE_PROJECT_DIR" && sh utils/generate-keys.sh) \
         || die "generate-keys.sh failed."
@@ -435,10 +464,21 @@ start_supabase() {
       success "Minimal secrets written to ${env_file}."
     fi
 
-    if [[ -x "${SUPABASE_PROJECT_DIR}/utils/add-new-auth-keys.sh" ]]; then
+    # NOTE: utils/add-new-auth-keys.sh (below) is what's expected to bring
+    # ANON_KEY/SERVICE_ROLE_KEY in sync with JWT_SECRET when the openssl
+    # fallback above ran. If it's skipped or fails, ANON_KEY/SERVICE_ROLE_KEY
+    # can be left as .env.example's placeholder demo tokens (iss:
+    # "supabase-demo") — signed with a different, publicly-known secret —
+    # while JWT_SECRET has just been randomized. Every service that checks
+    # the token's signature (kong, auth, rest, storage, realtime) then
+    # rejects it with 403. If that happens, re-run
+    # `sh utils/add-new-auth-keys.sh` manually and restart the stack.
+    if [[ -f "${SUPABASE_PROJECT_DIR}/utils/add-new-auth-keys.sh" ]]; then
       info "Running utils/add-new-auth-keys.sh (asymmetric JWT keys)..."
       (cd "$SUPABASE_PROJECT_DIR" && sh utils/add-new-auth-keys.sh) \
         || warn "add-new-auth-keys.sh failed — JWT signing will use symmetric keys only."
+    else
+      warn "utils/add-new-auth-keys.sh not found in ${SUPABASE_PROJECT_DIR}/utils/ — skipping."
     fi
 
     echo ""
@@ -649,6 +689,7 @@ dialogue_model — or dialogue/QA calls will queue behind every vision call. Fix
   local ollama_num_parallel="1"
 
   remove_container "$OLLAMA_CONTAINER"
+  wait_for_port_free "$OLLAMA_PORT" 10
 
   info "Starting Ollama container (attempting GPU passthrough)..."
   gpu_err_log="$(mktemp)"
@@ -666,6 +707,7 @@ dialogue_model — or dialogue/QA calls will queue behind every vision call. Fix
     warn "GPU passthrough unavailable: $(tail -n1 "$gpu_err_log")"
     warn "Falling back to CPU. See notes below if you expected a GPU here."
     remove_container "$OLLAMA_CONTAINER"
+    wait_for_port_free "$OLLAMA_PORT" 10
     docker run -d \
       --name "$OLLAMA_CONTAINER" \
       -e OLLAMA_KEEP_ALIVE="${ollama_keep_alive}" \
