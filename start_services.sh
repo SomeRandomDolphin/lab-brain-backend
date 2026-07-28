@@ -455,12 +455,62 @@ start_supabase() {
     info "Existing secrets found in .env — skipping key generation."
   fi
 
-  # ── Step 4: pull images ──────────────────────────────────────────────────
+  # Re-read in case Step 3 just generated it — the earlier read may have
+  # captured the placeholder value.
+  pg_pass=$(grep '^POSTGRES_PASSWORD=' "$env_file" | cut -d= -f2- | tr -d '"' || true)
+
+  # ── Step 4: catch stale Postgres credentials before they cause a confusing
+  #    crash-loop ─────────────────────────────────────────────────────────
+  # Postgres only applies POSTGRES_PASSWORD (and roles.sql's admin roles:
+  # supabase_storage_admin, supabase_auth_admin, authenticator, supabase_admin)
+  # the FIRST time its data directory is initialized. If .env's password ever
+  # changes afterward (e.g. a re-run regenerated secrets, or the folder was
+  # copied from an older attempt), every service that authenticates as one of
+  # those roles fails with "password authentication failed" (28P01) — auth,
+  # rest, storage, and realtime all hit this; db/kong/studio don't, so it
+  # looks confusingly selective. Catch it up front instead of watching four
+  # containers crash-loop.
+  check_db_password_drift() {
+    local db_data_dir="${SUPABASE_PROJECT_DIR}/volumes/db/data"
+    local marker_file="${SUPABASE_PROJECT_DIR}/volumes/db/.postgres_password_sha256"
+    local current_hash
+    current_hash=$(printf '%s' "$pg_pass" | sha256sum | cut -d' ' -f1)
+
+    if [[ -d "$db_data_dir" ]] && [[ -n "$(ls -A "$db_data_dir" 2>/dev/null)" ]]; then
+      # Postgres has already been initialized at least once.
+      if [[ -f "$marker_file" ]]; then
+        local stored_hash
+        stored_hash=$(cat "$marker_file")
+        if [[ "$stored_hash" != "$current_hash" ]]; then
+          die "POSTGRES_PASSWORD in ${env_file} doesn't match the password Postgres was
+  initialized with — auth/rest/storage/realtime will crash-loop with
+  'password authentication failed' until this is fixed.
+  This is a fresh deploy, so the simplest fix is to wipe Postgres and let it
+  reinitialize with the current .env:
+    cd ${SUPABASE_PROJECT_DIR}
+    COMPOSE_PROJECT_NAME=${SUPABASE_COMPOSE_PROJECT} docker compose down
+    sudo rm -rf volumes/db/data volumes/db/.postgres_password_sha256
+    COMPOSE_PROJECT_NAME=${SUPABASE_COMPOSE_PROJECT} sh run.sh start
+  (Only do this if there's no real data in the DB yet.)"
+        fi
+      else
+        # Data dir predates this check — record the current hash so future
+        # runs can detect drift, without blocking this run.
+        echo "$current_hash" > "$marker_file"
+      fi
+    else
+      mkdir -p "$(dirname "$marker_file")"
+      echo "$current_hash" > "$marker_file"
+    fi
+  }
+  check_db_password_drift
+
+  # ── Step 5: pull images ──────────────────────────────────────────────────
   info "Pulling Supabase Docker images (may take a while on first run)..."
   (cd "$SUPABASE_PROJECT_DIR" && COMPOSE_PROJECT_NAME="$SUPABASE_COMPOSE_PROJECT" docker compose pull) \
     || die "docker compose pull failed. Check your internet connection."
 
-  # ── Step 5: start via run.sh ─────────────────────────────────────────────
+  # ── Step 6: start via run.sh ─────────────────────────────────────────────
   info "Starting Supabase stack via run.sh start..."
   if [[ -f "$run_sh" ]]; then
     (cd "$SUPABASE_PROJECT_DIR" && COMPOSE_PROJECT_NAME="$SUPABASE_COMPOSE_PROJECT" sh run.sh start) \
@@ -471,7 +521,7 @@ start_supabase() {
       || die "docker compose up failed. Check logs: cd ${SUPABASE_PROJECT_DIR} && COMPOSE_PROJECT_NAME=${SUPABASE_COMPOSE_PROJECT} docker compose logs"
   fi
 
-  # ── Step 6: extract keys and update config.json ──────────────────────────
+  # ── Step 7: extract keys and update config.json ──────────────────────────
   local anon_key publishable_key api_url
   publishable_key=$(grep -E '^(SUPABASE_PUBLISHABLE_KEY|ANON_KEY)=' "$env_file" \
     | head -1 | cut -d= -f2- | tr -d '"' || true)
