@@ -282,11 +282,55 @@ if marker in text and "- ${POSTGRES_PORT}:${POSTGRES_PORT}" not in text:
 with open(path, "w") as fh:
     fh.write(text)
 
+# ── 3. Give every healthcheck a real start_period ───────────────────────────
+# Several services (rest, auth, imgproxy, functions, kong) ship with NO
+# start_period at all, meaning Docker starts counting failed healthchecks
+# from the instant the container starts — not once it's had a fair chance to
+# boot. On a loaded VM (9+ containers competing for CPU/disk, Postgres still
+# running migrations) whichever container is momentarily slow loses the race
+# and gets torn down as "unhealthy", and it's a different one each run. This
+# adds a 30s start_period to any healthcheck missing one, and raises any
+# existing start_period under 30s — failures during start_period don't count
+# against the retry budget, so a slow (but fine) boot no longer looks fatal.
+hc_changed = False
+
+def _add_start_period(m):
+    global hc_changed
+    hc_changed = True
+    return m.group(0) + f"{m.group(1)}start_period: 30s\n"
+
+text = re.sub(
+    r"^(      )retries: \d+\n(?!      start_period)",
+    _add_start_period,
+    text,
+    flags=re.M,
+)
+
+def _bump_start_period(m):
+    global hc_changed
+    indent, seconds = m.group(1), int(m.group(2))
+    if seconds < 30:
+        hc_changed = True
+        return f"{indent}start_period: 30s\n"
+    return m.group(0)
+
+text = re.sub(
+    r"^(      )start_period: (\d+)s\n",
+    _bump_start_period,
+    text,
+    flags=re.M,
+)
+
+with open(path, "w") as fh:
+    fh.write(text)
+
 if pooler_changed:
     print("[patch_supabase_compose] commented out the supavisor service block")
 if db_changed:
     print("[patch_supabase_compose] exposed db on ${POSTGRES_PORT}:${POSTGRES_PORT}")
-if not pooler_changed and not db_changed:
+if hc_changed:
+    print("[patch_supabase_compose] gave healthchecks a 30s start_period")
+if not pooler_changed and not db_changed and not hc_changed:
     print("[patch_supabase_compose] already patched — nothing to do")
 PYEOF
 }
