@@ -150,6 +150,31 @@ def _apply(dataclass_obj, raw: dict) -> None:
             setattr(dataclass_obj, key, val)
 
 
+def _looks_like_jwt(token: str) -> bool:
+    """
+    Cheap sanity check, not a real JWT validator: a Supabase service/anon
+    key is a JWT — three '.'-separated segments, each valid base64url.
+    This exists to catch one specific failure mode at startup instead of
+    at the first storage upload: a stale/corrupted SUPABASE_SERVICE_KEY
+    (truncated during copy-paste, a stray trailing newline/space, an old
+    rotated key still sitting in .env) currently fails silently here and
+    only surfaces later as a cryptic 403 "Failed to base64url decode the
+    signature" the first time something tries to use it for a Storage
+    call.
+    """
+    import base64
+    parts = token.split(".")
+    if len(parts) != 3:
+        return False
+    for part in parts:
+        padded = part + "=" * (-len(part) % 4)
+        try:
+            base64.urlsafe_b64decode(padded)
+        except Exception:
+            return False
+    return True
+
+
 def load(path: Path = CONFIG_PATH) -> Config:
     # Don't rely on main.py having already called load_env() before this
     # module gets imported. `cfg = load()` below runs exactly once, at
@@ -162,8 +187,27 @@ def load(path: Path = CONFIG_PATH) -> Config:
     # being read" when it's really an import-order race. load_env() is
     # documented as idempotent/cheap to call repeatedly, so calling it here
     # too removes the dependency on being imported after main.py's call.
+    #
+    # override=True: .env is now the source of truth, full stop — it always
+    # wins, even over a real OS-level env var of the same name. This is a
+    # deliberate change from env.py's documented default (real env wins),
+    # made specifically because a stale SUPABASE_SERVICE_KEY sitting in the
+    # real Windows environment was silently shadowing a correct, freshly
+    # edited .env value and causing storage uploads to fail with a cryptic
+    # 403 "Failed to base64url decode the signature". Editing .env should
+    # always be enough to change what the app sees, with no separate step
+    # to also clear/update a shell-level variable.
+    #
+    # Tradeoff to know about: if this app is ever deployed somewhere that
+    # intentionally injects secrets as real environment variables (Docker,
+    # Render, Railway, etc. — the exact scenario env.py's default was
+    # designed for) AND a .env file happens to exist in that environment
+    # too, .env would now win there as well. That's fine as long as no
+    # .env file ships to production; if it ever might, this should go back
+    # to the default override=False (or override just the Supabase keys
+    # specifically) before deploying.
     from app.core.env import load_env
-    load_env()
+    load_env(override=True)
 
     if not path.exists():
         log.warning(f"config.json not found at {path} — using defaults.")
@@ -228,6 +272,14 @@ def load(path: Path = CONFIG_PATH) -> Config:
             "[config] SUPABASE_SERVICE_KEY not found in the real environment or .env — "
             "falling back to the key hardcoded in config.json. Set SUPABASE_SERVICE_KEY "
             "in your .env instead; config.json is not meant to hold secrets long-term."
+        )
+    if c.supabase.key and not _looks_like_jwt(c.supabase.key):
+        log.warning(
+            f"[config] SUPABASE_SERVICE_KEY (resolved from {key_source}) doesn't look "
+            "like a valid JWT (expected 3 '.'-separated base64url segments). Storage "
+            "uploads will likely fail with a cryptic 403 'Failed to base64url decode "
+            "the signature' error the first time they run. Double-check the value in "
+            "your .env file — it's now always the source of truth for this key."
         )
 
     log.info(

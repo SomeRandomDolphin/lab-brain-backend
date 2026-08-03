@@ -14,6 +14,7 @@ import logging
 import re
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -21,6 +22,17 @@ from app.core.config import cfg
 from app.services import privacy as _privacy
 
 log = logging.getLogger(__name__)
+
+# Dedicated executor for vision LLM calls. Previously these went through
+# run_in_executor(None, ...) — the shared default ThreadPoolExecutor also
+# used by ASR (transcribe), diarization, and frame encoding. Vision calls
+# were fine at ~2.2s each, but once max_tokens was raised to fix the
+# thinking-truncation bug, calls started taking 4-10s (full reasoning pass).
+# A vision call now holding a shared worker thread for 10s at a time was
+# starving ASR/diarization of workers and freezing transcription on the
+# frontend. Giving vision its own small pool means a slow vision call can
+# never block the audio pipeline again.
+_vision_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="vision-llm")
 
 try:
     from openai import OpenAI
@@ -146,7 +158,7 @@ async def analyse_frame(session_id: str, jpeg_bytes: bytes, known_identity: Opti
     t0 = time.perf_counter()
     try:
         response = await loop.run_in_executor(
-            None,
+            _vision_executor,
             lambda: _client.chat.completions.create(
                 model=cfg.local_llm.vision_model,
                 messages=[{
@@ -156,14 +168,24 @@ async def analyse_frame(session_id: str, jpeg_bytes: bytes, known_identity: Opti
                         {"type": "text", "text": _VISION_PROMPT},
                     ],
                 }],
-                max_tokens=300,
+                max_tokens=4096,
                 temperature=0.0,
                 timeout=30,  # fail fast instead of silently retrying/hanging
             )
         )
         elapsed = time.perf_counter() - t0
-        log.info(f"[vision:{session_id}] LLM complete frame call_id={call_id} ({elapsed:.1f}s)")
-        raw    = response.choices[0].message.content.strip()
+        finish_reason = response.choices[0].finish_reason
+        log.info(
+            f"[vision:{session_id}] LLM complete frame call_id={call_id} "
+            f"({elapsed:.1f}s) finish_reason={finish_reason}"
+        )
+        raw = response.choices[0].message.content.strip()
+        if not raw:
+            log.warning(
+                f"[vision:{session_id}] call_id={call_id} returned EMPTY content "
+                f"(finish_reason={finish_reason}) — likely thinking-budget exhaustion "
+                f"if finish_reason is 'length'"
+            )
         parsed = _extract_json(session_id, raw)
 
         raw_speakers = parsed.get("present_speakers", [])
@@ -192,8 +214,21 @@ async def analyse_frame(session_id: str, jpeg_bytes: bytes, known_identity: Opti
                     gated_speakers.append(sp)
                     gated_cues[sp] = raw_cues.get(sp, "unknown")
                 else:
+                    # Anonymization already destroys any way to tell one
+                    # unidentified face from another within this frame — the
+                    # VLM's raw labels ("Person A"/"Person B") aren't stable
+                    # identities to begin with, so multiple raw detections
+                    # that all fail the privacy gate can only honestly mean
+                    # "at least one unidentified person", never "N distinct
+                    # people". Appending the same literal string once per
+                    # raw detection previously let a single frame with 2+
+                    # (often hallucinated/duplicate) raw detections inflate
+                    # present_speakers with copies of an identical,
+                    # undifferentiable label — which is also what was
+                    # causing duplicate React keys on the frontend.
                     anon = "Person (anon)"
-                    gated_speakers.append(anon)
+                    if anon not in gated_speakers:
+                        gated_speakers.append(anon)
                     gated_cues[anon] = "unknown"
 
         state.present_speakers = gated_speakers

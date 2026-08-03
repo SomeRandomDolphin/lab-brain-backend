@@ -24,14 +24,17 @@ from app.pipeline.asr import VadChunker, transcribe, resample_livekit_frame
 from app.pipeline.dialogue_service import (
     get_dialogue, assign_speaker, assign_speaker_words,
     update_mode, push_context, generate_response, clear_dialogue, ConvMode,
+    QA_FOLLOW_UP_WINDOW_SECONDS,
 )
 from app.pipeline.livekit_rooms import broadcast, get_known_identity
 
 log = logging.getLogger(__name__)
 
-SAMPLE_RATE           = cfg.vad.sample_rate
-SILENCE_THRESHOLD     = cfg.vad.silence_threshold
-VISION_FRAME_INTERVAL = cfg.vision.frame_interval
+SAMPLE_RATE       = cfg.vad.sample_rate
+SILENCE_THRESHOLD = cfg.vad.silence_threshold
+# VISION_FRAME_INTERVAL decimation now happens in livekit_rooms.py's
+# _drain_video (before the JPEG encode), which reads cfg.vision.frame_interval
+# directly — see _process_video below.
 
 # Sessions with a QA reply currently generating. generate_response() is a
 # slow local-LLM call (many seconds), and clear_summon() used to only run
@@ -94,6 +97,29 @@ async def _handle_qa_sse(session_id, dlg, full_text, retriever, mode, tts_queue)
     # reply finished. It's now consumed at task-creation time in
     # _handle_segment instead — see _qa_in_flight comment above for why.
 
+    # ── Exit QA mode now that the reply has been delivered ───────────────
+    # update_mode()'s FSM only transitions OUT of QA via rule 3: a LATER
+    # segment carrying >=3 words of non-summoned speech. Nothing in that
+    # FSM ever runs again just because this task finished — so if nobody
+    # happens to speak a full sentence after the question, dlg.mode sits on
+    # QA indefinitely and the frontend's mode indicator looks permanently
+    # stuck, even though the summon button itself already reset. Return to
+    # MEETING_CAPTURE/AMBIENT here explicitly instead of waiting on a
+    # hypothetical future utterance. Guarded on dlg.mode == QA in case a
+    # concurrent segment already moved it on while this call was in flight.
+    if dlg.mode == ConvMode.QA:
+        perc_state = vision.get_state(session_id)
+        dlg.mode = ConvMode.MEETING_CAPTURE if perc_state.present_speakers else ConvMode.AMBIENT
+        dlg.mode_entered_at = time.time()
+        # Arm a short follow-up window so a question right after this reply
+        # doesn't need the wake word / summon button again — see rule 2b in
+        # dialogue_service.update_mode(). Only worth arming if a reply was
+        # actually delivered; on failure/empty reply there's nothing to
+        # follow up on, so leave it unarmed.
+        if reply:
+            dlg.qa_follow_up_until = time.time() + QA_FOLLOW_UP_WINDOW_SECONDS
+        broadcast(session_id, {"type": "mode_change", "mode": dlg.mode.value})
+
 
 # ── Main pipeline coroutine ───────────────────────────────────────────────────
 
@@ -112,9 +138,31 @@ async def livekit_pipeline(
     metrics       = eval_metrics.get_metrics(session_id)
     tts_queue: asyncio.Queue = asyncio.Queue()
     segment_index = 0
-    frame_counter = 0
     _known_speakers: set[str] = set()
     _wx_align_cache: dict     = {}
+
+    # _process_audio runs on every raw LiveKit audio frame (~50/sec at a
+    # typical 20ms Opus frame size). Both "still buffering" and "segment
+    # dropped as silence" below used to broadcast a "listening" SSE event on
+    # EVERY one of those frames, so the frontend received ~50 "listening"
+    # events/sec continuously for the whole session — a firehose of no-op
+    # updates that, combined with a full-store Zustand subscription on the
+    # frontend, produced a near-continuous re-render loop (see useSSE.ts /
+    # page.tsx fix). "listening" only needs to signal a STATE CHANGE
+    # (not-listening -> listening), so track the last broadcast state and
+    # only emit when it actually flips.
+    _last_listening_state: Optional[bool] = None
+
+    def _broadcast_listening() -> None:
+        nonlocal _last_listening_state
+        if _last_listening_state is True:
+            return
+        _last_listening_state = True
+        broadcast(session_id, {
+            "type":     "listening",
+            "mode":     dlg.mode.value,
+            "summoned": _capture.is_summoned(session_id),
+        })
 
     log.info(f"[pipeline:{session_id}] started")
     broadcast(session_id, {"type": "session", "session_id": session_id})
@@ -144,18 +192,14 @@ async def livekit_pipeline(
     # segment_q for the (slow) heavy stage below, rather than processed here.
 
     async def _process_audio(raw_frame) -> None:
-        nonlocal segment_index
+        nonlocal segment_index, _last_listening_state
 
         pcm_f32 = resample_livekit_frame(raw_frame)
         request_received_at = time.time()
         segment_audio = chunker.push(pcm_f32)
 
         if segment_audio is None:
-            broadcast(session_id, {
-                "type":     "listening",
-                "mode":     dlg.mode.value,
-                "summoned": _capture.is_summoned(session_id),
-            })
+            _broadcast_listening()
             return
 
         # NOTE: this used to gate on SILENCE_THRESHOLD * 2 (0.06 with the
@@ -174,12 +218,14 @@ async def livekit_pipeline(
             #     f"(rms={seg_rms:.5f} < {SILENCE_THRESHOLD:.5f}, "
             #     f"{len(segment_audio)} samples / {len(segment_audio) / SAMPLE_RATE:.2f}s)"
             # )
-            broadcast(session_id, {
-                "type":     "listening",
-                "mode":     dlg.mode.value,
-                "summoned": _capture.is_summoned(session_id),
-            })
+            _broadcast_listening()
             return
+
+        # A real (non-silent) segment is being handed off for transcription —
+        # we're leaving the "listening" state, so the NEXT buffering frame
+        # after this should announce "listening" again rather than staying
+        # silently suppressed by the guard above.
+        _last_listening_state = False
 
         segment_index += 1
         # Handing off here (instead of `await`ing the heavy chain inline) is
@@ -385,18 +431,21 @@ async def livekit_pipeline(
                 )
 
     # ── Video processor: fast stage (runs in the hot per-frame loop) ─────────
-    # Only selects every VISION_FRAME_INTERVAL-th frame and hands it off — it
-    # must never `await` vision inference directly, or it stalls draining
-    # video_q the same way the old inline ASR/diarization stalled audio_q.
+    # Frames arriving here are already decimated to every VISION_FRAME_INTERVAL-
+    # th frame (see livekit_rooms.py's _drain_video). This stage must never
+    # `await` vision inference directly, or it stalls draining video_q the
+    # same way the old inline ASR/diarization stalled audio_q.
 
     _vision_latest: Optional[bytes] = None
     _vision_event = asyncio.Event()
 
     async def _process_video(jpeg_bytes: bytes) -> None:
-        nonlocal frame_counter, _vision_latest
-        frame_counter += 1
-        if frame_counter % VISION_FRAME_INTERVAL != 0:
-            return
+        nonlocal _vision_latest
+        # VISION_FRAME_INTERVAL decimation now happens upstream, in
+        # livekit_rooms.py's _drain_video, before the RGBA convert + JPEG
+        # encode — every jpeg_bytes that reaches this function has already
+        # passed that filter, so filtering again here would decimate twice
+        # (frame_interval=5 would become an effective 1-in-25, not 1-in-5).
 
         # Latest-frame-wins: if the vision worker is still busy with a
         # previous frame, overwrite the pending slot rather than queuing —
@@ -514,13 +563,46 @@ async def livekit_pipeline(
             except Exception:
                 log.exception(f"[pipeline:{session_id}] _process_video raised unexpectedly")
 
+    # Minimum time between successive vision dispatches (start-to-start).
+    # The previous version derived this from cfg.vision.camera_fps (5),
+    # giving a 0.2s floor — meaningless, since every real call already
+    # takes 4-8s on its own, so `remaining` was always negative and
+    # asyncio.sleep() never actually fired. This is a real, deliberate cap:
+    # check the vision LLM at most once every 10s, explicitly, regardless
+    # of how fast any individual call happens to come back. That leaves
+    # much more idle time on Ollama's single request slot for QA calls to
+    # land in without queueing behind a passive perception check.
+    _VISION_MIN_INTERVAL = 10.0
+
     async def _vision_worker() -> None:
+        last_dispatch_at = 0.0
         while True:
             await _vision_event.wait()
             _vision_event.clear()
             jpeg_bytes = _vision_latest
             if jpeg_bytes is None:
                 continue
+
+            # Let a user-facing QA reply have Ollama's single request slot
+            # uncontested. Skipping this frame (rather than blocking here)
+            # keeps the worker responsive to _vision_event — the next frame
+            # that arrives once QA finishes will be picked up normally.
+            if session_id in _qa_in_flight:
+                continue
+
+            since_last = time.time() - last_dispatch_at
+            if since_last < _VISION_MIN_INTERVAL:
+                # Not our turn yet. Sleep out the remainder, but re-check
+                # _qa_in_flight afterwards rather than dispatching blindly —
+                # a QA call may have started during this wait.
+                await asyncio.sleep(_VISION_MIN_INTERVAL - since_last)
+                if session_id in _qa_in_flight:
+                    continue
+                # A newer frame may have arrived while we waited; use it —
+                # same latest-frame-wins principle as everywhere else here.
+                jpeg_bytes = _vision_latest
+
+            last_dispatch_at = time.time()
             try:
                 await _run_vision_analysis(jpeg_bytes)
             except asyncio.CancelledError:

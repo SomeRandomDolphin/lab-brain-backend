@@ -23,9 +23,9 @@ Supabase Storage buckets (supabase-py):
 
 Required environment variables
 -------------------------------
-  SUPABASE_DB_URL   postgresql+asyncpg://postgres:<pw>@db.<ref>.supabase.co:5432/postgres
-  SUPABASE_URL      https://<project>.supabase.co          (Storage only)
-  SUPABASE_KEY      service_role or anon key               (Storage only)
+  SUPABASE_DB_URL      postgresql+asyncpg://postgres:<pw>@db.<ref>.supabase.co:5432/postgres
+  SUPABASE_URL         https://<project>.supabase.co          (Storage only)
+  SUPABASE_SERVICE_KEY service_role or anon key                (Storage only)
 
 Schema migrations
 -----------------
@@ -553,7 +553,7 @@ async def connectivity_status() -> dict:
     return {
         "db_url_configured":     bool(db_url),
         "storage_url_configured": bool(os.environ.get("SUPABASE_URL")),
-        "storage_key_configured": bool(os.environ.get("SUPABASE_KEY")),
+        "storage_key_configured": bool(os.environ.get("SUPABASE_SERVICE_KEY")),
         "db_reachable":          reachable,
         "storage_available":     client is not None,
     }

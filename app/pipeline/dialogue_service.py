@@ -112,6 +112,16 @@ try:
 except ImportError:
     LOCAL_LLM_AVAILABLE = False
 
+# Dedicated executor for dialogue LLM network calls (generate_response/qa,
+# summarize). Same rationale as vision's _vision_executor: these calls used
+# run_in_executor(None, ...) — the shared default executor also used by
+# diarization and (via vision.py/livekit_rooms.py) ASR-adjacent work. A
+# single QA call can legitimately hold a thread for 5-10s+ with a thinking
+# model; keeping that off the shared pool means it can't stall diarization
+# or frame draining while it's in flight.
+from concurrent.futures import ThreadPoolExecutor
+_dialogue_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dialogue-llm")
+
 _SYSTEM_PROMPT = (
     "You are Lab Brain, a helpful AI assistant embedded in a research "
     "laboratory meeting room. You are concise (≤2 sentences), professional, "
@@ -259,6 +269,12 @@ _DENY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# How long after a QA reply a follow-up question is still routed to QA
+# without needing to re-summon (wake word / button click) first. See rule
+# 2b in update_mode() and the re-arming in session_pipeline.py's
+# _handle_qa_sse.
+QA_FOLLOW_UP_WINDOW_SECONDS = 15.0
+
 
 def _is_affirmation(text: str) -> bool:
     return bool(_AFFIRM_RE.search(text))
@@ -280,6 +296,13 @@ class DialogueState:
     CONTEXT_WINDOW:       int           = field(default_factory=lambda: cfg.dialogue.context_window)
     confirmation_pending: Optional[str] = None
     _speaker_counter:     int           = field(default=0, repr=False)
+    _speaker_map:         dict          = field(default_factory=dict, repr=False)
+    # Timestamp (time.time()) until which a non-summoned utterance that
+    # looks like a question should still be routed to QA. 0 = no active
+    # follow-up window. Re-armed by session_pipeline.py after each QA
+    # reply; consumed (reset to 0) the moment it's used or the session is
+    # manually dismissed. See QA_FOLLOW_UP_WINDOW_SECONDS.
+    qa_follow_up_until:   float         = 0.0
 
     def push_context(self, speaker: str, text: str) -> None:
         self.transcript_context.append(f"{speaker}: {text}")
@@ -350,8 +373,6 @@ async def assign_speaker(
 
             dominant_raw = max(duration_per_speaker, key=duration_per_speaker.get)
 
-            if not hasattr(state, "_speaker_map"):
-                state._speaker_map: dict[str, str] = {}
             if dominant_raw not in state._speaker_map:
                 idx = len(state._speaker_map)
                 state._speaker_map[dominant_raw] = (
@@ -391,9 +412,6 @@ async def assign_speaker_words(
             None,
             lambda: pipeline({"waveform": torch.from_numpy(wav).unsqueeze(0), "sample_rate": _SAMPLE_RATE}),
         )
-
-        if not hasattr(state, "_speaker_map"):
-            state._speaker_map = {}
 
         turns: list[tuple[float, float, str]] = []
         for start, end, raw_label in _extract_turns(diarization):
@@ -481,6 +499,24 @@ def update_mode(
     if transcript and summoned:
         state.mode = ConvMode.QA
         state.mode_entered_at = time.time()
+        state.qa_follow_up_until = 0.0  # consumed; re-armed after the reply
+        return state.mode, None
+
+    # 2b. Follow-up window → QA, without needing the wake word again.
+    # Only for something that reads like an actual question/command --
+    # ordinary conversation during this window should still fall through
+    # to rule 3 as normal meeting capture, so two people continuing to
+    # chat right after a reply doesn't get silently routed to the agent.
+    if (
+        transcript
+        and not summoned
+        and state.qa_follow_up_until
+        and time.time() < state.qa_follow_up_until
+        and _looks_like_question(transcript)
+    ):
+        state.mode = ConvMode.QA
+        state.mode_entered_at = time.time()
+        state.qa_follow_up_until = 0.0  # consumed; re-armed after the reply
         return state.mode, None
 
     # 3. Active transcript (non-summoned) → silent MEETING_CAPTURE
@@ -498,6 +534,41 @@ def update_mode(
         return state.mode, None
 
     return state.mode, utterance
+
+
+def force_exit_qa(session_id: str) -> Optional[ConvMode]:
+    """
+    Manually force a session out of QA mode. This is the escape hatch behind
+    the summon button's "dismiss" action.
+
+    update_mode()'s FSM (and _handle_qa_sse's automatic revert in
+    session_pipeline.py) both bring QA back to MEETING_CAPTURE/AMBIENT on
+    their own -- but only once a segment or an LLM reply actually completes.
+    If the LLM call is still in flight, hung, or a segment never arrives,
+    there was previously no way for the user to get back to a listening
+    state at all. This lets the "dismiss" click bypass all of that and reset
+    the mode immediately, regardless of what the pipeline is doing.
+
+    Returns the new mode, or None if there's no active dialogue state for
+    this session_id (e.g. it was never summoned, or the session already
+    ended).
+    """
+    state = _dialogue_states.get(session_id)
+    if state is None:
+        return None
+    if state.mode == ConvMode.QA:
+        state.mode = ConvMode.MEETING_CAPTURE
+        state.mode_entered_at = time.time()
+        # A manual dismiss means "I'm done talking to the agent" -- don't
+        # leave the follow-up window armed, or the very next sentence in
+        # the room could get silently routed back to QA.
+        state.qa_follow_up_until = 0.0
+        # Import here (not at module top) since livekit_rooms.py is one
+        # layer up the pipeline stack and doesn't otherwise need to be a
+        # dependency of dialogue_service.py just for this one broadcast.
+        from app.pipeline.livekit_rooms import broadcast
+        broadcast(session_id, {"type": "mode_change", "mode": state.mode.value})
+    return state.mode
 
 
 # ── Response generator ────────────────────────────────────────────────────────
@@ -543,7 +614,7 @@ async def generate_response(
         t0 = time.perf_counter()
         try:
             response = await loop.run_in_executor(
-                None,
+                _dialogue_executor,
                 lambda: _dialogue_client.chat.completions.create(
                     model=cfg.local_llm.dialogue_model,
                     messages=[{"role": "system", "content": _SYSTEM_PROMPT}] + history,
@@ -553,7 +624,7 @@ async def generate_response(
                     # with no error anywhere (200 OK, clean elapsed time) —
                     # the same failure mode vision.py had. Give it real
                     # headroom for thinking + the short answer.
-                    max_tokens=700,
+                    max_tokens=4096,
                     temperature=0.4,
                     timeout=30,  # fail fast instead of silently retrying/hanging
                 )
@@ -659,14 +730,14 @@ async def generate_summary(state: DialogueState, session_tags: dict) -> str:
     t0 = time.perf_counter()
     try:
         response = await loop.run_in_executor(
-            None,
+            _dialogue_executor,
             lambda: _dialogue_client.chat.completions.create(
                 model=cfg.local_llm.dialogue_model,
                 messages=[
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user",   "content": user_message},
                 ],
-                max_tokens=1200,  # same thinking-budget headroom as generate_response()
+                max_tokens=4096,  # same thinking-budget headroom as generate_response()
                 temperature=0.1,  # was 0.3 — summarization should be low-creativity
                 timeout=30,
             )

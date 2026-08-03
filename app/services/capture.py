@@ -154,6 +154,29 @@ def clear_summon(session_id: str) -> None:
     _summon_state.pop(session_id, None)
 
 
+def dismiss_agent(session_id: str) -> None:
+    """
+    Manual "dismiss agent" action (the summon button's DELETE path).
+
+    Deliberately NOT the same thing as clear_summon(): clear_summon() is
+    also called by session_pipeline.py's _handle_segment the instant QA
+    mode is entered, to consume the summon flag before the reply task is
+    spawned -- that happens on every QA turn, well before the user has any
+    chance to click dismiss. If this function's mode-reset were folded into
+    clear_summon() instead, it would fire at THAT point too and kill every
+    QA reply before it starts.
+
+    This is for the user-initiated case only: clear the summon flag (in
+    case a reply is still pending) AND force the dialogue state out of QA
+    immediately, regardless of whether a reply has finished generating.
+    See dialogue_service.force_exit_qa for why a dedicated escape hatch was
+    needed there.
+    """
+    _summon_state.pop(session_id, None)
+    from app.pipeline.dialogue_service import force_exit_qa
+    force_exit_qa(session_id)
+
+
 def force_summon(session_id: str) -> None:
     _summon_state[session_id] = True
 

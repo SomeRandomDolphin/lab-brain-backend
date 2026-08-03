@@ -415,8 +415,22 @@ def _encode_frame(rgba) -> bytes:
 async def _drain_video(track, q: asyncio.Queue) -> None:
     video_stream = lk_rtc.VideoStream(track, format=lk_rtc.VideoBufferType.I420)
     dropped = 0
+    frame_counter = 0
     loop = asyncio.get_event_loop()
     async for event in video_stream:
+        # Apply VISION_FRAME_INTERVAL here, BEFORE the RGBA convert + JPEG
+        # encode — this used to happen downstream in session_pipeline.py's
+        # _process_video, after every single incoming frame (typically
+        # 15-30fps from the browser) had already paid the CPU cost of
+        # _encode_frame via the shared default executor. That executor is
+        # also used by WhisperX ASR and diarization, so encoding frames that
+        # were just going to be discarded 4 times out of 5 (frame_interval=5)
+        # was pure wasted contention against the audio pipeline. Only frames
+        # that will actually be used ever get encoded now.
+        frame_counter += 1
+        if frame_counter % cfg.vision.frame_interval != 0:
+            continue
+
         frame = event.frame
         rgba = frame.convert(lk_rtc.VideoBufferType.RGBA)
         # PIL conversion + JPEG encode is CPU-bound. Doing it inline used to
