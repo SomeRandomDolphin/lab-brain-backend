@@ -127,7 +127,7 @@ def create_app() -> FastAPI:
         # (removed — supabase_auth.py no longer exposes those; auth is now
         # fully delegated to Supabase Auth/GoTrue and this module only
         # covers Postgres via SQLAlchemy + Storage via supabase-py).
-        from app.db.supabase_auth import connectivity_status
+        from app.db.supabase_client import connectivity_status
         try:
             status = await connectivity_status()
             log.info(f"[startup] Supabase connectivity: {status}")

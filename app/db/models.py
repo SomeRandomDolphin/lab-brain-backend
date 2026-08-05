@@ -22,6 +22,7 @@ from sqlalchemy import (
     DateTime,
     JSON,
 )
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import DeclarativeBase
 
 
@@ -41,7 +42,15 @@ class Session(Base):
     # Multi-tenancy: the account that created (owns) this session. NOT NULL —
     # every session is required to be created by an authenticated user as of
     # migration 0007. FK to auth.users(id) ON DELETE CASCADE.
-    user_id           = Column(String, nullable=False, index=True)
+    #
+    # PG_UUID(as_uuid=False): the actual Postgres column is `uuid`, not
+    # `varchar` — using plain String here made SQLAlchemy bind every
+    # parameter as ::VARCHAR, which Postgres refuses to compare/insert
+    # against a uuid column (asyncpg.UndefinedFunctionError /
+    # DatatypeMismatchError). as_uuid=False keeps the Python-side value a
+    # plain str (matching current_user["id"] everywhere it's passed in) —
+    # only the wire-level bind type changes, no call sites need to change.
+    user_id           = Column(PG_UUID(as_uuid=False), nullable=False, index=True)
     host_identity     = Column(String, nullable=False, default="browser-user")
     started_at        = Column(DateTime(timezone=True), nullable=False)
     ended_at          = Column(DateTime(timezone=True), nullable=True)
@@ -61,7 +70,8 @@ class SessionParticipant(Base):
     __tablename__ = "session_participants"
 
     session_id = Column(String, primary_key=True)
-    user_id    = Column(String, primary_key=True)
+    # Same fix as Session.user_id above — real column is uuid, not varchar.
+    user_id    = Column(PG_UUID(as_uuid=False), primary_key=True)
     joined_at  = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 
