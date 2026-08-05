@@ -122,28 +122,40 @@ def create_app() -> FastAPI:
         import app.services.capture as _capture  # noqa: F401
         log.info("[startup] app.services.capture imported (spaCy NER warm)")
 
-        # Warm up the Supabase auth client so the first request doesn't pay
-        # the cold-start cost and misconfiguration is caught at boot time.
+        # Surface Supabase misconfiguration at boot time rather than on the
+        # first request. Replaces the old _get_admin()/_get_anon() warm-up
+        # (removed — supabase_auth.py no longer exposes those; auth is now
+        # fully delegated to Supabase Auth/GoTrue and this module only
+        # covers Postgres via SQLAlchemy + Storage via supabase-py).
+        from app.db.supabase_auth import connectivity_status
         try:
-            from app.db.supabase_auth import _get_admin, _get_anon
-            _get_admin()
-            _get_anon()
-            log.info("[startup] Supabase Auth clients ready")
-        except RuntimeError as exc:
-            log.warning(f"[startup] Supabase Auth not configured: {exc}")
+            status = await connectivity_status()
+            log.info(f"[startup] Supabase connectivity: {status}")
+        except Exception as exc:
+            log.error(f"[startup] Supabase connectivity check failed: {exc}")
 
-        # Warm the LKC retrieval embedding model now, off the event loop, so
-        # the first `mode=qa` segment of a meeting doesn't pay for a
-        # synchronous ~420MB sentence-transformers download+load. This is
-        # exactly what fired mid-summon in a previous log (modules.json,
-        # model.safetensors, etc. downloading while a live segment was in
-        # flight). run_in_executor keeps the load off the event loop so it
-        # doesn't block /metrics or SSE polling while it happens — same
-        # reasoning as the spaCy warm-up above.
+        # Warm the LKC retrieval embedding model now so the first `mode=qa`
+        # segment of a meeting doesn't pay a cold-start on the embedding
+        # call. This used to be a synchronous ~420MB sentence-transformers
+        # download+load, wrapped in run_in_executor to keep it off the
+        # event loop (that's what fired mid-summon in a previous log —
+        # modules.json, model.safetensors, etc. downloading while a live
+        # segment was in flight).
+        #
+        # Since the qwen3-embedding switch, warmup() is a small async HTTP
+        # call to Ollama's /api/embed — not a blocking local load — so it's
+        # awaited directly here instead. Wrapping an async function in
+        # run_in_executor(None, _warmup_retrieval) would schedule the
+        # coroutine on a thread without ever awaiting it: it returns
+        # immediately with an unawaited coroutine object, "[startup] LKC
+        # retrieval embedding model warmed" logs regardless of whether the
+        # embed call actually happened, and Ollama never actually receives
+        # the warmup request — so it's important this isn't run_in_executor
+        # any more, not just unnecessary.
         import asyncio
         from app.services.lkc_retrieval import warmup as _warmup_retrieval
         try:
-            await asyncio.get_event_loop().run_in_executor(None, _warmup_retrieval)
+            await _warmup_retrieval()
             log.info("[startup] LKC retrieval embedding model warmed")
         except Exception as exc:
             log.error(f"[startup] LKC retrieval warmup failed: {exc}")

@@ -34,6 +34,11 @@ try:
         CreateRoomRequest,
         ListRoomsRequest,
         DeleteRoomRequest,
+        RoomCompositeEgressRequest,
+        EncodedFileOutput,
+        EncodedFileType,
+        S3Upload,
+        StopEgressRequest,
     )
     LIVEKIT_AVAILABLE = True
     log.info("[livekit] SDK loaded.")
@@ -160,6 +165,84 @@ async def delete_room(session_id: str) -> bool:
         return False
 
 
+# ── Egress (raw audio+video recording to Supabase Storage) ───────────────────
+#
+# This uses LiveKit's server-side Egress feature rather than hand-rolling a
+# JPEG-frame/audio-segment uploader: Egress records the actual room composite
+# (mixed audio+video, matching what a participant would see/hear) and streams
+# it directly to any S3-compatible endpoint — Supabase Storage speaks S3, so
+# no intermediate handling on this server is needed at all.
+#
+# NOTE ON CONFIG: this expects the following to exist on `cfg` — they aren't
+# in config.py yet since I don't have that file, so add them there:
+#   cfg.livekit.egress_enabled     (bool)
+#   cfg.supabase.s3_endpoint       (str, e.g. "https://<project>.supabase.co/storage/v1/s3")
+#   cfg.supabase.s3_bucket         (str)
+#   cfg.supabase.s3_region         (str — Supabase accepts a placeholder like "us-east-1" if unused)
+#   cfg.supabase.s3_access_key     (str)
+#   cfg.supabase.s3_secret_key     (str)
+#
+# Treat these as secrets (env vars), same as the existing Supabase service
+# key — do not commit them.
+
+async def start_egress(session_id: str) -> Optional[str]:
+    """Start a room-composite (single mixed file) recording, uploaded
+    directly to Supabase Storage via its S3-compatible endpoint. Returns the
+    egress_id (used to stop it later) or None if egress is disabled/unavailable.
+    """
+    if not LIVEKIT_AVAILABLE or not getattr(cfg.livekit, "egress_enabled", False):
+        return None
+
+    file_output = EncodedFileOutput(
+        file_type=EncodedFileType.MP4,
+        filepath=f"{session_id}/{session_id}-{int(time.time())}.mp4",
+        s3=S3Upload(
+            access_key=cfg.supabase.s3_access_key,
+            secret=cfg.supabase.s3_secret_key,
+            bucket=cfg.supabase.s3_bucket,
+            region=cfg.supabase.s3_region,
+            endpoint=cfg.supabase.s3_endpoint,
+            force_path_style=True,  # required for most S3-compatible (non-AWS) endpoints
+        ),
+    )
+    try:
+        async with LiveKitAPI(
+            url=cfg.livekit.url,
+            api_key=cfg.livekit.api_key,
+            api_secret=cfg.livekit.api_secret,
+        ) as api:
+            info = await api.egress.start_room_composite_egress(
+                RoomCompositeEgressRequest(
+                    room_name=session_id,
+                    audio_only=False,
+                    video_only=False,
+                    file_outputs=[file_output],
+                )
+            )
+        _egress_ids[session_id] = info.egress_id
+        log.info(f"[livekit:{session_id}] egress started: egress_id={info.egress_id}")
+        return info.egress_id
+    except Exception as exc:
+        log.error(f"[livekit:{session_id}] start_egress failed: {exc!r}", exc_info=True)
+        return None
+
+
+async def stop_egress(session_id: str) -> None:
+    egress_id = _egress_ids.pop(session_id, None)
+    if not egress_id:
+        return
+    try:
+        async with LiveKitAPI(
+            url=cfg.livekit.url,
+            api_key=cfg.livekit.api_key,
+            api_secret=cfg.livekit.api_secret,
+        ) as api:
+            await api.egress.stop_egress(StopEgressRequest(egress_id=egress_id))
+        log.info(f"[livekit:{session_id}] egress stopped: egress_id={egress_id}")
+    except Exception as exc:
+        log.warning(f"[livekit:{session_id}] stop_egress failed: {exc!r}")
+
+
 # ── Active subscriber tasks ───────────────────────────────────────────────────
 _subscriber_tasks: dict[str, asyncio.Task] = {}
 
@@ -167,18 +250,41 @@ _subscriber_tasks: dict[str, asyncio.Task] = {}
 # collect them while they are still awaiting frames from the LiveKit streams.
 _drain_tasks: dict[str, list[asyncio.Task]] = {}
 
-# The real display name of the (non-server) participant currently in the
-# room, keyed by session_id. Populated from LiveKit's own participant object
-# — which carries the name set via create_token()'s display_name — rather
-# than anything vision.py can see, since the VLM only ever produces generic
-# "Person A"/"Person B" labels with no notion of who that actually is.
+# The real display name of each (non-server) participant currently in the
+# room, keyed by (session_id -> participant_identity -> display_name).
+# Populated from LiveKit's own participant object — which carries the name
+# set via create_token()'s display_name — rather than anything vision.py can
+# see, since the VLM only ever produces generic "Person A"/"Person B" labels
+# with no notion of who that actually is.
 # Session_pipeline reads this to substitute the real name in place of the
 # generic label for whoever is recognized as the account holder.
-_known_identities: dict[str, str] = {}
+#
+# NOTE: this used to be dict[session_id, str] — a single slot per session.
+# In a multi-participant room, every participant's track-subscribed event
+# overwrote that one slot, so whichever participant's track happened to
+# subscribe last silently clobbered everyone else's name. Keying by
+# (session_id, participant_identity) keeps each participant's identity
+# independent.
+_known_identities: dict[str, dict[str, str]] = {}
 
 
-def get_known_identity(session_id: str) -> Optional[str]:
-    return _known_identities.get(session_id)
+# Active LiveKit Egress recording IDs, keyed by session_id, so the recording
+# can be stopped explicitly when the session ends rather than relying on
+# room deletion to implicitly kill it (which risks losing the tail of the
+# recording depending on how LiveKit's server handles that).
+_egress_ids: dict[str, str] = {}
+
+
+def get_known_identity(session_id: str, participant_identity: Optional[str] = None) -> Optional[str]:
+    identities = _known_identities.get(session_id, {})
+    if participant_identity is not None:
+        return identities.get(participant_identity)
+    # Back-compat / single-participant convenience: if exactly one identity
+    # is known for this session, return it; otherwise there's no single
+    # answer, so don't guess.
+    if len(identities) == 1:
+        return next(iter(identities.values()))
+    return None
 
 
 def start_subscriber(session_id: str, pipeline_fn) -> None:
@@ -263,7 +369,9 @@ async def _subscriber_loop(session_id: str, pipeline_fn) -> None:
         # i.e. the real account name once useSession.ts/livekit.py pass it
         # through, falling back to the raw identity for older/guest tokens
         # that never got a real display_name.
-        _known_identities[session_id] = participant.name or participant.identity
+        _known_identities.setdefault(session_id, {})[participant.identity] = (
+            participant.name or participant.identity
+        )
         log.info(
             f"[livekit:{session_id}] track subscribed: kind={track.kind} "
             f"participant={participant.identity} muted={publication.muted}"
@@ -279,10 +387,18 @@ async def _subscriber_loop(session_id: str, pipeline_fn) -> None:
                     exc_info=exc,
                 )
 
+        # Every track is tagged with participant.identity when it's pushed
+        # onto the shared queue. Previously this pushed the bare frame/jpeg
+        # with no indication of which participant it came from — with one
+        # remote participant that's harmless, but with several, frames from
+        # different people's tracks landed in the same queue indistinguishable
+        # from one another, which is what let them get merged into a single
+        # VadChunker/vision slot downstream as if they were one continuous
+        # feed. session_pipeline.py now keys per-participant state off this.
         if track.kind == lk_rtc.TrackKind.KIND_AUDIO:
-            t = asyncio.create_task(_drain_audio(track, audio_q))
+            t = asyncio.create_task(_drain_audio(participant.identity, track, audio_q))
         elif track.kind == lk_rtc.TrackKind.KIND_VIDEO:
-            t = asyncio.create_task(_drain_video(track, video_q))
+            t = asyncio.create_task(_drain_video(participant.identity, track, video_q))
         else:
             return
 
@@ -354,6 +470,7 @@ async def _subscriber_loop(session_id: str, pipeline_fn) -> None:
                     f"[livekit:{session_id}] *** CONNECTED *** "
                     f"sid={room.local_participant.sid}"
                 )
+                await start_egress(session_id)
                 break  # success
             except asyncio.CancelledError:
                 raise
@@ -384,16 +501,17 @@ async def _subscriber_loop(session_id: str, pipeline_fn) -> None:
             exc_info=True,
         )
     finally:
-        log.info(f"[livekit:{session_id}] finally: calling room.disconnect()")
+        log.info(f"[livekit:{session_id}] finally: stopping egress (if any) and disconnecting")
+        await stop_egress(session_id)
         await room.disconnect()
 
 
-async def _drain_audio(track, q: asyncio.Queue) -> None:
+async def _drain_audio(participant_identity: str, track, q: asyncio.Queue) -> None:
     audio_stream = lk_rtc.AudioStream(track)
     dropped = 0
     async for event in audio_stream:
         try:
-            q.put_nowait(event.frame)
+            q.put_nowait((participant_identity, event.frame))
         except asyncio.QueueFull:
             dropped += 1
             if dropped == 1 or dropped % 50 == 0:
@@ -412,7 +530,7 @@ def _encode_frame(rgba) -> bytes:
     return buf.getvalue()
 
 
-async def _drain_video(track, q: asyncio.Queue) -> None:
+async def _drain_video(participant_identity: str, track, q: asyncio.Queue) -> None:
     video_stream = lk_rtc.VideoStream(track, format=lk_rtc.VideoBufferType.I420)
     dropped = 0
     frame_counter = 0
@@ -440,7 +558,7 @@ async def _drain_video(track, q: asyncio.Queue) -> None:
         # even started. Offloading it lets frames keep draining in real time.
         jpeg_bytes = await loop.run_in_executor(None, _encode_frame, rgba)
         try:
-            q.put_nowait(jpeg_bytes)
+            q.put_nowait((participant_identity, jpeg_bytes))
         except asyncio.QueueFull:
             dropped += 1
             if dropped == 1 or dropped % 50 == 0:

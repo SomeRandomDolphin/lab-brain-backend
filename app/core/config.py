@@ -25,7 +25,7 @@ CONFIG_PATH = Path(__file__).parent.parent.parent / "config.json"
 
 @dataclass
 class LocalLLMConfig:
-    base_url:       str = "http://100.118.203.111:11434/v1"
+    base_url:       str = "http://100.122.56.39:11434/v1"
     api_key:        str = "ollama"
     vision_model:   str = "qwen3-vl:4b"
     dialogue_model: str = "qwen3:4b"
@@ -107,9 +107,10 @@ class LiveKitConfig:
         docker run --rm -p 7880:7880 livekit/livekit-server --dev
     Then set api_key="devkey", api_secret="devsecret".
     """
-    url:        str = "ws://100.118.203.111:7880"
-    api_key:    str = "devkey"
-    api_secret: str = "devsecret"
+    url:            str  = "ws://100.122.56.39:7880"
+    api_key:        str  = "devkey"
+    api_secret:     str  = "devsecret"
+    egress_enabled: bool = False
 
 
 @dataclass
@@ -123,6 +124,17 @@ class SupabaseConfig:
     key:          str  = ""
     store_audio:  bool = False
     store_vision: bool = True
+    # S3-compatible endpoint for LiveKit Egress uploads (Supabase Storage
+    # speaks S3). s3_endpoint is left blank here on purpose — if it's not
+    # set explicitly (via config.json or S3_ENDPOINT env var), load() below
+    # derives it from `url` as f"{url}/storage/v1/s3", which is correct for
+    # both self-hosted and cloud Supabase projects and means you don't need
+    # to set it separately from SUPABASE_URL in the common case.
+    s3_endpoint:    str = ""
+    s3_bucket:      str = ""
+    s3_region:      str = "us-east-1"  # placeholder; self-hosted Storage doesn't enforce this
+    s3_access_key:  str = ""
+    s3_secret_key:  str = ""
 
 
 @dataclass
@@ -282,11 +294,66 @@ def load(path: Path = CONFIG_PATH) -> Config:
             "your .env file — it's now always the source of truth for this key."
         )
 
+    # ── S3-compatible credentials (LiveKit Egress -> Supabase Storage) ────────
+    # Same env-wins-over-config.json precedence as the Supabase URL/key above,
+    # for the same reason: these are secrets and .env is the source of truth.
+    env_s3_access_key = (os.environ.get("S3_PROTOCOL_ACCESS_KEY_ID") or "").strip()
+    env_s3_secret_key = (os.environ.get("S3_PROTOCOL_ACCESS_KEY_SECRET") or "").strip()
+    env_s3_bucket     = (os.environ.get("S3_BUCKET") or "").strip()
+    env_s3_region     = (os.environ.get("S3_REGION") or "").strip()
+    env_s3_endpoint   = (os.environ.get("S3_ENDPOINT") or "").strip()
+
+    if env_s3_access_key:
+        c.supabase.s3_access_key = env_s3_access_key
+    if env_s3_secret_key:
+        c.supabase.s3_secret_key = env_s3_secret_key
+    if env_s3_bucket:
+        c.supabase.s3_bucket = env_s3_bucket
+    if env_s3_region:
+        c.supabase.s3_region = env_s3_region
+
+    if env_s3_endpoint:
+        c.supabase.s3_endpoint = env_s3_endpoint
+    elif not c.supabase.s3_endpoint and c.supabase.url:
+        # Derive from SUPABASE_URL rather than requiring a separate var in
+        # the common case — this is correct for both self-hosted Supabase
+        # (http://host:port/storage/v1/s3) and cloud projects
+        # (https://<project>.supabase.co/storage/v1/s3).
+        c.supabase.s3_endpoint = f"{c.supabase.url.rstrip('/')}/storage/v1/s3"
+
+    env_egress_enabled = (os.environ.get("LIVEKIT_EGRESS_ENABLED") or "").strip().lower()
+    if env_egress_enabled in ("1", "true", "yes"):
+        c.livekit.egress_enabled = True
+    elif env_egress_enabled in ("0", "false", "no"):
+        c.livekit.egress_enabled = False
+
+    if c.livekit.egress_enabled and not (c.supabase.s3_access_key and c.supabase.s3_secret_key and c.supabase.s3_bucket):
+        log.warning(
+            "[config] livekit.egress_enabled is True but S3 credentials/bucket are "
+            "incomplete (need S3_PROTOCOL_ACCESS_KEY_ID, S3_PROTOCOL_ACCESS_KEY_SECRET, "
+            "and S3_BUCKET) — recordings will fail to start until these are set."
+        )
+
+    # ── LiveKit connection (env-wins, same reasoning as Supabase above) ───────
+    # api_secret in particular is a real credential and previously had no env
+    # override at all — only config.json, which isn't meant to hold secrets
+    # long-term (self-hosted LiveKit's api_secret is exactly as sensitive as
+    # the Supabase service key above).
+    env_lk_url        = (os.environ.get("LIVEKIT_URL") or "").strip()
+    env_lk_api_key    = (os.environ.get("LIVEKIT_API_KEY") or "").strip()
+    env_lk_api_secret = (os.environ.get("LIVEKIT_API_SECRET") or "").strip()
+    if env_lk_url:
+        c.livekit.url = env_lk_url
+    if env_lk_api_key:
+        c.livekit.api_key = env_lk_api_key
+    if env_lk_api_secret:
+        c.livekit.api_secret = env_lk_api_secret
+
     log.info(
         f"Config loaded. LLM: {c.local_llm.base_url} | "
         f"summon_required={c.summon.require_summon} | "
         f"NER={c.spacy.model} | graph={c.lkc.db_file} | "
-        f"livekit={c.livekit.url} | "
+        f"livekit={c.livekit.url} (egress={'on' if c.livekit.egress_enabled else 'off'}) | "
         f"supabase={'configured' if c.supabase.url else 'disabled'}"
     )
     return c

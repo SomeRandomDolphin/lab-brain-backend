@@ -1,11 +1,15 @@
 """
 app/api/v1/endpoints/livekit.py — LiveKit room management endpoints.
 
-POST   /livekit/room          — create room, return session_id + signed token
-GET    /livekit/token         — re-issue token for guest join
-GET    /livekit/room/{sid}    — room status
-DELETE /livekit/room/{sid}    — end session, stop subscriber, push metrics to Supabase
+POST   /livekit/room          — create room, return session_id + signed token (login required)
+GET    /livekit/token         — join an existing room (login required — no more anonymous guests)
+GET    /livekit/room/{sid}    — room status (owner or participant)
+DELETE /livekit/room/{sid}    — end session, stop subscriber, push metrics to Supabase (owner only)
 GET    /events/{sid}          — SSE stream (replaces WebSocket endpoints)
+
+Confirmed decisions this file implements:
+  - Creating a room requires login; the session is owned by that account.
+  - Joining a room requires login too — no anonymous guests.
 """
 
 import time
@@ -13,9 +17,10 @@ import uuid
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from app.api.deps import get_current_user, require_session_access, require_session_owner
 from app.core.config import cfg
 from app.schemas import RoomCreateRequest, RoomCreateResponse
 from app.pipeline import livekit_rooms
@@ -37,7 +42,10 @@ def _get_pipeline():
 
 
 @router.post("/room", response_model=RoomCreateResponse)
-async def create_room(req: RoomCreateRequest = None):
+async def create_room(
+    req: RoomCreateRequest = None,
+    current_user: dict = Depends(get_current_user),
+):
     if req is None:
         req = RoomCreateRequest()
 
@@ -64,8 +72,13 @@ async def create_room(req: RoomCreateRequest = None):
     livekit_rooms.start_subscriber(session_id, _get_pipeline())
 
     try:
+        # user_id is set once here, at creation, from the authenticated
+        # requester — never trusted from the request body. host_identity
+        # stays the cosmetic display name; it is no longer the access
+        # boundary (that's sessions.user_id + session_participants now).
         await supabase_client.upsert_session(
             session_id=session_id,
+            user_id=current_user["id"],
             host_identity=req.display_name,
             started_at=time.time(),
         )
@@ -73,13 +86,24 @@ async def create_room(req: RoomCreateRequest = None):
         # Non-fatal: room is live, don't kill the session over a DB write
         log.error(f"[livekit] upsert_session failed (non-fatal): {exc}", exc_info=True)
 
-    log.info(f"[livekit] room created: {session_id} host={req.display_name}")
+    log.info(f"[livekit] room created: {session_id} host={req.display_name} owner={current_user['id']}")
     return RoomCreateResponse(session_id=session_id, token=token, lk_url=cfg.livekit.url)
 
 
 @router.get("/token")
-async def get_token(session_id: str, identity: str = "browser-user"):
-    """Issue a JWT for a guest joining an existing room."""
+async def get_token(
+    identity: Optional[str] = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+    session_id: str = Depends(require_session_access),
+):
+    """
+    Issue a JWT for an authenticated user joining an existing room.
+
+    Anonymous guest join is gone (per confirmed decision). `identity` stays
+    as an optional cosmetic display label for the LiveKit UI — it defaults
+    to the current user's name rather than the old shared "browser-user"
+    literal, since the participant is now a real authenticated account.
+    """
     if not livekit_rooms.LIVEKIT_AVAILABLE:
         return JSONResponse(status_code=503, content={"error": "LiveKit SDK not installed"})
     room_info = await livekit_rooms.get_room(session_id)
@@ -88,16 +112,27 @@ async def get_token(session_id: str, identity: str = "browser-user"):
             status_code=404,
             content={"error": f"Room '{session_id}' does not exist."},
         )
+
+    display_identity = identity or current_user.get("name") or current_user["email"]
+
     try:
-        token = livekit_rooms.create_token(session_id, identity=identity)
-        return {"session_id": session_id, "token": token, "lk_url": cfg.livekit.url}
+        token = livekit_rooms.create_token(session_id, identity=display_identity)
     except Exception as exc:
         return JSONResponse(status_code=500, content={"error": str(exc)})
 
+    # Record participation (no-op if already recorded, or if this user is
+    # the owner — an owner is already accessible via sessions.user_id).
+    try:
+        await supabase_client.add_session_participant(session_id, current_user["id"])
+    except Exception as exc:
+        log.error(f"[livekit] add_session_participant failed (non-fatal): {exc}", exc_info=True)
+
+    return {"session_id": session_id, "token": token, "lk_url": cfg.livekit.url}
+
 
 @router.get("/room/{session_id}")
-async def room_status(session_id: str):
-    """Return participant count and recording status for a room."""
+async def room_status(session_id: str = Depends(require_session_access)):
+    """Return participant count and recording status for a room. Owner or participant."""
     if not livekit_rooms.LIVEKIT_AVAILABLE:
         return JSONResponse(status_code=503, content={"error": "LiveKit SDK not installed"})
     info = await livekit_rooms.get_room(session_id)
@@ -107,8 +142,8 @@ async def room_status(session_id: str):
 
 
 @router.delete("/room/{session_id}")
-async def delete_room(session_id: str):
-    """End a session: stop subscriber, delete room, snapshot metrics to Supabase."""
+async def delete_room(session_id: str = Depends(require_session_owner)):
+    """End a session: stop subscriber, delete room, snapshot metrics to Supabase. Owner only."""
     # Stop subscriber and delete LiveKit room — always run these first.
     await livekit_rooms.stop_subscriber(session_id)
     deleted = await livekit_rooms.delete_room(session_id)
@@ -119,6 +154,8 @@ async def delete_room(session_id: str):
 
     # DB writes are best-effort — a ProgrammingError or schema mismatch
     # must never cause a 500 that blocks the frontend from completing teardown.
+    # No user_id passed here — this is a partial-update (ended_at only) and
+    # must NOT touch the existing owner. See supabase_client.upsert_session.
     try:
         await supabase_client.upsert_session(session_id=session_id, ended_at=ended_ts)
     except Exception as exc:
@@ -144,7 +181,7 @@ async def delete_room(session_id: str):
 
 
 @sse_router.get("/events/{session_id}")
-async def sse_events(session_id: str):
+async def sse_events(session_id: str = Depends(require_session_access)):
     """
     Server-Sent Events stream. Replaces /ws/asr, /ws/vision, /ws/tts.
     Event types: session, transcript, agent_reply, perception, mode_change, speak, listening, error.

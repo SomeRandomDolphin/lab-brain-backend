@@ -2,75 +2,163 @@
 app/services/lkc_retrieval.py — Dense LKC Retrieval Service.
 
 Sources documents from the SQLite LKC graph (supports cross-session Q&A).
-Primary model: all-mpnet-base-v2 (~420 MB).
-Fallback: all-MiniLM-L6-v2 (~22 MB) → TF-IDF.
+Embeddings are served by the same local Ollama instance the app already
+runs for dialogue/vision (see config.json → local_llm), instead of a
+separately-downloaded sentence-transformers model. This removes the
+`sentence-transformers==3.3.1` pin and the Windows/FFmpeg dependency
+issues that pin existed for entirely.
+
+Primary:  Ollama embedding model, via /api/embed
+          (config: local_llm.embedding_model, default "qwen3-embedding:0.6b")
+Fallback: TF-IDF (scikit-learn), used only if Ollama is unreachable —
+          e.g. the container hasn't finished starting, the host is down,
+          or embedding_model was never pulled.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from pathlib import Path
 from typing import Optional
+
+import httpx
+import numpy as np
 
 from app.db import lkc_graph
 
 log = logging.getLogger(__name__)
 
-_EMBED_MODEL_PRIMARY  = "sentence-transformers/all-mpnet-base-v2"
-_EMBED_MODEL_FALLBACK = "sentence-transformers/all-MiniLM-L6-v2"
+_DEFAULT_OLLAMA_BASE_URL = "http://100.122.56.39:11434"
+_DEFAULT_EMBED_MODEL     = "qwen3-embedding:0.6b"
 
-try:
-    from sentence_transformers import SentenceTransformer
-    import numpy as np
-    SBERT_AVAILABLE = True
-except ImportError:
-    SBERT_AVAILABLE = False
-    log.warning("[retrieval] sentence-transformers not installed — trying TF-IDF.")
+
+def _load_llm_config() -> tuple[str, str]:
+    """
+    Resolve (ollama_base_url, embedding_model) from config.json, walking
+    upward from this file's location rather than assuming a fixed relative
+    path — keeps this working if the service module ever moves. Falls back
+    to hardcoded defaults on a missing or malformed config.json so a bad
+    config degrades gracefully at import time instead of crashing the app.
+    """
+    here = Path(__file__).resolve()
+    for parent in (here.parent, *here.parents):
+        candidate = parent / "config.json"
+        if not candidate.is_file():
+            continue
+        try:
+            cfg = json.loads(candidate.read_text())
+            llm_cfg  = cfg.get("local_llm", {})
+            base_url = llm_cfg.get("base_url", _DEFAULT_OLLAMA_BASE_URL).rstrip("/")
+            # config.json's base_url is the OpenAI-compat path (".../v1")
+            # used by the dialogue/vision clients. Ollama's native
+            # embeddings endpoint lives one level up, at ".../api/embed" —
+            # strip a trailing "/v1" if present rather than requiring a
+            # second base_url entry in config.json to stay in sync.
+            if base_url.endswith("/v1"):
+                base_url = base_url[: -len("/v1")]
+            model = llm_cfg.get("embedding_model", _DEFAULT_EMBED_MODEL)
+            return base_url, model
+        except (json.JSONDecodeError, OSError) as exc:
+            log.warning(f"[retrieval] could not parse {candidate}: {exc} — using defaults.")
+            break
+    return _DEFAULT_OLLAMA_BASE_URL, _DEFAULT_EMBED_MODEL
+
+
+_OLLAMA_BASE_URL, _EMBED_MODEL = _load_llm_config()
+_OLLAMA_EMBED_URL = f"{_OLLAMA_BASE_URL}/api/embed"
+
+# Optimistic until a real call proves otherwise — unlike the old SBERT
+# import check, we can't know Ollama is reachable until we actually ask it.
+OLLAMA_AVAILABLE = True
 
 SKLEARN_AVAILABLE = False
-if not SBERT_AVAILABLE:
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity as _sk_cosine
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    log.warning("[retrieval] scikit-learn not installed — TF-IDF fallback disabled.")
+
+_http_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    """Lazily-created, reused client — avoids a new connection per QA turn."""
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(timeout=30.0)
+    return _http_client
+
+
+async def _ollama_embed(texts: list[str]) -> Optional[np.ndarray]:
+    """
+    Batch-embed `texts` via Ollama's native /api/embed endpoint, returning
+    L2-normalized float32 vectors (shape: len(texts) x dim), or None if
+    Ollama is unreachable, errors, or returns something unusable — the
+    caller falls back to TF-IDF in that case rather than crashing.
+
+    Normalization is done manually rather than trusted from the API:
+    some serving backends behind Ollama (e.g. llama-server) don't apply
+    --embd-normalize automatically, so assuming "the API already
+    normalizes it" is fragile across backend/version changes.
+    """
+    global OLLAMA_AVAILABLE
     try:
-        from sklearn.feature_extraction.text import TfidfVectorizer
-        from sklearn.metrics.pairwise import cosine_similarity as _sk_cosine
-        import numpy as np
-        SKLEARN_AVAILABLE = True
-    except ImportError:
-        log.warning("[retrieval] scikit-learn also missing — retrieval disabled.")
-
-_embed_model = None
-_embed_model_name: str = ""
-
-
-def warmup() -> None:
-    """
-    Force-load the embedding model synchronously. Call this from the
-    FastAPI startup hook (via run_in_executor, since this is a blocking
-    ~420MB download/load) so the cost is paid once at boot instead of
-    mid-meeting on the first QA/summon segment.
-    """
-    model = _get_embed_model()
-    if model is None:
-        log.warning(
-            "[retrieval] warmup: no SBERT backend available "
-            "(falling back to TF-IDF, or retrieval disabled if sklearn is also missing)."
+        client = _get_http_client()
+        resp = await client.post(
+            _OLLAMA_EMBED_URL,
+            json={"model": _EMBED_MODEL, "input": texts},
         )
-
-
-def _get_embed_model():
-    global _embed_model, _embed_model_name
-    if _embed_model is not None:
-        return _embed_model
-    if not SBERT_AVAILABLE:
+        resp.raise_for_status()
+        data = resp.json()
+        raw = np.array(data["embeddings"], dtype=np.float32)
+        norms = np.linalg.norm(raw, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1.0, norms)
+        if not OLLAMA_AVAILABLE:
+            log.info(f"[retrieval] Ollama embedding endpoint recovered ({_EMBED_MODEL}).")
+        OLLAMA_AVAILABLE = True
+        return raw / norms
+    except Exception as exc:
+        if OLLAMA_AVAILABLE:  # log once when it goes down, not on every call
+            log.warning(
+                f"[retrieval] Ollama embed call failed ({exc}) — "
+                + ("falling back to TF-IDF until it recovers." if SKLEARN_AVAILABLE
+                   else "retrieval disabled until it recovers (sklearn also missing).")
+            )
+        OLLAMA_AVAILABLE = False
         return None
-    for model_name in (_EMBED_MODEL_PRIMARY, _EMBED_MODEL_FALLBACK):
-        try:
-            _embed_model = SentenceTransformer(model_name)
-            _embed_model_name = model_name
-            log.info(f"[retrieval] embedding model loaded: {model_name}")
-            return _embed_model
-        except Exception as exc:
-            log.warning(f"[retrieval] could not load {model_name}: {exc}")
-    return None
+
+
+def _fit_tfidf(corpus: list[str]):
+    """CPU-bound; called via run_in_executor from _IndexEntry.build()."""
+    vectorizer = TfidfVectorizer(ngram_range=(1, 2), max_features=8000, sublinear_tf=True)
+    matrix = vectorizer.fit_transform(corpus)
+    return vectorizer, matrix
+
+
+async def warmup() -> None:
+    """
+    Fire a trivial embed call at startup so the embedding model is loaded
+    and resident on the Ollama side before the first real QA/summon
+    request needs it — same intent as start_services.sh's residency check
+    for vision_model/dialogue_model, just from the app side.
+
+    NOTE — behavior change from the sentence-transformers version: this is
+    now a small async HTTP call, not a ~420MB blocking model load. Call it
+    directly with `await warmup()` from the FastAPI startup hook instead of
+    wrapping it in run_in_executor; wrapping an async function in
+    run_in_executor won't await it correctly.
+    """
+    embeddings = await _ollama_embed(["warmup"])
+    if embeddings is None:
+        log.warning(
+            f"[retrieval] warmup: Ollama embedding endpoint unreachable at "
+            f"{_OLLAMA_EMBED_URL} (model={_EMBED_MODEL}). "
+            + ("Falling back to TF-IDF." if SKLEARN_AVAILABLE
+               else "Retrieval will be disabled until it recovers.")
+        )
 
 
 class _IndexEntry:
@@ -78,37 +166,46 @@ class _IndexEntry:
         self.records      = records
         self.record_count = len(records)
         self.corpus: list[str] = []
-        self._embeddings = None
-        self._vectorizer = None
-        self._tfidf_mat  = None
+        self._embeddings = None   # np.ndarray | None — Ollama path
+        self._vectorizer  = None  # TfidfVectorizer | None — fallback path
+        self._tfidf_mat   = None
 
-    def build(self) -> None:
+    async def build(self) -> None:
         if not self.records:
             return
         self.corpus = [
             f"{r.get('speaker', '')} {r.get('text', '')}".strip()
             for r in self.records
         ]
-        model = _get_embed_model()
-        if model is not None:
-            raw   = model.encode(self.corpus, batch_size=64, show_progress_bar=False)
-            norms = np.linalg.norm(raw, axis=1, keepdims=True)
-            norms = np.where(norms == 0, 1.0, norms)
-            self._embeddings = (raw / norms).astype(np.float32)
+        embeddings = await _ollama_embed(self.corpus)
+        if embeddings is not None:
+            self._embeddings = embeddings
         elif SKLEARN_AVAILABLE:
-            self._vectorizer = TfidfVectorizer(
-                ngram_range=(1, 2), max_features=8000, sublinear_tf=True
+            # TF-IDF fit over the whole corpus is CPU-bound and, on a
+            # long session, runs on nearly every QA turn (see the cache
+            # note in _get_session_entry below) — keep it off the event
+            # loop the same way the old encode() call was.
+            loop = asyncio.get_event_loop()
+            self._vectorizer, self._tfidf_mat = await loop.run_in_executor(
+                None, _fit_tfidf, self.corpus
             )
-            self._tfidf_mat = self._vectorizer.fit_transform(self.corpus)
 
-    def search(self, question: str, top_k: int) -> str:
-        model = _get_embed_model()
-        if model is not None and self._embeddings is not None:
-            q_raw  = model.encode([question], show_progress_bar=False)
-            q_norm = q_raw / max(float(np.linalg.norm(q_raw)), 1e-9)
-            scores = (self._embeddings @ q_norm.T).flatten()
+    async def search(self, question: str, top_k: int) -> str:
+        if self._embeddings is not None:
+            q_emb = await _ollama_embed([question])
+            if q_emb is None:
+                # Ollama went down mid-session after a successful build().
+                # Nothing sane to return here — the cached dense index
+                # can't be queried without an embedding for `question`,
+                # and rebuilding as TF-IDF mid-session would silently
+                # change result semantics. Surface as empty; caller
+                # already treats "" as "no hits".
+                return ""
+            scores = (self._embeddings @ q_emb[0].T).flatten()
             floor  = 0.20
         elif SKLEARN_AVAILABLE and self._tfidf_mat is not None:
+            # Single-string transform is cheap enough to run inline on
+            # the event loop, unlike the full-corpus fit in build().
             q_vec  = self._vectorizer.transform([question])
             scores = _sk_cosine(q_vec, self._tfidf_mat).flatten()
             floor  = 0.05
@@ -144,23 +241,16 @@ class LKCRetriever:
             entry = await self._get_global_entry()
         if entry is None or not entry.records:
             return ""
-        # entry.search() calls SentenceTransformer.encode() (or, in the
-        # TF-IDF fallback path, sklearn's transform), both of which are
-        # CPU-bound and were previously called directly on the event loop —
-        # blocking every other coroutine (segment processing, SSE, HTTP
-        # handling) for however long that encode took. Offloading it here
-        # matters most on longer sessions, where build() below re-embeds a
-        # growing transcript on nearly every QA turn.
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, entry.search, question, top_k)
+        # entry.search() is now natively async I/O (an HTTP call to
+        # Ollama), not a blocking local computation — so it no longer
+        # needs the run_in_executor wrapper the sentence-transformers
+        # version required to keep encode() off the event loop. The
+        # TF-IDF fallback path inside search() is a single-string
+        # transform and stays cheap enough to run inline; the expensive
+        # full-corpus TF-IDF fit is offloaded inside _IndexEntry.build().
+        return await entry.search(question, top_k)
 
     async def _get_session_entry(self, session_id: str) -> Optional[_IndexEntry]:
-        # session_text_corpus is a coroutine function — this was previously
-        # called without `await`, which silently handed a coroutine object
-        # (instead of the list of records) straight into _IndexEntry(...),
-        # blowing up on `len(records)` the moment any QA request came in
-        # (every "mode=qa" segment in the logs hit this and was swallowed by
-        # the fire-and-forget asyncio.create_task in _handle_qa_sse).
         records = await lkc_graph.session_text_corpus(session_id)
         cached  = self._sessions.get(session_id)
         if cached is None or len(records) != cached.record_count:
@@ -168,17 +258,20 @@ class LKCRetriever:
             # count — and a new transcript record lands after nearly every
             # segment, so in practice this re-embeds the ENTIRE session
             # transcript from scratch on almost every single QA call, not
-            # just the new records. Combined with build() being CPU-bound,
-            # this was blocking the event loop for longer and longer as a
-            # meeting went on. Not rewritten to be incremental here (that's
-            # a bigger change), but at minimum it's now off the event loop.
+            # just the new records. With embeddings now coming from a
+            # network call instead of a local model, this trades local
+            # CPU cost for repeated round-trips to Ollama — batched in a
+            # single /api/embed call per rebuild, so it's still one
+            # request rather than one per record, but it's still O(whole
+            # transcript) per QA call. Not rewritten to be incremental
+            # here (that's a bigger change); flagging again since the
+            # cost profile shifted.
             entry = _IndexEntry(records)
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, entry.build)
+            await entry.build()
             self._sessions[session_id] = entry
         return self._sessions.get(session_id)
 
-    async def _get_global_entry(self) -> Optional[_IndexEntry]:     
+    async def _get_global_entry(self) -> Optional[_IndexEntry]:
         all_records = await lkc_graph.read_lkc(record_type="transcript")
         if len(all_records) == self._global_record_count and self._global is not None:
             return self._global
@@ -190,8 +283,7 @@ class LKCRetriever:
             if r.get("text")
         ]
         self._global = _IndexEntry(lightweight)
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self._global.build)
+        await self._global.build()
         self._global_record_count = len(all_records)
         return self._global
 
@@ -200,15 +292,14 @@ class LKCRetriever:
         self._global = None
 
     def stats(self) -> dict:
-        model = _get_embed_model()
         backend = (
-            _embed_model_name
-            if (SBERT_AVAILABLE and model is not None)
+            _EMBED_MODEL if OLLAMA_AVAILABLE
             else ("tfidf" if SKLEARN_AVAILABLE else "none")
         )
         return {
             "backend":           backend,
-            "sbert_available":   SBERT_AVAILABLE,
+            "ollama_available":  OLLAMA_AVAILABLE,
+            "ollama_embed_url":  _OLLAMA_EMBED_URL,
             "sklearn_available": SKLEARN_AVAILABLE,
             "cached_sessions":   len(self._sessions),
             "global_index_size": self._global_record_count,

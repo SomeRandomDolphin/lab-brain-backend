@@ -2,22 +2,23 @@
 app/api/v1/endpoints/supabase.py — Supabase read endpoints + Alembic migration control.
 
 GET    /supabase/status                               — connectivity check
-GET    /supabase/sessions                             — list sessions from Supabase
-GET    /supabase/sessions/{sid}/transcripts           — transcript rows
-GET    /supabase/sessions/{sid}/summary               — persisted summary
-GET    /supabase/sessions/{sid}/report                — report Storage URL
-GET    /supabase/sessions/{sid}/audio/{seg_idx}       — audio segment URL
+GET    /supabase/sessions                             — list the caller's own sessions
+GET    /supabase/sessions/{sid}/transcripts           — transcript rows (owner or participant)
+GET    /supabase/sessions/{sid}/summary               — persisted summary (owner or participant)
+GET    /supabase/sessions/{sid}/report                — report Storage URL (owner or participant)
+GET    /supabase/sessions/{sid}/audio/{seg_idx}       — audio segment URL (owner or participant)
 
-POST   /supabase/migrations/run                       — `alembic upgrade head`
-GET    /supabase/migrations/status                    — current vs. head revision, pending list
+POST   /supabase/migrations/run                       — `alembic upgrade head` (admin only)
+GET    /supabase/migrations/status                    — current vs. head revision, pending list (admin only)
 
 Migrations are now powered by Alembic (see app/db/migrations.py) instead of
 the old custom exec_sql SQL-file runner.
 """
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 
+from app.api.deps import get_current_user, require_admin, require_session_access
 from app.core.config import cfg
 from app.db import supabase_client
 from app.db.migrations import get_migration_status, run_migrations_async
@@ -29,26 +30,37 @@ router = APIRouter(prefix="/supabase", tags=["supabase"])
 
 @router.get("/status")
 async def supabase_status():
-    return supabase_client.connectivity_status()
+    return await supabase_client.connectivity_status()
 
 
 @router.get("/sessions")
-async def list_sessions(limit: int = Query(default=50, le=200)):
-    return {"sessions": supabase_client.get_sessions(limit=limit)}
+async def list_sessions(
+    limit: int = Query(default=50, le=200),
+    current_user: dict = Depends(get_current_user),
+):
+    # Bug fix: get_sessions is `async def` in supabase_client.py — this was
+    # previously called without await, handing FastAPI a coroutine object
+    # instead of a result (a serialization error or garbage on every call).
+    # Also now scoped to the caller's own sessions, replacing the previous
+    # "every session in the database, to anyone who can reach the API"
+    # behaviour.
+    return {"sessions": await supabase_client.get_sessions(current_user["id"], limit=limit)}
 
 
 @router.get("/sessions/{session_id}/transcripts")
 async def get_transcripts(
-    session_id: str,
+    session_id: str = Depends(require_session_access),
     limit: int = Query(default=500, le=2000),
 ):
-    rows = supabase_client.get_transcripts(session_id, limit=limit)
+    # Bug fix: same missing-await issue as get_sessions above.
+    rows = await supabase_client.get_transcripts(session_id, limit=limit)
     return {"session_id": session_id, "count": len(rows), "transcripts": rows}
 
 
 @router.get("/sessions/{session_id}/summary")
-async def get_summary(session_id: str):
-    row = supabase_client.get_session_summary(session_id)
+async def get_summary(session_id: str = Depends(require_session_access)):
+    # Bug fix: same missing-await issue as get_sessions above.
+    row = await supabase_client.get_session_summary(session_id)
     if row is None:
         return JSONResponse(
             status_code=404,
@@ -58,7 +70,7 @@ async def get_summary(session_id: str):
 
 
 @router.get("/sessions/{session_id}/report")
-async def get_report_url(session_id: str):
+async def get_report_url(session_id: str = Depends(require_session_access)):
     url = supabase_client.get_report_url(session_id)
     if url is None:
         return JSONResponse(
@@ -69,7 +81,10 @@ async def get_report_url(session_id: str):
 
 
 @router.get("/sessions/{session_id}/audio/{segment_index}")
-async def get_audio_url(session_id: str, segment_index: int):
+async def get_audio_url(
+    segment_index: int,
+    session_id: str = Depends(require_session_access),
+):
     if not cfg.supabase.store_audio:
         return JSONResponse(
             status_code=404,
@@ -81,10 +96,13 @@ async def get_audio_url(session_id: str, segment_index: int):
     return {"session_id": session_id, "segment_index": segment_index, "url": url}
 
 
-# ── Migration endpoints (Alembic) ─────────────────────────────────────────────
+# ── Migration endpoints (Alembic) — admin only ────────────────────────────────
+# Confirmed decision: add a real admin-role concept rather than leaving these
+# open. See app.api.deps.require_admin / app.db.supabase_auth for how
+# isAdmin is set (Supabase user_metadata.role == "admin").
 
-@router.post("/migrations/run", summary="Apply all pending Alembic migrations")
-async def apply_migrations() -> dict:
+@router.post("/migrations/run", summary="Apply all pending Alembic migrations (admin only)")
+async def apply_migrations(_admin: dict = Depends(require_admin)) -> dict:
     """
     Run `alembic upgrade head` against the Supabase database.
     Already-applied revisions are skipped automatically (idempotent).
@@ -102,8 +120,8 @@ async def apply_migrations() -> dict:
     return {"ok": True, **status}
 
 
-@router.get("/migrations/status", summary="Check pending Alembic migrations (dry-run)")
-async def migration_status() -> dict:
+@router.get("/migrations/status", summary="Check pending Alembic migrations (admin only, dry-run)")
+async def migration_status(_admin: dict = Depends(require_admin)) -> dict:
     """
     Return current and head revision without applying anything.
 

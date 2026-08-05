@@ -9,13 +9,14 @@ report exports), which have no SQLAlchemy equivalent.
 What goes where
 ---------------
 Postgres tables (SQLAlchemy ORM — see models.py):
-  sessions          — one row per LiveKit room / Lab Brain session
-  transcripts       — one row per WhisperX segment (text + tags + word timestamps)
-  agent_replies     — one row per LLM reply
-  vision_frames     — one row per analysed camera frame
-  session_summaries — one row per end-of-session LLM summary
-  eval_metrics      — one row per session metric snapshot
-  consent_registry  — speaker consent records
+  sessions             — one row per LiveKit room / Lab Brain session (owned by user_id)
+  session_participants — authenticated users who joined a session they don't own
+  transcripts          — one row per WhisperX segment (text + tags + word timestamps)
+  agent_replies        — one row per LLM reply
+  vision_frames        — one row per analysed camera frame
+  session_summaries    — one row per end-of-session LLM summary
+  eval_metrics         — one row per session metric snapshot
+  consent_registry     — speaker consent records, scoped per session
 
 Supabase Storage buckets (supabase-py):
   audio-segments    — raw float32 PCM blobs
@@ -42,7 +43,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import func, select, delete, text as sa_text
+from sqlalchemy import func, select, delete, or_, text as sa_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -51,6 +52,7 @@ from .models import (
     ConsentRegistry,
     EvalMetrics,
     Session as SessionModel,
+    SessionParticipant,
     SessionSummary,
     Transcript,
     VisionFrame,
@@ -159,27 +161,33 @@ def _fire_sync(fn, *args) -> None:
         fn(*args)
 
 
-async def _ensure_session_row(session_id: str, db: AsyncSession) -> None:
+async def _ensure_session_row(session_id: str, db: AsyncSession, user_id: Optional[str] = None) -> None:
     """
     Guarantee a sessions row exists for *session_id* without overwriting any
     real session data that may already be there.
 
     Called by upsert_session_summary and upsert_eval_metrics, which can be
-    invoked by the frontend before POST /sessions has been called (the client
-    generates IDs locally and may send summary/metrics for a session that was
-    never explicitly persisted).  A bare INSERT … ON CONFLICT DO NOTHING is the
-    lightest-weight way to satisfy the FK constraint.
+    invoked by the frontend before POST /livekit/room has run its DB write
+    (the room itself is already created by then, since these are teardown /
+    mid-session calls, but this stays a defensive fallback).
 
-    We use raw SQL rather than pg_insert(SessionModel.__table__) to sidestep
-    the SQLAlchemy metadata/metadata_ column naming quirk entirely.
+    As of migration 0007, sessions.user_id is NOT NULL, so this can no
+    longer insert a bare fallback row without an owner. In every real call
+    path here, `user_id` is available from the caller (the authenticated
+    request that led here) — pass it through. If it is ever missing, the
+    INSERT is skipped and the caller's own FK-dependent write will fail
+    loudly with a clear FK error rather than silently creating an unowned
+    session.
     """
+    if user_id is None:
+        return
     await db.execute(
         sa_text("""
-            INSERT INTO sessions (session_id, host_identity, started_at, metadata, updated_at)
-            VALUES (:sid, 'browser-user', NOW(), '{}', NOW())
+            INSERT INTO sessions (session_id, user_id, host_identity, started_at, metadata, updated_at)
+            VALUES (:sid, :uid, 'browser-user', NOW(), '{}', NOW())
             ON CONFLICT (session_id) DO NOTHING
         """),
-        {"sid": session_id},
+        {"sid": session_id, "uid": user_id},
     )
 
 
@@ -189,12 +197,24 @@ async def _ensure_session_row(session_id: str, db: AsyncSession) -> None:
 
 async def upsert_session(
     session_id: str,
+    user_id: Optional[str] = None,
     host_identity: str = "browser-user",
     started_at: Optional[float] = None,
     ended_at: Optional[float] = None,
     livekit_room_sid: Optional[str] = None,
     metadata: Optional[dict] = None,
 ) -> None:
+    """
+    user_id is required on session *creation* (POST /livekit/room) and must
+    be omitted on every later partial-update call (e.g. DELETE /livekit/room/{sid}
+    setting ended_at) — passing user_id=None here means "leave whatever
+    user_id already exists on the row untouched", not "set it to NULL".
+    This is why user_id is excluded from `values`/the ON CONFLICT SET clause
+    unless it was explicitly given: the ON CONFLICT DO UPDATE previously
+    used a single `values` dict for both INSERT and UPDATE, which meant a
+    teardown call with no user_id would have overwritten the owner to NULL
+    (and NULL is no longer even legal post-migration-0007).
+    """
     values = {
         "session_id":      session_id,
         "host_identity":   host_identity,
@@ -205,15 +225,71 @@ async def upsert_session(
     }
     if ended_at is not None:
         values["ended_at"] = _from_unix(ended_at)
+    if user_id is not None:
+        values["user_id"] = user_id
 
+    update_values = {k: v for k, v in values.items() if k != "session_id"}
+
+    if user_id is None:
+        # Update-only path (e.g. teardown): the row must already exist.
+        # Insert would fail anyway (user_id NOT NULL), so go straight to UPDATE.
+        from sqlalchemy import update as sa_update
+        stmt = (
+            sa_update(SessionModel)
+            .where(SessionModel.session_id == session_id)
+            .values(**update_values)
+        )
+    else:
+        stmt = (
+            pg_insert(SessionModel)
+            .values(**values)
+            .on_conflict_do_update(index_elements=["session_id"], set_=update_values)
+        )
+
+    async with get_session_factory()() as db:
+        await db.execute(stmt)
+        await db.commit()
+
+
+async def add_session_participant(session_id: str, user_id: str) -> None:
+    """
+    Record that `user_id` has joined `session_id` as a non-owner participant.
+    Called on every successful GET /livekit/token. ON CONFLICT DO NOTHING —
+    re-joining an already-recorded session is a no-op, not an error.
+    """
     stmt = (
-        pg_insert(SessionModel)
-        .values(**values)
-        .on_conflict_do_update(index_elements=["session_id"], set_=values)
+        pg_insert(SessionParticipant)
+        .values(session_id=session_id, user_id=user_id)
+        .on_conflict_do_nothing(index_elements=["session_id", "user_id"])
     )
     async with get_session_factory()() as db:
         await db.execute(stmt)
         await db.commit()
+
+
+async def get_session_access(session_id: str) -> tuple[Optional[str], set[str]]:
+    """
+    Return (owner_user_id, {participant_user_ids}) for a session, or
+    (None, set()) if the session doesn't exist. Used by
+    app.api.deps.require_session_access / require_session_owner so the
+    ownership check lives in one place instead of being duplicated per route.
+    """
+    async with get_session_factory()() as db:
+        owner_row = await db.execute(
+            select(SessionModel.user_id).where(SessionModel.session_id == session_id)
+        )
+        owner = owner_row.scalar_one_or_none()
+        if owner is None:
+            return None, set()
+
+        participants_row = await db.execute(
+            select(SessionParticipant.user_id).where(
+                SessionParticipant.session_id == session_id
+            )
+        )
+        participants = set(participants_row.scalars().all())
+
+    return owner, participants
 
 
 async def insert_transcript(
@@ -298,7 +374,9 @@ async def insert_vision_frame(
         await db.commit()
 
 
-async def upsert_session_summary(session_id: str, summary_md: str, tags: dict) -> None:
+async def upsert_session_summary(
+    session_id: str, summary_md: str, tags: dict, user_id: Optional[str] = None
+) -> None:
     values = {
         "session_id": session_id,
         "summary_md": summary_md,
@@ -317,10 +395,9 @@ async def upsert_session_summary(session_id: str, summary_md: str, tags: dict) -
     )
     async with get_session_factory()() as db:
         # Ensure the parent sessions row exists before inserting the FK-dependent
-        # summary.  The client generates session IDs locally and may call this
-        # endpoint before the session has been persisted — ON CONFLICT DO NOTHING
-        # is a no-op when the row is already there.
-        await _ensure_session_row(session_id, db)
+        # summary. As of migration 0007 this requires a user_id — pass the
+        # current requester's id through from the endpoint.
+        await _ensure_session_row(session_id, db, user_id=user_id)
         await db.execute(stmt)
         await db.commit()
 
@@ -334,7 +411,9 @@ async def upsert_session_summary(session_id: str, summary_md: str, tags: dict) -
     )
 
 
-async def upsert_eval_metrics(session_id: str, metrics_dict: dict) -> None:
+async def upsert_eval_metrics(
+    session_id: str, metrics_dict: dict, user_id: Optional[str] = None
+) -> None:
     now = _utcnow()
     values = {
         "session_id":  session_id,
@@ -351,17 +430,24 @@ async def upsert_eval_metrics(session_id: str, metrics_dict: dict) -> None:
     async with get_session_factory()() as db:
         # Same FK-safety pattern as upsert_session_summary — ensure the parent
         # sessions row exists before writing eval_metrics.
-        await _ensure_session_row(session_id, db)
+        await _ensure_session_row(session_id, db, user_id=user_id)
         await db.execute(stmt)
         await db.commit()
 
 
 async def upsert_consent(
+    session_id: str,
     speaker_label: str,
     consented: bool,
     real_name: Optional[str] = None,
 ) -> None:
+    """
+    session_id is now required (migration 0009) — consent is scoped per
+    session, since speaker_label alone ("Person A") is not a stable identity
+    across unrelated sessions.
+    """
     values = {
+        "session_id":    session_id,
         "speaker_label": speaker_label,
         "consented":     consented,
         "real_name":     real_name,
@@ -371,7 +457,7 @@ async def upsert_consent(
     stmt = (
         pg_insert(ConsentRegistry.__table__)
         .values(**values)
-        .on_conflict_do_update(index_elements=["speaker_label"], set_=values)
+        .on_conflict_do_update(index_elements=["session_id", "speaker_label"], set_=values)
     )
     async with get_session_factory()() as db:
         await db.execute(stmt)
@@ -449,8 +535,27 @@ async def export_report(
 # Public read API
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def get_sessions(limit: int = 50) -> list[dict]:
-    stmt = select(SessionModel).order_by(SessionModel.started_at.desc()).limit(limit)
+async def get_sessions(user_id: str, limit: int = 50) -> list[dict]:
+    """
+    Return sessions the given user owns OR has participated in — replacing
+    the previous "every session in the database, to anyone" behaviour.
+    """
+    accessible_ids = (
+        select(SessionParticipant.session_id)
+        .where(SessionParticipant.user_id == user_id)
+        .scalar_subquery()
+    )
+    stmt = (
+        select(SessionModel)
+        .where(
+            or_(
+                SessionModel.user_id == user_id,
+                SessionModel.session_id.in_(accessible_ids),
+            )
+        )
+        .order_by(SessionModel.started_at.desc())
+        .limit(limit)
+    )
     async with get_session_factory()() as db:
         result = await db.execute(stmt)
         rows = result.scalars().all()

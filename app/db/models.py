@@ -38,12 +38,31 @@ class Session(Base):
 
     id                = Column(BigInteger, primary_key=True, autoincrement=True)
     session_id        = Column(String, nullable=False, unique=True, index=True)
+    # Multi-tenancy: the account that created (owns) this session. NOT NULL —
+    # every session is required to be created by an authenticated user as of
+    # migration 0007. FK to auth.users(id) ON DELETE CASCADE.
+    user_id           = Column(String, nullable=False, index=True)
     host_identity     = Column(String, nullable=False, default="browser-user")
     started_at        = Column(DateTime(timezone=True), nullable=False)
     ended_at          = Column(DateTime(timezone=True), nullable=True)
     livekit_room_sid  = Column(String, nullable=True)
     metadata_         = Column("metadata", JSON, nullable=False, default=dict, key="metadata_")
     updated_at        = Column(DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow)
+
+
+class SessionParticipant(Base):
+    """
+    Authenticated users who joined a session via GET /livekit/token but did
+    not create it. A row is inserted on every successful join. Used by
+    app.api.deps.require_session_access to grant view/join-level access to
+    anyone who is owner OR participant, as distinct from owner-only actions
+    (delete/manage) gated by require_session_owner.
+    """
+    __tablename__ = "session_participants"
+
+    session_id = Column(String, primary_key=True)
+    user_id    = Column(String, primary_key=True)
+    joined_at  = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 
 class Transcript(Base):
@@ -119,7 +138,11 @@ class ConsentRegistry(Base):
     __tablename__ = "consent_registry"
 
     id            = Column(BigInteger, primary_key=True, autoincrement=True)
-    speaker_label = Column(String, nullable=False, unique=True, index=True)
+    # Composite PK as of migration 0009 — speaker_label alone collided across
+    # unrelated sessions (diarization labels like "Person A" are not globally
+    # unique). `id` remains a separate unique surrogate, untouched by this.
+    session_id    = Column(String, primary_key=True)
+    speaker_label = Column(String, primary_key=True, index=True)
     consented     = Column(Boolean, nullable=False)
     real_name     = Column(String, nullable=True)
     updated_at    = Column(DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow)

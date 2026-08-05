@@ -6,7 +6,12 @@ to the `lkc_records` Postgres table in your Supabase project via the shared
 async engine in supabase_client.py.
 
 The public API surface (write_to_lkc, read_lkc, read_sessions, …) is
-unchanged so existing callers need no modification.
+unchanged for existing single-session callers (capture.py, sessions.py).
+read_lkc() and read_sessions() gained an optional `session_ids` scoping
+parameter so multi-session listing endpoints (GET /lkc, GET /lkc/sessions)
+can filter to only the sessions a given user is allowed to see, without
+lkc_graph.py itself knowing anything about auth or ownership — the caller
+(the endpoint, via app.api.deps) resolves the allowed session_id set first.
 
 Schema: see models.LkcRecord
 """
@@ -64,14 +69,24 @@ async def write_to_lkc(record: dict) -> None:
 
 async def read_lkc(
     session_id: Optional[str] = None,
+    session_ids: Optional[list[str]] = None,
     record_type: Optional[str] = None,
     since_unix: Optional[float] = None,
     limit: int = 2000,
 ) -> list[dict]:
+    """
+    session_id: single-session filter (existing callers, e.g. GET /lkc/sessions/{sid}).
+    session_ids: multi-session allow-list filter (new — e.g. GET /lkc viewer,
+        scoped to only the sessions the requesting user can access). If both
+        are given, session_id wins for that one session; session_ids alone
+        restricts to that set.
+    """
     stmt = select(LkcRecord).order_by(LkcRecord.timestamp_unix.asc()).limit(limit)
 
     if session_id:
         stmt = stmt.where(LkcRecord.session_id == session_id)
+    elif session_ids is not None:
+        stmt = stmt.where(LkcRecord.session_id.in_(session_ids))
     if record_type:
         stmt = stmt.where(LkcRecord.record_type == record_type)
     if since_unix is not None:
@@ -84,7 +99,12 @@ async def read_lkc(
     return [r.payload for r in rows]
 
 
-async def read_sessions() -> list[dict]:
+async def read_sessions(session_ids: Optional[list[str]] = None) -> list[dict]:
+    """
+    session_ids: optional allow-list — when given, only these sessions are
+    summarised (used to scope GET /lkc/sessions to the requesting user's
+    accessible sessions instead of every session in the graph).
+    """
     stmt = (
         select(
             LkcRecord.session_id,
@@ -107,6 +127,8 @@ async def read_sessions() -> list[dict]:
         .group_by(LkcRecord.session_id)
         .order_by(func.min(LkcRecord.timestamp_unix).desc())
     )
+    if session_ids is not None:
+        stmt = stmt.where(LkcRecord.session_id.in_(session_ids))
 
     async with get_session_factory()() as db:
         result = await db.execute(stmt)

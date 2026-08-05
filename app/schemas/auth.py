@@ -2,12 +2,15 @@
 app/schemas/auth.py — Auth request/response Pydantic models.
 
 These match the User interface expected by the frontend (src/types/index.ts):
-  { id, name, email, avatarUrl, createdAt }
+  { id, name, email, avatarUrl, createdAt, isAdmin }
 
 Changes from the SQLite version:
   • AuthResponse now includes refreshToken (Supabase JWTs are short-lived;
     the frontend needs the refresh token to silently renew access).
   • RefreshRequest added for POST /auth/refresh.
+  • UserOut now includes isAdmin (from Supabase user_metadata.role — see
+    supabase_auth.py), so the frontend can conditionally show operator-only
+    UI (migrations panel, full-graph viewer) without a separate whoami call.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ class UserOut(BaseModel):
     email:      str
     avatarUrl:  Optional[str] = None
     createdAt:  str           # ISO 8601
+    isAdmin:    bool = False
 
 
 # ── Register ──────────────────────────────────────────────────────────────────

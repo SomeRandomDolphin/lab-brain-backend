@@ -132,7 +132,36 @@ async def livekit_pipeline(
     Entry point called by livekit_rooms.start_subscriber().
     Runs until the subscriber task is cancelled (DELETE /livekit/room/{sid}).
     """
-    chunker       = VadChunker()
+    # One VadChunker per LiveKit participant identity, not one shared chunker.
+    # A single shared chunker was fine for the original one-shared-mic design
+    # (one track, possibly several people picked up by pyannote diarization),
+    # but with several REMOTE participants each on their own track, a shared
+    # chunker received raw PCM frames from independent tracks interleaved by
+    # whatever order asyncio happened to schedule them — not time-aligned,
+    # producing garbled audio rather than two real streams. Keying by
+    # identity keeps each participant's own audio properly contiguous.
+    _chunkers: dict[str, VadChunker] = {}
+
+    def _chunker_for(identity: str) -> VadChunker:
+        if identity not in _chunkers:
+            _chunkers[identity] = VadChunker()
+        return _chunkers[identity]
+
+    # Every distinct identity that has actually sent audio in this session.
+    # Used at segment-handling time to tell the two supported topologies
+    # apart: exactly one identity means the classic shared-mic/shared-camera
+    # case (several people, one track) where pyannote diarization is still
+    # the right tool; more than one identity means separate remote
+    # participants, each already disambiguated at the track level — running
+    # diarization there would be redundant and diarization's own "Person A"/
+    # "Person B" labels would be strictly worse than the real identities we
+    # already have.
+    _seen_audio_identities: set[str] = set()
+
+    # dlg (dialogue/mode/QA state) stays a single shared instance across all
+    # participants by design — per your call, wake-word/QA is session-wide,
+    # not per-participant, so whoever says the wake word triggers one shared
+    # reply rather than each participant getting independent QA state.
     dlg           = get_dialogue(session_id)
     retriever     = lkc_retrieval.get_retriever()
     metrics       = eval_metrics.get_metrics(session_id)
@@ -191,12 +220,13 @@ async def livekit_pipeline(
     # draining audio_q in real time. Completed VAD segments are handed off to
     # segment_q for the (slow) heavy stage below, rather than processed here.
 
-    async def _process_audio(raw_frame) -> None:
+    async def _process_audio(identity: str, raw_frame) -> None:
         nonlocal segment_index, _last_listening_state
 
+        _seen_audio_identities.add(identity)
         pcm_f32 = resample_livekit_frame(raw_frame)
         request_received_at = time.time()
-        segment_audio = chunker.push(pcm_f32)
+        segment_audio = _chunker_for(identity).push(pcm_f32)
 
         if segment_audio is None:
             _broadcast_listening()
@@ -232,7 +262,7 @@ async def livekit_pipeline(
         # the fix: this coroutine returns immediately and _audio_consumer goes
         # straight back to `audio_q.get()`, so real-time audio ingestion is
         # never gated on how long ASR/diarization/persistence take.
-        segment_q.put_nowait((segment_index, segment_audio, time.time(), request_received_at))
+        segment_q.put_nowait((identity, segment_index, segment_audio, time.time(), request_received_at))
 
     # ── Audio processor: heavy stage (runs in its own worker, FIFO order) ────
     # Processed one segment at a time, in submission order, by a dedicated
@@ -240,7 +270,7 @@ async def livekit_pipeline(
     # slow segment no longer stalls audio ingestion the way it did when this
     # ran inline inside _process_audio.
 
-    async def _handle_segment(seg_idx: int, segment_audio, seg_start: float, dequeued_at: float, request_received_at: float) -> None:
+    async def _handle_segment(identity: str, seg_idx: int, segment_audio, seg_start: float, dequeued_at: float, request_received_at: float) -> None:
         loop = asyncio.get_event_loop()
 
         # Time spent sitting in segment_q behind earlier segments, before
@@ -264,30 +294,45 @@ async def livekit_pipeline(
 
         perc_state = vision.get_state(session_id)
 
-        # Word-level speaker alignment. This is the single (executor-offloaded)
-        # diarization pass for this segment — the segment-level speaker below
-        # is derived from it rather than re-running diarization a second time.
-        word_timestamps = (
-            await assign_speaker_words(dlg, raw_word_ts, segment_audio)
-            if raw_word_ts else raw_word_ts
-        )
-
-        # Speaker (segment-level) — resolved as the majority vote across the
-        # word-level labels, which come from the same audio diarization pass.
-        # NOTE: this must NOT be overwritten with perc_state.present_speakers.
-        # present_speakers is vision-derived and indexes purely off
-        # segment_index, so it's uncorrelated with who is actually talking in
-        # this segment — using it here previously pinned every segment to
-        # whichever face vision happened to detect (e.g. a lone "Person
-        # (anon)"), which is what caused the audio/vision speaker mismatches.
-        if word_timestamps:
-            word_speakers = [w.get("speaker") for w in word_timestamps if w.get("speaker")]
-            speaker = (
-                max(set(word_speakers), key=word_speakers.count)
-                if word_speakers else await assign_speaker(dlg, audio_segment=segment_audio)
+        # Multiple distinct participant identities have sent audio in this
+        # session => genuinely separate remote participants, each already
+        # disambiguated at the track level. Running pyannote diarization
+        # here would be redundant (we already know who this segment's audio
+        # came from) and its generic "Person A"/"Person B" labels would be
+        # strictly worse than the real name/identity we already have. This
+        # does NOT touch the single-identity case below, which is the
+        # original shared-mic/shared-camera design (several people picked up
+        # by one track) and still needs diarization to tell them apart.
+        if len(_seen_audio_identities) > 1:
+            speaker = get_known_identity(session_id, identity) or identity
+            word_timestamps = (
+                [{**w, "speaker": speaker} for w in raw_word_ts] if raw_word_ts else raw_word_ts
             )
         else:
-            speaker = await assign_speaker(dlg, audio_segment=segment_audio)
+            # Word-level speaker alignment. This is the single (executor-offloaded)
+            # diarization pass for this segment — the segment-level speaker below
+            # is derived from it rather than re-running diarization a second time.
+            word_timestamps = (
+                await assign_speaker_words(dlg, raw_word_ts, segment_audio)
+                if raw_word_ts else raw_word_ts
+            )
+
+            # Speaker (segment-level) — resolved as the majority vote across the
+            # word-level labels, which come from the same audio diarization pass.
+            # NOTE: this must NOT be overwritten with perc_state.present_speakers.
+            # present_speakers is vision-derived and indexes purely off
+            # segment_index, so it's uncorrelated with who is actually talking in
+            # this segment — using it here previously pinned every segment to
+            # whichever face vision happened to detect (e.g. a lone "Person
+            # (anon)"), which is what caused the audio/vision speaker mismatches.
+            if word_timestamps:
+                word_speakers = [w.get("speaker") for w in word_timestamps if w.get("speaker")]
+                speaker = (
+                    max(set(word_speakers), key=word_speakers.count)
+                    if word_speakers else await assign_speaker(dlg, audio_segment=segment_audio)
+                )
+            else:
+                speaker = await assign_speaker(dlg, audio_segment=segment_audio)
 
         # Privacy
         redacted_text = (
@@ -436,10 +481,16 @@ async def livekit_pipeline(
     # `await` vision inference directly, or it stalls draining video_q the
     # same way the old inline ASR/diarization stalled audio_q.
 
-    _vision_latest: Optional[bytes] = None
+    # (identity, jpeg_bytes) of the most recent video frame across ALL
+    # participants — Ollama serves one request at a time regardless, so
+    # analysing every participant's feed concurrently isn't an option; this
+    # keeps the existing latest-frame-wins behavior but now remembers whose
+    # frame it is, so the right participant's known name gets substituted
+    # rather than always looking up a single session-wide identity.
+    _vision_latest: Optional[tuple[str, bytes]] = None
     _vision_event = asyncio.Event()
 
-    async def _process_video(jpeg_bytes: bytes) -> None:
+    async def _process_video(identity: str, jpeg_bytes: bytes) -> None:
         nonlocal _vision_latest
         # VISION_FRAME_INTERVAL decimation now happens upstream, in
         # livekit_rooms.py's _drain_video, before the RGBA convert + JPEG
@@ -451,15 +502,16 @@ async def livekit_pipeline(
         # previous frame, overwrite the pending slot rather than queuing —
         # analysing a stale frame once the worker catches up is worse than
         # just analysing whatever is current when it's ready.
-        _vision_latest = jpeg_bytes
+        _vision_latest = (identity, jpeg_bytes)
         _vision_event.set()
 
     # ── Video processor: heavy stage (its own worker, latest-frame-wins) ─────
 
-    async def _run_vision_analysis(jpeg_bytes: bytes) -> None:
+    async def _run_vision_analysis(frame: tuple[str, bytes]) -> None:
+        identity, jpeg_bytes = frame
         t0         = time.time()
         state      = await vision.analyse_frame(
-            session_id, jpeg_bytes, known_identity=get_known_identity(session_id)
+            session_id, jpeg_bytes, known_identity=get_known_identity(session_id, identity)
         )
         latency_ms = round((time.time() - t0) * 1000)
 
@@ -513,9 +565,9 @@ async def livekit_pipeline(
 
     async def _audio_consumer() -> None:
         while True:
-            frame = await audio_q.get()
+            identity, frame = await audio_q.get()
             try:
-                await _process_audio(frame)
+                await _process_audio(identity, frame)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -523,7 +575,7 @@ async def livekit_pipeline(
 
     async def _segment_consumer() -> None:
         while True:
-            seg_idx, segment_audio, seg_start, request_received_at = await segment_q.get()
+            identity, seg_idx, segment_audio, seg_start, request_received_at = await segment_q.get()
             dequeued_at = time.time()
 
             # If more items piled up behind this one while we were busy,
@@ -547,7 +599,7 @@ async def livekit_pipeline(
                 )
 
             try:
-                await _handle_segment(seg_idx, segment_audio, seg_start, dequeued_at, request_received_at)
+                await _handle_segment(identity, seg_idx, segment_audio, seg_start, dequeued_at, request_received_at)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -555,9 +607,9 @@ async def livekit_pipeline(
 
     async def _video_consumer() -> None:
         while True:
-            jpeg = await video_q.get()
+            identity, jpeg = await video_q.get()
             try:
-                await _process_video(jpeg)
+                await _process_video(identity, jpeg)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -579,8 +631,8 @@ async def livekit_pipeline(
         while True:
             await _vision_event.wait()
             _vision_event.clear()
-            jpeg_bytes = _vision_latest
-            if jpeg_bytes is None:
+            frame = _vision_latest
+            if frame is None:
                 continue
 
             # Let a user-facing QA reply have Ollama's single request slot
@@ -600,11 +652,11 @@ async def livekit_pipeline(
                     continue
                 # A newer frame may have arrived while we waited; use it —
                 # same latest-frame-wins principle as everywhere else here.
-                jpeg_bytes = _vision_latest
+                frame = _vision_latest
 
             last_dispatch_at = time.time()
             try:
-                await _run_vision_analysis(jpeg_bytes)
+                await _run_vision_analysis(frame)
             except asyncio.CancelledError:
                 raise
             except Exception:

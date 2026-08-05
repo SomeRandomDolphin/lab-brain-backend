@@ -1,21 +1,24 @@
 """
 app/api/v1/endpoints/sessions.py — Session-level endpoints.
 
-POST   /summary/{sid}         — generate + persist LLM summary
-GET    /mode/{sid}            — current dialogue mode + summon flag
-GET    /perception/{sid}      — latest vision perception state
+POST   /summary/{sid}         — generate + persist LLM summary (owner or participant)
+GET    /mode/{sid}            — current dialogue mode + summon flag (owner or participant)
+GET    /perception/{sid}      — latest vision perception state (owner or participant)
 GET    /config/client         — frontend config (camera fps, tts hide ms, lk_url)
-GET    /metrics               — all session metric summaries
-GET    /metrics/csv           — CSV export of raw metric samples
-POST   /eval/wer              — compute WER for a reference/hypothesis pair
+GET    /metrics               — session metric summaries, scoped to the caller's own sessions
+GET    /metrics/csv           — CSV export of raw metric samples, same scoping
+POST   /eval/wer              — compute WER for a reference/hypothesis pair (owner or participant)
 """
 
+import csv
+import io
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 
+from app.api.deps import get_current_user, require_session_access
 from app.core.config import cfg
 from app.db import lkc_graph, supabase_client
 from app.services import vision, eval_metrics
@@ -31,7 +34,7 @@ router = APIRouter(tags=["sessions"])
 
 
 @router.post("/summary/{session_id}")
-async def post_summary(session_id: str):
+async def post_summary(session_id: str = Depends(require_session_access)):
     import logging
     _log = logging.getLogger(__name__)
     try:
@@ -98,7 +101,7 @@ async def post_summary(session_id: str):
 
 
 @router.get("/mode/{session_id}")
-async def get_mode(session_id: str):
+async def get_mode(session_id: str = Depends(require_session_access)):
     dialogue  = _get_dialogue_module()
     dlg_state = dialogue.get_dialogue(session_id)
     return {
@@ -109,7 +112,7 @@ async def get_mode(session_id: str):
 
 
 @router.get("/perception/{session_id}")
-async def get_perception(session_id: str):
+async def get_perception(session_id: str = Depends(require_session_access)):
     state = vision.get_state(session_id)
     return {
         "session_id":        session_id,
@@ -133,17 +136,53 @@ async def client_config():
 
 
 @router.get("/metrics")
-async def get_all_metrics():
-    return JSONResponse(await eval_metrics.all_summaries())
+async def get_all_metrics(current_user: dict = Depends(get_current_user)):
+    """
+    eval_metrics keeps its per-session snapshots in-memory, keyed only by
+    session_id — it has no notion of ownership. Scoping happens here: fetch
+    the caller's own (owned + participant) session ids from the DB and
+    filter the in-memory summaries down to just those.
+    """
+    accessible = {
+        s["session_id"]
+        for s in await supabase_client.get_sessions(current_user["id"], limit=10_000)
+    }
+    summaries = await eval_metrics.all_summaries()
+    scoped = [s for s in summaries if s.get("session_id") in accessible]
+    return JSONResponse(scoped)
 
 
 @router.get("/metrics/csv", response_class=PlainTextResponse)
-async def get_metrics_csv():
-    return PlainTextResponse(await eval_metrics.all_csv(), media_type="text/csv")
+async def get_metrics_csv(current_user: dict = Depends(get_current_user)):
+    accessible = {
+        s["session_id"]
+        for s in await supabase_client.get_sessions(current_user["id"], limit=10_000)
+    }
+    raw_csv = await eval_metrics.all_csv()
+
+    reader = csv.DictReader(io.StringIO(raw_csv))
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["session_id", "metric", "value"])
+    writer.writeheader()
+    for row in reader:
+        if row.get("session_id") in accessible:
+            writer.writerow(row)
+
+    return PlainTextResponse(buf.getvalue(), media_type="text/csv")
 
 
 @router.post("/eval/wer")
-async def evaluate_wer(req: WerRequest):
-    metrics = await eval_metrics.get_metrics(req.session_id)
+async def evaluate_wer(req: WerRequest, current_user: dict = Depends(get_current_user)):
+    # session_id arrives in the request body here, not as a path param, so it
+    # can't go through Depends(require_session_access) the usual way — same
+    # ownership/participant check, applied manually.
+    owner, participants = await supabase_client.get_session_access(req.session_id)
+    if owner is None or (current_user["id"] != owner and current_user["id"] not in participants):
+        raise HTTPException(status_code=404, detail="Session not found.")
+
+    # Bonus fix: get_metrics() is a synchronous function in eval_metrics.py
+    # (not `async def`) — the previous `await eval_metrics.get_metrics(...)`
+    # would have raised a TypeError at runtime on every call to this route.
+    metrics = eval_metrics.get_metrics(req.session_id)
     wer     = metrics.record_wer(req.reference, req.hypothesis)
     return {"session_id": req.session_id, "wer": round(wer, 4)}

@@ -40,10 +40,16 @@ class ConsentRequest(BaseModel):
 
 
 class ConsentSyncRequest(BaseModel):
-    """Dual-write consent: local registry + Supabase."""
-    speaker:   str
-    consented: bool
-    real_name: Optional[str] = None
+    """
+    Dual-write consent: local registry + Supabase.
+
+    session_id is required as of migration 0009 — consent_registry is now
+    scoped per session (speaker_label alone collided across sessions).
+    """
+    session_id: str
+    speaker:    str
+    consented:  bool
+    real_name:  Optional[str] = None
 
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
