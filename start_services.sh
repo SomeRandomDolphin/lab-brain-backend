@@ -243,6 +243,21 @@ start_livekit() {
   api_secret=$(read_config "['livekit']['api_secret']" "devsecret")
   echo "    api_key=${api_key}  api_secret=${api_secret}"
 
+  # --node-ip tells LiveKit which address to advertise in its WebRTC ICE
+  # candidates — i.e. where connecting browsers should reach it for actual
+  # media, as opposed to the signaling websocket. This must be an address
+  # the BROWSER can route to. 127.0.0.1 only works when the browser runs on
+  # the exact same host as the Docker container; if the browser reaches
+  # this server over a LAN/Tailscale/public address instead (e.g.
+  # ws://100.x.x.x:7880), 127.0.0.1 resolves to the browser's own machine
+  # and ICE negotiation fails ("ICE failed, add a TURN server") even though
+  # signaling connects fine. Set livekit.node_ip in config.json to whatever
+  # address your clients actually use to reach LIVEKIT_URL — falls back to
+  # 127.0.0.1 for same-host local dev.
+  local node_ip
+  node_ip=$(read_config "['livekit']['node_ip']" "127.0.0.1")
+  echo "    node_ip=${node_ip}  (advertised WebRTC media address — must match how clients reach LIVEKIT_URL)"
+
   # Egress needs a shared Redis to receive recording jobs from LiveKit —
   # --dev mode runs LiveKit in-memory with no Redis, which is why
   # start_room_composite_egress previously failed with
@@ -284,14 +299,18 @@ EOF
       -v "${livekit_config}:/etc/livekit.yaml" \
       livekit/livekit-server \
       --config /etc/livekit.yaml \
-      --node-ip=127.0.0.1 \
+      --node-ip="${node_ip}" \
       >/dev/null
   else
     info "Starting LiveKit dev server..."
-    # --node-ip=127.0.0.1 is required for local Docker dev: without it the
-    # server advertises its internal bridge IP (e.g. 172.17.0.2) as the WebRTC
-    # media address, which the host browser can't reach — the symptom is
-    # "could not establish pc connection" even though signaling succeeds.
+    # --node-ip must be an address the connecting BROWSER can route to —
+    # without it (or with a wrong value) the server advertises either its
+    # internal Docker bridge IP or an unreachable loopback as the WebRTC
+    # media address, and clients get signaling-connects-but-ICE-fails
+    # ("could not establish pc connection" / "ICE failed, add a TURN
+    # server"). Defaults to 127.0.0.1 for same-host local dev; set
+    # livekit.node_ip in config.json if clients reach this server over a
+    # LAN/Tailscale/public address instead (see node_ip resolution above).
     #
     # --network attached even though egress is off, so nothing else has to
     # change if you flip LIVEKIT_EGRESS_ENABLED=true and re-run later.
@@ -304,7 +323,7 @@ EOF
       -e LIVEKIT_KEYS="${api_key}: ${api_secret}" \
       livekit/livekit-server \
       --dev \
-      --node-ip=127.0.0.1 \
+      --node-ip="${node_ip}" \
       >/dev/null
   fi
 
