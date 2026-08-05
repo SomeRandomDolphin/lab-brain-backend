@@ -770,7 +770,15 @@ dialogue_model — or dialogue/QA calls will queue behind every vision call. Fix
   info "Verifying all three models can stay resident together..."
   docker exec "$OLLAMA_CONTAINER" ollama run "$vision_model" "hi" >/dev/null 2>&1 || true
   docker exec "$OLLAMA_CONTAINER" ollama run "$dialogue_model" "hi" >/dev/null 2>&1 || true
-  docker exec "$OLLAMA_CONTAINER" curl -sf http://localhost:11434/api/embed \
+  # NOTE: `docker exec ... curl` doesn't work here — the official
+  # ollama/ollama image does not ship curl (a long-standing known gap, see
+  # ollama/ollama#9781 — it's also why the image's own default healthcheck
+  # is broken). That call was failing with "curl: not found" and getting
+  # swallowed by `|| true`, so the embedding model was silently never
+  # warmed regardless of available RAM/VRAM. Curl from the HOST instead,
+  # against the already-published port — same approach wait_for_http()
+  # above already uses.
+  curl -sf "http://localhost:${OLLAMA_PORT}/api/embed" \
     -d "{\"model\": \"${embedding_model}\", \"input\": \"hi\"}" >/dev/null 2>&1 || true
   loaded="$(docker exec "$OLLAMA_CONTAINER" ollama ps)"
   echo "$loaded"
