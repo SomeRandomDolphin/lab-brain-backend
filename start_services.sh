@@ -480,6 +480,16 @@ SUPABASE_REPO_DIR="${SCRIPT_DIR}/.supabase-repo"
 # patches supabase-project/.env (KONG_HTTP_PORT) on a fresh install via
 # set_kong_port() below, so the two never drift out of sync.
 SUPABASE_API_PORT=8080
+# storage-api's own container port, exposed directly on the host so S3-
+# protocol clients (LiveKit Egress) can bypass Kong entirely. Kong rewrites
+# the Host header when proxying (${SUPABASE_API_PORT} -> storage:5000
+# internally), and SigV4 signs the Host header as part of the request — so
+# a request signed against the Kong-facing host/port never matches what
+# storage-api recomputes on its end, and every S3 upload fails 403
+# SignatureDoesNotMatch regardless of how correct the access key/secret
+# are. Hitting storage-api directly on this port sidesteps the rewrite.
+# See patch_supabase_compose() below for where this gets wired in.
+SUPABASE_STORAGE_PORT=5000
 # Compose project name — controls the container name prefix
 SUPABASE_COMPOSE_PROJECT="lab-brain-supabase"
 
@@ -535,6 +545,28 @@ if marker in text and "- ${POSTGRES_PORT}:${POSTGRES_PORT}" not in text:
 with open(path, "w") as fh:
     fh.write(text)
 
+# ── 2b. Expose `storage` directly on SUPABASE_STORAGE_PORT ─────────────────
+# Same reasoning as the db exposure above, for a different failure mode:
+# Kong rewrites the Host header when proxying to storage-api, and SigV4
+# (used by LiveKit Egress and any other S3-protocol client) signs the Host
+# header as part of the request. A request signed for the Kong-facing
+# host/port never matches what storage-api recomputes internally, so every
+# S3 upload fails 403 SignatureDoesNotMatch no matter how correct the
+# access key/secret are. Publishing storage-api's own port lets S3 clients
+# bypass Kong entirely and hit it with a consistent Host header.
+storage_changed = False
+storage_marker = "  storage:\n    container_name: supabase-storage\n"
+if storage_marker in text and "- ${SUPABASE_STORAGE_PORT}:5000" not in text:
+    text = text.replace(
+        storage_marker,
+        storage_marker + "    ports:\n      - ${SUPABASE_STORAGE_PORT}:5000\n",
+        1,
+    )
+    storage_changed = True
+
+with open(path, "w") as fh:
+    fh.write(text)
+
 # ── 3. Give every healthcheck a real start_period ───────────────────────────
 # Several services (rest, auth, imgproxy, functions, kong) ship with NO
 # start_period at all, meaning Docker starts counting failed healthchecks
@@ -581,9 +613,11 @@ if pooler_changed:
     print("[patch_supabase_compose] commented out the supavisor service block")
 if db_changed:
     print("[patch_supabase_compose] exposed db on ${POSTGRES_PORT}:${POSTGRES_PORT}")
+if storage_changed:
+    print("[patch_supabase_compose] exposed storage on ${SUPABASE_STORAGE_PORT}:5000")
 if hc_changed:
     print("[patch_supabase_compose] gave healthchecks a 30s start_period")
-if not pooler_changed and not db_changed and not hc_changed:
+if not pooler_changed and not db_changed and not storage_changed and not hc_changed:
     print("[patch_supabase_compose] already patched — nothing to do")
 PYEOF
 }
@@ -609,6 +643,29 @@ set_kong_port() {
     echo "KONG_HTTP_PORT=${port}" >> "$env_file"
   fi
   success "Set KONG_HTTP_PORT=${port} in ${env_file}."
+}
+
+# Writes SUPABASE_STORAGE_PORT into supabase-project/.env so Compose can
+# substitute it in the `storage:` service's `ports:` mapping added by
+# patch_supabase_compose() above — Compose only expands ${VARS} from the
+# project's own .env, not from variables set in this script's shell.
+# Safe to re-run: no-ops if already set to the current value.
+set_storage_port() {
+  local env_file="$1"
+  local port="$2"
+  [[ -f "$env_file" ]] || die ".env file not found: ${env_file}"
+
+  if grep -q "^SUPABASE_STORAGE_PORT=${port}$" "$env_file"; then
+    info "SUPABASE_STORAGE_PORT already set to ${port} — nothing to do."
+    return
+  fi
+
+  if grep -q '^SUPABASE_STORAGE_PORT=' "$env_file"; then
+    sed -i "s|^SUPABASE_STORAGE_PORT=.*|SUPABASE_STORAGE_PORT=${port}|" "$env_file"
+  else
+    echo "SUPABASE_STORAGE_PORT=${port}" >> "$env_file"
+  fi
+  success "Set SUPABASE_STORAGE_PORT=${port} in ${env_file}."
 }
 
 start_supabase() {
@@ -656,6 +713,11 @@ start_supabase() {
 
   # ── Step 2c: move Kong off its default port ──────────────────────────────
   set_kong_port "$env_file" "$SUPABASE_API_PORT"
+
+  # ── Step 2d: publish storage-api directly, bypassing Kong ────────────────
+  # See patch_supabase_compose()'s storage block for why this matters for
+  # S3-protocol clients (LiveKit Egress) specifically.
+  set_storage_port "$env_file" "$SUPABASE_STORAGE_PORT"
 
   # ── Step 3: generate secrets (first-time only) ───────────────────────────
   local pg_pass
@@ -818,6 +880,10 @@ print('config.json updated.')
   echo "  REST API           → http://localhost:${SUPABASE_API_PORT}/rest/v1/"
   echo "  Auth API           → http://localhost:${SUPABASE_API_PORT}/auth/v1/"
   echo "  Storage API        → http://localhost:${SUPABASE_API_PORT}/storage/v1/"
+  echo "  Storage API (direct, bypasses Kong) → http://localhost:${SUPABASE_STORAGE_PORT}/s3"
+  echo "  (Use this direct URL as S3_ENDPOINT in your .env for LiveKit Egress —"
+  echo "   going through Kong rewrites the Host header, which breaks SigV4"
+  echo "   signing and causes every upload to fail 403 SignatureDoesNotMatch.)"
   echo "  Postgres (direct)  → postgresql+asyncpg://postgres:${pg_pass_display}@localhost:${pg_port}/postgres"
   echo "  (Set this as SUPABASE_DB_URL in your .env for Alembic migrations)"
   echo ""

@@ -92,17 +92,29 @@ async def create_room(
 
 @router.get("/token")
 async def get_token(
+    session_id: str = Query(...),
     identity: Optional[str] = Query(default=None),
     current_user: dict = Depends(get_current_user),
-    session_id: str = Depends(require_session_access),
 ):
     """
     Issue a JWT for an authenticated user joining an existing room.
 
-    Anonymous guest join is gone (per confirmed decision). `identity` stays
-    as an optional cosmetic display label for the LiveKit UI — it defaults
-    to the current user's name rather than the old shared "browser-user"
-    literal, since the participant is now a real authenticated account.
+    Anonymous guest join is gone (per confirmed decision) — that's enforced
+    by get_current_user above. Access itself is NOT gated behind
+    require_session_access here: that dependency only admits the owner or
+    an existing session_participants row, but the only way to become a
+    participant is to successfully call this endpoint — a first-time
+    joiner could never pass it (the owner alone has an unconditional path
+    via sessions.user_id, which is why this bug only ever showed up for
+    non-owners). Any logged-in user who has the session_id (effectively a
+    room code/invite link, matching this file's actual join model) is
+    allowed to attempt to join; the room-existence check below is the real
+    gate, exactly like every other join-by-code flow.
+
+    `identity` stays as an optional cosmetic display label for the LiveKit
+    UI — it defaults to the current user's name rather than the old shared
+    "browser-user" literal, since the participant is now a real
+    authenticated account.
     """
     if not livekit_rooms.LIVEKIT_AVAILABLE:
         return JSONResponse(status_code=503, content={"error": "LiveKit SDK not installed"})
