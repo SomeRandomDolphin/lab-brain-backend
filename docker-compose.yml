@@ -1,0 +1,59 @@
+name: lab-brain
+
+# Manages the FastAPI app only. LiveKit, Ollama, and Supabase are started
+# and managed separately by start_services.sh — this just needs to reach
+# them on the host, the same way the app does when run with `python main.py`
+# outside Docker.
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lab-brain-backend
+    ports:
+      - "8080:8080"
+    env_file:
+      # Injected as real container env vars (not a file copied into the
+      # image) — see app/core/env.py / config.py notes below for why that
+      # distinction matters here.
+      - .env
+    environment:
+      # ── These 5 are the ONLY values app/core/config.py overrides from
+      # env vars at runtime (see load() in config.py) — everything else
+      # (local_llm.base_url, whisper.*, vad.*, etc.) is read from
+      # config.json only, with no env-var override path. Put those in the
+      # mounted config.json below instead of here.
+      #
+      # SUPABASE_URL / SUPABASE_SERVICE_KEY: put the real values in .env,
+      # not here, since they're secrets. Listed here only as a reminder of
+      # what config.py actually reads:
+      #   - SUPABASE_URL
+      #   - SUPABASE_SERVICE_KEY
+      #
+      # LiveKit: same story — real values belong in .env. start_services.sh
+      # runs LiveKit bound to all host interfaces (-p 7880:7880 etc.), so
+      # host.docker.internal reaches it from inside this container. Swap in
+      # LIVEKIT_API_KEY / LIVEKIT_API_SECRET matching whatever
+      # start_services.sh's LiveKit container was started with (check
+      # config.json's livekit.api_key/api_secret — they must match).
+      - LIVEKIT_URL=ws://host.docker.internal:7880
+    volumes:
+      # REQUIRED, not optional: local_llm.base_url (Ollama) has no env-var
+      # override in config.py — it's only ever read from config.json. If
+      # config.json's local_llm.base_url still points at a Tailscale IP
+      # (e.g. 100.122.56.39) that this container can't route to, change it
+      # here to http://host.docker.internal:11434/v1 — since start_services.sh
+      # publishes Ollama with -p 11434:11434 on the host, that address reaches
+      # it from inside the container. Same applies if livekit.url /
+      # supabase.url/key are left in config.json instead of .env: env vars
+      # above take precedence, but only for those 5 keys.
+      - ./config.json:/app/config.json
+    extra_hosts:
+      # Makes host.docker.internal resolve on Linux too (Docker Desktop for
+      # Mac/Windows already provides it). Needed because start_services.sh's
+      # containers are published on the HOST's network, not this compose
+      # file's — 127.0.0.1/localhost inside this container refers to the
+      # container itself, not the host.
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
