@@ -15,13 +15,14 @@ torch.set_num_threads(cfg.whisper.cpu_threads)
 
 # PyTorch 2.6 changed torch.load's default from weights_only=False to
 # weights_only=True. The pyannote VAD checkpoint that whisperx.load_model()
-# pulls in below contains an omegaconf.listconfig.ListConfig object, which
-# isn't in torch's default safe-globals allowlist — without this, loading
-# that checkpoint raises _pickle.UnpicklingError at import time. This is the
-# official fix recommended in torch's own error message; safe here since the
+# pulls in below pickles several omegaconf classes (ListConfig,
+# ContainerMetadata, and potentially others) that aren't in torch's default
+# safe-globals allowlist — allowlisting them one at a time as each new
+# UnpicklingError surfaces is a whack-a-mole. Instead, override torch.load's
+# default back to weights_only=False for this one call. Safe here since the
 # checkpoint is pyannote's own official release, not untrusted input.
-from omegaconf.listconfig import ListConfig
-torch.serialization.add_safe_globals([ListConfig])
+import functools
+torch.load = functools.partial(torch.load, weights_only=False)
 
 log = logging.getLogger(__name__)
 
