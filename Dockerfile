@@ -4,7 +4,20 @@
 # Stage 1: builder — has compilers, git, and the pip cache. None of this
 # ships in the final image; only the resulting venv gets copied forward.
 # ═══════════════════════════════════════════════════════════════════════════
-FROM python:3.11-slim AS builder
+# Pinned to -bookworm explicitly (not the rolling `python:3.11-slim` tag):
+# that tag recently moved from Debian bookworm (glibc 2.36) to trixie
+# (glibc 2.41). Newer glibc's dynamic loader refuses to mprotect an
+# executable stack the way the prebuilt ctranslate2 wheel's bundled
+# libctranslate2-*.so expects, and both whisperx and faster-whisper import
+# ctranslate2 — so on trixie the app fails at import time with
+# "ImportError: ... cannot enable executable stack as shared object
+# requires: Invalid argument" before uvicorn ever starts. See
+# https://github.com/OpenNMT/CTranslate2/issues/1849 — the fix (#1852) is
+# closed upstream but hasn't actually shipped in a published wheel as of
+# ctranslate2 4.8.1, so pinning the base image (not a Python dependency)
+# is the reliable fix. Revisit this pin once a ctranslate2 release fixes
+# the underlying .so.
+FROM python:3.11-slim-bookworm AS builder
 
 # build-essential : compiles native extensions for any package without a
 #                   prebuilt wheel for this platform/Python version
@@ -62,7 +75,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Stage 2: runtime — slim base + only what's needed to RUN the app.
 # No compilers, no git, no pip cache.
 # ═══════════════════════════════════════════════════════════════════════════
-FROM python:3.11-slim AS runtime
+# Pinned to -bookworm — see the matching comment on the builder stage's
+# FROM line above; both stages must use the same glibc, and the runtime
+# stage is the one that actually imports ctranslate2 at process startup.
+FROM python:3.11-slim-bookworm AS runtime
 
 # ffmpeg          : required by whisperx / av for audio+video decode
 # libsndfile1     : required by soundfile (whisperx/pyannote dependency)
