@@ -18,11 +18,34 @@ torch.set_num_threads(cfg.whisper.cpu_threads)
 # pulls in below pickles several omegaconf classes (ListConfig,
 # ContainerMetadata, and potentially others) that aren't in torch's default
 # safe-globals allowlist — allowlisting them one at a time as each new
-# UnpicklingError surfaces is a whack-a-mole. Instead, override torch.load's
-# default back to weights_only=False for this one call. Safe here since the
-# checkpoint is pyannote's own official release, not untrusted input.
+# UnpicklingError surfaces is a whack-a-mole. We want to force
+# weights_only=False for this one call. Safe here since the checkpoint is
+# pyannote's own official release, not untrusted input.
+#
+# NOTE: functools.partial(torch.load, weights_only=False) does NOT work here.
+# lightning_fabric's internal loader (lightning_fabric/utilities/cloud_io.py
+# _load()) always calls torch.load(..., weights_only=weights_only) with an
+# *explicit* keyword — its own default just happens to be None. A partial's
+# preset kwargs only fill in arguments the caller omits; they're silently
+# discarded the moment the caller supplies that keyword itself, even as
+# None. So the explicit weights_only=None from lightning_fabric overrides
+# our partial's weights_only=False, None falls through to torch's
+# safe-globals resolution path, and we get the exact UnpicklingError this
+# comment is trying to prevent.
+#
+# A real wrapper function doesn't have this problem — it can unconditionally
+# overwrite the kwarg before forwarding, regardless of what the caller passed.
 import functools
-torch.load = functools.partial(torch.load, weights_only=False)
+_original_torch_load = torch.load
+
+
+@functools.wraps(_original_torch_load)
+def _patched_torch_load(*args, **kwargs):
+    kwargs["weights_only"] = False
+    return _original_torch_load(*args, **kwargs)
+
+
+torch.load = _patched_torch_load
 
 log = logging.getLogger(__name__)
 
