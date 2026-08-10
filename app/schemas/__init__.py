@@ -16,6 +16,7 @@ from app.schemas.auth import (  # noqa: F401
     ForgotPasswordRequest,
     ResetPasswordRequest,
     OkResponse,
+    TosConsentRequest,
 )
 
 

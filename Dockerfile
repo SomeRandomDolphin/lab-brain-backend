@@ -85,15 +85,15 @@ RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app $VENV_PATH
 USER appuser
 
 ENV PYTHONUNBUFFERED=1 \
-    PORT=8080
+    PORT=8000
 
-EXPOSE 8080
+EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD curl -sf http://localhost:8080/docs > /dev/null || exit 1
+    CMD curl -sf http://localhost:8000/docs > /dev/null || exit 1
 
 # Equivalent to `python main.py` per the README, but explicit about host/port
 # and without dev-mode --reload. Swap in `--workers N` if you need more than
 # one worker process (note: in-memory/session state in the pipeline modules
 # isn't necessarily safe to run behind >1 worker without checking first).
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

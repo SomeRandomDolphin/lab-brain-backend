@@ -305,6 +305,10 @@ async def livekit_pipeline(
         # by one track) and still needs diarization to tell them apart.
         if len(_seen_audio_identities) > 1:
             speaker = get_known_identity(session_id, identity) or identity
+            # One LiveKit identity == one distinct remote participant here,
+            # so it's safe (and collision-free vs a display name) to gate
+            # consent on the identity itself.
+            consent_key = identity
             word_timestamps = (
                 [{**w, "speaker": speaker} for w in raw_word_ts] if raw_word_ts else raw_word_ts
             )
@@ -334,9 +338,17 @@ async def livekit_pipeline(
             else:
                 speaker = await assign_speaker(dlg, audio_segment=segment_audio)
 
+            # Shared mic/camera: a single LiveKit identity can carry several
+            # physically-distinct, differently-consenting people (diarization
+            # is exactly what's telling them apart). Gating on `identity`
+            # here would silently apply the account holder's consent to
+            # everyone else picked up on that mic, so this MUST stay keyed
+            # on the per-voice diarization label, not the account identity.
+            consent_key = speaker
+
         # Privacy
         redacted_text = (
-            _privacy.redact(full_text) if _privacy.check_consent(speaker) else full_text
+            await _privacy.redact_async(full_text) if _privacy.check_consent(consent_key) else full_text
         )
         # summoned = wake-word spoken in THIS segment, OR the frontend's
         # manual "summon agent" button was pressed (force_summon) and hasn't

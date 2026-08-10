@@ -27,6 +27,10 @@ class UserOut(BaseModel):
     avatarUrl:  Optional[str] = None
     createdAt:  str           # ISO 8601
     isAdmin:    bool = False
+    # None = the account-level privacy-screen decision hasn't been made yet;
+    # the dashboard shows the first-login ToS modal until this is set.
+    tosAccepted:   Optional[bool] = None
+    tosAcceptedAt: Optional[str]  = None
 
 
 # ── Register ──────────────────────────────────────────────────────────────────
@@ -91,3 +95,15 @@ class ResetPasswordRequest(BaseModel):
 
 class OkResponse(BaseModel):
     ok: bool = True
+
+
+# ── Privacy screen / ToS consent ───────────────────────────────────────────────
+# NOTE: this is used by app/api/v1/endpoints/privacy.py's POST /tos-consent.
+# It's defined here (alongside UserOut, since it's an account-level field)
+# rather than in whatever schemas module ConsentRequest/ConsentSyncRequest
+# live in — make sure it's re-exported from app/schemas/__init__.py the same
+# way those are, or the `from app.schemas import ... TosConsentRequest`
+# import in the endpoints file will fail.
+
+class TosConsentRequest(BaseModel):
+    accepted: bool

@@ -128,7 +128,7 @@ async def asr_endpoint(ws: WebSocket):
                 assign_speaker_words(dlg, raw_word_ts, segment_audio)
                 if raw_word_ts else raw_word_ts
             )
-            redacted_text = _privacy.redact(full_text) if _privacy.check_consent(speaker) else full_text
+            redacted_text = await _privacy.redact_async(full_text) if _privacy.check_consent(speaker) else full_text
             summoned      = _capture.check_summon(session_id, full_text)
 
             current_known = set(perc_state.present_speakers)

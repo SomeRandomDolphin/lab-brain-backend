@@ -12,7 +12,7 @@ services:
       dockerfile: Dockerfile
     container_name: lab-brain-backend
     ports:
-      - "8080:8080"
+      - "8000:8000"
     env_file:
       # Injected as real container env vars (not a file copied into the
       # image) — see app/core/env.py / config.py notes below for why that

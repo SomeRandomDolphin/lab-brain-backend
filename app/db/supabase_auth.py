@@ -104,6 +104,9 @@ def _user_to_dict(supa_user) -> dict:
         "avatarUrl": meta.get("avatar_url"),
         "createdAt": created_at,
         "isAdmin":   meta.get("role") == "admin",
+        # None = user hasn't been asked yet -> frontend shows the ToS modal.
+        "tosAccepted":   meta.get("tos_accepted"),
+        "tosAcceptedAt": meta.get("tos_accepted_at"),
     }
 
 
@@ -157,6 +160,42 @@ def create_user(name: str, email: str, password: str) -> dict:
         if "already registered" in msg or "already exists" in msg or "unique" in msg:
             raise ValueError(f"Email already registered: {email}") from exc
         raise
+
+
+def update_user_metadata(user_id: str, patch: dict) -> dict:
+    """
+    Merge `patch` into a user's user_metadata rather than overwriting it —
+    Supabase's admin.update_user_by_id() replaces user_metadata wholesale,
+    and other fields already stored there (name, avatar_url, role) must
+    survive a partial update like a ToS-consent write.
+    """
+    try:
+        resp = _get_admin().auth.admin.get_user_by_id(user_id)
+        if resp.user is None:
+            raise ValueError(f"No such user: {user_id}")
+        merged = {**(resp.user.user_metadata or {}), **patch}
+        updated = _get_admin().auth.admin.update_user_by_id(
+            user_id, {"user_metadata": merged}
+        )
+        return _user_to_dict(updated.user)
+    except ValueError:
+        raise
+    except Exception as exc:
+        log.error(f"[supabase_auth] update_user_metadata failed for {user_id}: {exc}")
+        raise
+
+
+def set_tos_consent(user_id: str, accepted: bool) -> dict:
+    """Record the account-level privacy-screen decision from the dashboard's
+    first-login ToS modal. See app/api/v1/endpoints/privacy.py's
+    POST /privacy/tos-consent for the caller."""
+    import time
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    updated = update_user_metadata(
+        user_id, {"tos_accepted": accepted, "tos_accepted_at": ts}
+    )
+    log.info(f"[supabase_auth] tos_consent set for {user_id}: accepted={accepted}")
+    return updated
 
 
 def authenticate_user(email: str, password: str) -> Optional[tuple[dict, str, str]]:

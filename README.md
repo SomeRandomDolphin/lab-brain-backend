@@ -128,10 +128,10 @@ is configured. Supabase handles reset email delivery by default; see
 ```bash
 python main.py
 # or with auto-reload for development:
-uvicorn main:app --reload --port 8080
+uvicorn main:app --reload --port 8000
 ```
 
-API docs: http://localhost:8080/docs
+API docs: http://localhost:8000/docs
 
 ---
 

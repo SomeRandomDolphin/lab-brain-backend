@@ -64,7 +64,18 @@ async def create_room(
         return JSONResponse(status_code=503, content={"error": f"LiveKit error: {exc}"})
 
     try:
-        token = livekit_rooms.create_token(session_id, identity=req.display_name)
+        # identity is the account's stable id — this is what participant.identity
+        # will carry through to session_pipeline.py's audio/video drain, and
+        # what app/services/privacy.py's consent registry is keyed on (see
+        # POST /privacy/tos-consent). display_name is purely cosmetic and can
+        # safely be whatever the client asked for; it must never be passed as
+        # `identity` or two people could collide on the same LiveKit identity
+        # (or on the same consent record) whenever they share a display name.
+        token = livekit_rooms.create_token(
+            session_id,
+            identity=current_user["id"],
+            display_name=req.display_name,
+        )
     except Exception as exc:
         log.error(f"[livekit] create_token failed: {exc}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": f"Token error: {exc}"})
@@ -111,10 +122,16 @@ async def get_token(
     allowed to attempt to join; the room-existence check below is the real
     gate, exactly like every other join-by-code flow.
 
-    `identity` stays as an optional cosmetic display label for the LiveKit
-    UI — it defaults to the current user's name rather than the old shared
-    "browser-user" literal, since the participant is now a real
-    authenticated account.
+    `identity` (the query param) stays as an optional cosmetic display
+    label for the LiveKit UI — it defaults to the current user's name
+    rather than the old shared "browser-user" literal, since the
+    participant is now a real authenticated account. It is NOT passed as
+    the actual LiveKit identity below (that was the bug: a client could
+    previously set ?identity=<anything> and that became their real LiveKit
+    participant.identity, which is also what app/services/privacy.py's
+    consent registry keys on — letting a client collide with, or even
+    impersonate, another account's identity). The real identity is always
+    server-derived from current_user["id"], never client-supplied.
     """
     if not livekit_rooms.LIVEKIT_AVAILABLE:
         return JSONResponse(status_code=503, content={"error": "LiveKit SDK not installed"})
@@ -128,7 +145,11 @@ async def get_token(
     display_identity = identity or current_user.get("name") or current_user["email"]
 
     try:
-        token = livekit_rooms.create_token(session_id, identity=display_identity)
+        token = livekit_rooms.create_token(
+            session_id,
+            identity=current_user["id"],
+            display_name=display_identity,
+        )
     except Exception as exc:
         return JSONResponse(status_code=500, content={"error": str(exc)})
 
