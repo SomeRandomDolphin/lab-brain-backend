@@ -17,6 +17,7 @@ numpy>=1.26.0
 openai>=1.30.0
 whisperx>=3.1.5
 torch>=2.1.0
+transformers>=5.14.1
 
 # ── Diarization ───────────────────────────────────────────────────────────────
 pyannote.audio>=3.3.2
