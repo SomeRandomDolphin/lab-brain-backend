@@ -24,19 +24,20 @@ torch==2.8.0
 transformers>=5.14.1
 
 # ── Diarization ───────────────────────────────────────────────────────────────
-pyannote.audio>=3.3.2
-# Pinned (<1.0.0, not just >=0.13.0 per pyannote's own floor): pyannote.audio
-# 3.4.0's Pipeline.from_pretrained() hardcodes `use_auth_token=` when it calls
-# huggingface_hub's hf_hub_download() internally. huggingface_hub only accepted
-# that kwarg via a backward-compat shim (validate_hf_hub_args →
-# smoothly_deprecate_use_auth_token) that translated it to `token=`; the shim
-# existed through the whole 0.x line and was dropped in the 1.0.0 major bump.
-# An unpinned install now resolves to 1.x, the shim is gone, and diarization
-# pipeline load fails with "hf_hub_download() got an unexpected keyword
-# argument 'use_auth_token'" — silently falling back to round-robin speaker
-# assignment. Pin below 1.0.0 until pyannote.audio itself is upgraded past
-# this internal use_auth_token call.
-huggingface_hub<1.0.0
+# Pinned >=4.0.0 (not just >=3.3.2): pyannote.audio 3.4.0's Pipeline.from_pretrained()
+# hardcodes `use_auth_token=` in its internal hf_hub_download() call, which only
+# worked because huggingface_hub kept a backward-compat shim
+# (validate_hf_hub_args -> smoothly_deprecate_use_auth_token) translating
+# use_auth_token -> token for the whole 0.x line. That shim was dropped in
+# huggingface_hub 1.0.0. We can't pin huggingface_hub<1.0 to route around this,
+# because transformers>=5.14.1 requires huggingface-hub>=1.5.0,<2.0 — a direct
+# conflict. pyannote.audio 4.x renamed its own Pipeline.from_pretrained kwarg to
+# `token` and dropped its huggingface_hub upper bound entirely, so it's
+# compatible with modern huggingface_hub and modern transformers at the same
+# time. See app/pipeline/dialogue_service.py — the diarization pipeline loader
+# now passes token=, and _extract_turns() already normalizes across both the
+# 3.x (bare Annotation) and 4.x (DiarizeOutput wrapper) pipeline call results.
+pyannote.audio>=4.0.0
 
 # ── Retrieval ─────────────────────────────────────────────────────────────────
 scikit-learn>=1.4.0
