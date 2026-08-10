@@ -73,7 +73,11 @@ def _get_diarization_pipeline():
             or os.environ.get("HF_TOKEN")
             or os.environ.get("HUGGINGFACE_TOKEN")
         )
-        use_auth  = {"token": hf_token} if hf_token else {}
+        # pyannote.audio 3.4.0's Pipeline.from_pretrained() only accepts
+        # `use_auth_token` (the `token` kwarg was introduced in pyannote.audio
+        # 4.x). Passing `token=` here raised a TypeError that got swallowed
+        # below, silently degrading to the round-robin speaker fallback.
+        use_auth  = {"use_auth_token": hf_token} if hf_token else {}
         pipeline  = PyannotePipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1", **use_auth
         )
