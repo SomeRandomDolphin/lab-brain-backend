@@ -30,7 +30,7 @@ from app.db import lkc_graph
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_OLLAMA_BASE_URL = "http://100.122.56.39:11434"
+_DEFAULT_OLLAMA_BASE_URL = "http://host.docker.internal:11434"
 _DEFAULT_EMBED_MODEL     = "qwen3-embedding:0.6b"
 
 

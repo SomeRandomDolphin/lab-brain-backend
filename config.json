@@ -1,6 +1,6 @@
 {
   "local_llm": {
-    "base_url": "http://100.122.56.39:11434/v1",
+    "base_url": "http://host.docker.internal:11434/v1",
     "vision_model": "qwen3-vl:4b",
     "dialogue_model": "qwen3:4b",
     "embedding_model": "qwen3-embedding:0.6b",
@@ -50,14 +50,14 @@
   },
   "livekit": {
     "_comment": "LiveKit SFU \u00e2\u20ac\u201d run: docker run --rm -p 7880:7880 livekit/livekit-server --dev",
-    "url": "ws://100.122.56.39:7880",
+    "url": "ws://host.docker.internal:7880",
     "api_key": "devkey",
     "api_secret": "QQYwEDWf1zeIPS90SP5AwEqflO+/xiz/0Gi1aOfEG9Y=",
-    "node_ip": "100.122.56.39"
+    "node_ip": "host.docker.internal"
   },
   "supabase": {
     "_comment": "Set SUPABASE_URL and SUPABASE_KEY env vars \u00e2\u20ac\u201d never hardcode secrets here.",
-    "url": "http://localhost:8080",
+    "url": "http://host.docker.internal:8080",
     "key": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzgyNzEyNDE4LCJleHAiOjE5NDAzOTI0MTh9.JRXxfOd3PEP8YBvoX_u6f7WYu6Mr2ZWJfvRqL-GkUyc",
     "store_audio": false,
     "store_vision": true
