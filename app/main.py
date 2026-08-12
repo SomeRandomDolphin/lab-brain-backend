@@ -76,6 +76,8 @@ def create_app() -> FastAPI:
         allow_origins=[
             "http://localhost:5173",
             "http://localhost:3000",
+            "http://100.122.56.39:5173",
+            "http://100.122.56.39:3000",
         ],
         allow_credentials=True,
         allow_methods=["*"],
@@ -83,7 +85,7 @@ def create_app() -> FastAPI:
     )
 
     # ── Debug: surface real 500 errors ────────────────────────────────────────
-    _ALLOWED_ORIGINS = {"http://localhost:5173", "http://localhost:3000"}
+    _ALLOWED_ORIGINS = {"http://localhost:5173", "http://localhost:3000", "http://100.122.56.39:5173", "http://100.122.56.39:3000"}
 
     @app.exception_handler(Exception)
     async def _debug_exception_handler(request: Request, exc: Exception) -> JSONResponse:
