@@ -35,10 +35,25 @@ from fastapi.staticfiles import StaticFiles
 
 from app.core.config import cfg
 from app.core.logging import setup_logging
-from app.api.v1.router import api_router
 
+# setup_logging() must run BEFORE importing app.api.v1.router, not after.
+# That import chain pulls in app.pipeline (asr.py's WhisperX/VAD loading,
+# dialogue_service's diarization pipeline loading, etc.), which does real
+# work and logs INFO-level progress messages ("Loading WhisperX...",
+# "WhisperX ready.", ...) at MODULE IMPORT TIME — i.e. the moment this
+# import statement runs, not later. If that import happens before
+# setup_logging() has attached a handler to the root logger, those INFO
+# calls aren't delayed or buffered — the root logger has no handler yet and
+# defaults to WARNING, so they're silently dropped and gone for good. This
+# was invisible for a long time because asr.py's import used to fail (for
+# unrelated reasons, since fixed) before ever reaching its "WhisperX
+# ready." log line; now that it succeeds, the missing output became a real
+# gap. Moving setup_logging() up here, before api_router is imported,
+# closes it.
 setup_logging()
 log = logging.getLogger(__name__)
+
+from app.api.v1.router import api_router
 
 
 def create_app() -> FastAPI:
