@@ -68,6 +68,36 @@ MIN_WORD_SCORE = 0.40
 # ── ASR backend ───────────────────────────────────────────────────────────────
 try:
     import whisperx
+
+    # whisperx/pyannote.audio 4.x compat shim.
+    # whisperx's bundled VAD wrapper (whisperx/vads/pyannote.py) still
+    # unconditionally forwards a `use_auth_token=` kwarg down through
+    # pyannote.audio's VoiceActivityDetection pipeline into Inference().
+    # pyannote.audio 4.x's Inference.__init__() doesn't accept that kwarg at
+    # all — unlike Pipeline.from_pretrained(), which just got renamed to
+    # `token=`, this one was dropped outright. This is an open, unresolved
+    # upstream bug (github.com/m-bain/whisperX issues #1241, #1333, #1406),
+    # still present in the latest released whisperx==3.8.5 as of this
+    # writing — no fixed release exists yet. The community workaround is
+    # downgrading to pyannote.audio==3.4.0, but that reopens the
+    # huggingface_hub/transformers conflict documented on the
+    # pyannote.audio pin in requirements.txt. Patching Inference to
+    # silently discard the stray kwarg fixes this one well-defined
+    # boundary without touching any dependency pin. Must patch the name as
+    # bound inside voice_activity_detection's own module namespace (`from
+    # .inference import Inference` creates a local binding there) — patching
+    # pyannote.audio.core.inference.Inference itself would not affect it.
+    import pyannote.audio.pipelines.voice_activity_detection as _pa_vad
+
+    _OriginalVadInference = _pa_vad.Inference
+
+    class _CompatVadInference(_OriginalVadInference):
+        def __init__(self, *args, **kwargs):
+            kwargs.pop("use_auth_token", None)
+            super().__init__(*args, **kwargs)
+
+    _pa_vad.Inference = _CompatVadInference
+
     WHISPERX_AVAILABLE = True
     log.info(f"Loading WhisperX '{cfg.whisper.model_size}' on {cfg.whisper.device}…")
     _wx_model = whisperx.load_model(
