@@ -108,6 +108,14 @@ class LiveKitConfig:
     Then set api_key="devkey", api_secret="devsecret".
     """
     url:            str  = "ws://host.docker.internal:7880"
+    # public_url is what gets handed to the *browser* in join-room API
+    # responses (create_room / get_token / client_config). It has to be
+    # reachable from wherever the browser actually sits — a Tailscale IP,
+    # a public hostname, etc — never host.docker.internal, which only
+    # resolves inside a container. Falls back to `url` below if unset, so
+    # existing deployments where the two happen to coincide keep working
+    # with no config change required.
+    public_url:     str  = ""
     api_key:        str  = "devkey"
     api_secret:     str  = "devsecret"
     egress_enabled: bool = False
@@ -340,20 +348,35 @@ def load(path: Path = CONFIG_PATH) -> Config:
     # long-term (self-hosted LiveKit's api_secret is exactly as sensitive as
     # the Supabase service key above).
     env_lk_url        = (os.environ.get("LIVEKIT_URL") or "").strip()
+    env_lk_public_url = (os.environ.get("LIVEKIT_PUBLIC_URL") or "").strip()
     env_lk_api_key    = (os.environ.get("LIVEKIT_API_KEY") or "").strip()
     env_lk_api_secret = (os.environ.get("LIVEKIT_API_SECRET") or "").strip()
     if env_lk_url:
         c.livekit.url = env_lk_url
+    if env_lk_public_url:
+        c.livekit.public_url = env_lk_public_url
     if env_lk_api_key:
         c.livekit.api_key = env_lk_api_key
     if env_lk_api_secret:
         c.livekit.api_secret = env_lk_api_secret
 
+    # If nothing set public_url explicitly (neither config.json nor
+    # LIVEKIT_PUBLIC_URL), fall back to `url` so this doesn't silently
+    # break deployments that never knew about the split. This intentionally
+    # runs *after* the LIVEKIT_URL env override above, so on this box it
+    # would fall back to host.docker.internal too — LIVEKIT_PUBLIC_URL (or
+    # config.json's livekit.public_url) must be set explicitly to fix the
+    # browser-facing address; there is no way to derive a real reachable
+    # address automatically.
+    if not c.livekit.public_url:
+        c.livekit.public_url = c.livekit.url
+
     log.info(
         f"Config loaded. LLM: {c.local_llm.base_url} | "
         f"summon_required={c.summon.require_summon} | "
         f"NER={c.spacy.model} | graph={c.lkc.db_file} | "
-        f"livekit={c.livekit.url} (egress={'on' if c.livekit.egress_enabled else 'off'}) | "
+        f"livekit={c.livekit.url} public={c.livekit.public_url} "
+        f"(egress={'on' if c.livekit.egress_enabled else 'off'}) | "
         f"supabase={'configured' if c.supabase.url else 'disabled'}"
     )
     return c

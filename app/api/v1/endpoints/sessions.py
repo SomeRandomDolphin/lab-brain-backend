@@ -131,7 +131,7 @@ async def client_config():
         "camera_fps":       cfg.vision.camera_fps,
         "camera_quality":   cfg.vision.camera_quality,
         "tts_auto_hide_ms": cfg.dialogue.tts_auto_hide_ms,
-        "lk_url":           cfg.livekit.url,
+        "lk_url":           cfg.livekit.public_url,
     }
 
 

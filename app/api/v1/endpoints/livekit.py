@@ -98,7 +98,7 @@ async def create_room(
         log.error(f"[livekit] upsert_session failed (non-fatal): {exc}", exc_info=True)
 
     log.info(f"[livekit] room created: {session_id} host={req.display_name} owner={current_user['id']}")
-    return RoomCreateResponse(session_id=session_id, token=token, lk_url=cfg.livekit.url)
+    return RoomCreateResponse(session_id=session_id, token=token, lk_url=cfg.livekit.public_url)
 
 
 @router.get("/token")
@@ -160,7 +160,7 @@ async def get_token(
     except Exception as exc:
         log.error(f"[livekit] add_session_participant failed (non-fatal): {exc}", exc_info=True)
 
-    return {"session_id": session_id, "token": token, "lk_url": cfg.livekit.url}
+    return {"session_id": session_id, "token": token, "lk_url": cfg.livekit.public_url}
 
 
 @router.get("/room/{session_id}")
