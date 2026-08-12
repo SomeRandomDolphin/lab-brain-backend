@@ -61,10 +61,18 @@ COPY requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip && \
     if [ "$USE_CUDA_TORCH" = "0" ]; then \
-        pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt; \
+        sed -E 's/^(torch|torchaudio|torchvision)==([0-9][0-9A-Za-z.]*)$/\1==\2+cpu/' requirements.txt > requirements.resolved.txt && \
+        pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.resolved.txt; \
     else \
         pip install -r requirements.txt; \
     fi
+    # requirements.resolved.txt only appends +cpu to torch/torchaudio/torchvision's
+    # own pinned lines (requirements.txt otherwise unchanged) — still ONE pip
+    # install call, so the whole graph (including transformers' backtracking)
+    # resolves against a hard-pinned, ABI-matched +cpu build for all three,
+    # instead of leaving pip free to land on a mismatched combination. See
+    # requirements.txt's comment on the torch/torchaudio/torchvision pins for
+    # the failure mode (`undefined symbol: torch_library_impl`) this avoids.
 
 # spaCy NER model used by app/services/capture.py — README calls this out
 # explicitly as a required post-install step.

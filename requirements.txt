@@ -21,6 +21,24 @@ whisperx>=3.1.5
 # app/pipeline/asr.py's add_safe_globals fix). Pinning avoids a future
 # rebuild silently resolving to yet another breaking torch release.
 torch==2.8.0
+# Pinned exact and listed explicitly (not left to whisperx's torchaudio~=2.8.0
+# / torchvision~=0.23.0 and pyannote.audio's torchaudio>=2.8.0 transitive
+# constraints): with only torch pinned, pip's resolver has to backtrack across
+# the whole dependency graph (transformers, openai, etc. all have many
+# candidate versions), and during that backtracking it can land on a
+# torchaudio build whose compiled ABI doesn't match whatever torch build it
+# settled on for that run — a bare version pin like `torchaudio==2.8.0`
+# doesn't prevent this, since PEP 440 `==` matching doesn't reliably
+# discriminate on the +cpu local-version segment that distinguishes the CPU
+# build from the default CUDA-ABI build on PyPI. Mismatched ABI fails at
+# import time with `OSError: ... undefined symbol: torch_library_impl`
+# rather than at install time, so it isn't caught by a successful `pip
+# install`. See the Dockerfile's builder-stage RUN step, which appends
+# `+cpu` to exactly these three pins (in one atomic install, not a separate
+# step — see that step's own comment for why sequential installs reintroduce
+# this same problem) when building for CPU-only inference.
+torchaudio==2.8.0
+torchvision==0.23.0
 transformers>=5.14.1
 
 # ── Diarization ───────────────────────────────────────────────────────────────
