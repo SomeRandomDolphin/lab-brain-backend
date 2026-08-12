@@ -54,6 +54,23 @@ torch==2.8.0
 # this same problem) when building for CPU-only inference.
 torchaudio==2.8.0
 torchvision==0.23.0
+# Pinned exact, same reasoning as torch/torchaudio/torchvision above: left
+# unpinned, pip's resolver can land on a torchcodec build whose compiled
+# core extension doesn't match torch==2.8.0's ABI. Symptom is different from
+# the torchaudio case though — instead of failing at import time for the
+# whole package, torchcodec fails per-FFmpeg-version at runtime with
+# `undefined symbol: torch_from_blob` the moment it finds a real FFmpeg lib
+# to test against (harmless for versions where no system FFmpeg lib is even
+# present — those just report "file not found" first). Per
+# https://github.com/pytorch/torchcodec#installing-torchcodec , torch 2.8.x
+# pairs with torchcodec 0.6.x or 0.7.x.
+#
+# NOTE: unlike torch/torchaudio/torchvision, do NOT add a `+cpu` suffix to
+# this pin in the Dockerfile's sed step — torchcodec didn't start shipping
+# a separate CUDA-default PyPI wheel until 0.11, so 0.7.0's plain PyPI wheel
+# is already CPU-only; `torchcodec==0.7.0+cpu` doesn't exist on either index
+# and pip will fail to resolve it.
+torchcodec==0.7.0
 transformers>=5.14.1
 
 # ── Diarization ───────────────────────────────────────────────────────────────
