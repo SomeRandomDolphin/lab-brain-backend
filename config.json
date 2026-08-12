@@ -53,7 +53,7 @@
     "url": "ws://host.docker.internal:7880",
     "api_key": "devkey",
     "api_secret": "QQYwEDWf1zeIPS90SP5AwEqflO+/xiz/0Gi1aOfEG9Y=",
-    "node_ip": "host.docker.internal"
+    "node_ip": "100.122.56.39"
   },
   "supabase": {
     "_comment": "Set SUPABASE_URL and SUPABASE_KEY env vars \u00e2\u20ac\u201d never hardcode secrets here.",
