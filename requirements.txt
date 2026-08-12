@@ -16,6 +16,21 @@ numpy>=1.26.0
 # ── LLM / ASR ─────────────────────────────────────────────────────────────────
 openai>=1.30.0
 whisperx>=3.1.5
+# Pinned explicitly (whisperx itself declares omegaconf>=2.3.0, but only as a
+# transitive dependency — it never appears as its own line here). During pip's
+# resolver backtracking (triggered by transformers/openai having many
+# candidate versions to negotiate against), omegaconf silently fell out of
+# the final resolved set entirely — no install-time error, just a missing
+# package. At runtime this surfaced as `ModuleNotFoundError("No module named
+# 'omegaconf'")` deep inside whisperx.load_model()'s VAD setup, which
+# asr.py's broad `except ImportError` caught and misreported as "whisperx
+# unavailable", silently degrading to the faster-whisper fallback. Same root
+# cause class as the torchaudio/torchvision pins above — an unpinned
+# transitive dependency at the mercy of resolver backtracking — just a
+# missing-module symptom instead of an ABI mismatch. Pin whatever else
+# whisperx pulls in transitively the same way if this recurs for a different
+# module.
+omegaconf>=2.3.0
 # Pinned exact (not >=): torch>=2.1.0 previously resolved to 2.8.0, whose
 # weights_only=True default breaks pyannote VAD checkpoint loading (see
 # app/pipeline/asr.py's add_safe_globals fix). Pinning avoids a future
