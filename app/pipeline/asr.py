@@ -86,10 +86,18 @@ try:
         )
         _wx_align_cache[cfg.whisper.language] = (_align_model, _align_meta)
         log.info("Alignment model ready.")
-except ImportError:
+except ImportError as e:
+    # NOTE: this except clause fires for the literal "whisperx isn't
+    # installed" case, but also for any ImportError raised deep inside
+    # whisperx.load_model() itself — e.g. a nested torchcodec/pyannote
+    # import failing partway through VAD setup. Logging the real exception
+    # (not just a fixed string) is the difference between "whisperx really
+    # isn't installed" and "whisperx is installed but something it imports
+    # broke" — the fallback behavior is identical either way, but the cause
+    # isn't, and only one of those is worth chasing.
     WHISPERX_AVAILABLE = False
     from faster_whisper import WhisperModel
-    log.warning("whisperx not installed — falling back to faster-whisper")
+    log.warning(f"whisperx unavailable ({e!r}) — falling back to faster-whisper")
     _fw_model = WhisperModel(
         cfg.whisper.model_size,
         device=cfg.whisper.device,
