@@ -490,6 +490,16 @@ EOF
   # the backend image's appuser uid exactly, or this swaps one mismatch for
   # another — override via config.json if your backend Dockerfile ever
   # changes appuser's uid/gid.
+  # --tmpfs "/home/egress/tmp:...": separate issue from the --user fix
+  # above. /home/egress/tmp lives inside the image itself (not a mounted
+  # volume) and is owned by root from the image build — the entrypoint's
+  # own startup cleanup ("rm: cannot remove '/home/egress/tmp/*':
+  # Permission denied") fails against it once we're running as uid 1000
+  # instead of root, which was crashing the container before it ever got
+  # to the recording logic. Mounting a fresh tmpfs there, pre-owned by
+  # appuser_uid:appuser_gid, sidesteps whatever ownership the image baked
+  # in. Bonus: Chrome's temp/profile writes during compositing land on
+  # RAM-backed tmpfs instead of the container's disk layer.
   local appuser_uid appuser_gid
   appuser_uid=$(read_config "['recordings']['appuser_uid']" "1000")
   appuser_gid=$(read_config "['recordings']['appuser_gid']" "1000")
@@ -498,6 +508,7 @@ EOF
     --network "$NETWORK_NAME" \
     --shm-size=1gb \
     --user "${appuser_uid}:${appuser_gid}" \
+    --tmpfs "/home/egress/tmp:rw,uid=${appuser_uid},gid=${appuser_gid},mode=1777" \
     -v "${egress_config}:/etc/egress.yaml" \
     -v "${RECORDINGS_VOLUME}:/recordings" \
     -e EGRESS_CONFIG_FILE=/etc/egress.yaml \
