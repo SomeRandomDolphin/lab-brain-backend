@@ -51,7 +51,7 @@
   "livekit": {
     "_comment": "LiveKit SFU \u00e2\u20ac\u201d run: docker run --rm -p 7880:7880 livekit/livekit-server --dev",
     "url": "ws://host.docker.internal:7880",
-    "public_url": "ws://100.122.56.39:7880",
+    "public_url": "wss://citi-condor.tail360067.ts.net:7443",
     "api_key": "devkey",
     "api_secret": "QQYwEDWf1zeIPS90SP5AwEqflO+/xiz/0Gi1aOfEG9Y=",
     "node_ip": "100.122.56.39"
