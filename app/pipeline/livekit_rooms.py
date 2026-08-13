@@ -234,24 +234,16 @@ async def start_egress(session_id: str) -> Optional[str]:
             info = await api.egress.start_room_composite_egress(
                 RoomCompositeEgressRequest(
                     room_name=session_id,
-                    audio_only=False,
+                    # Audio-only — drops video encoding entirely, by far
+                    # the biggest lever for file size (video was still the
+                    # dominant cost even at 960x540/800kbps). video_only
+                    # must stay False; it's the opposite toggle and the two
+                    # are mutually exclusive.
+                    audio_only=True,
                     video_only=False,
-                    # Confirmed field names against this installed version
-                    # via EncodingOptions.DESCRIPTOR.fields_by_name — no
-                    # built-in preset here goes below 720p, so a custom
-                    # EncodingOptions is the only way to get meaningfully
-                    # smaller output. 960x540/15fps/800kbps video + 64kbps
-                    # audio is plenty for an archival talking-heads meeting
-                    # recording nobody's watching closely — should land
-                    # well under half of what H264_720P_30 would produce.
-                    # audio_codec/video_codec left unset (MP4 defaults:
-                    # AAC/H264) since their exact enum member names haven't
-                    # been confirmed against this version yet.
+                    # width/height/framerate/video_bitrate no longer apply
+                    # with audio_only=True — only audio_bitrate matters now.
                     advanced=EncodingOptions(
-                        width=960,
-                        height=540,
-                        framerate=15,
-                        video_bitrate=800_000,
                         audio_bitrate=64_000,
                     ),
                     file_outputs=[file_output],
