@@ -472,10 +472,32 @@ EOF
   # app/pipeline/livekit_rooms.py. Egress writes finished recordings here;
   # the app reads them from here and uploads via Supabase's JWT Storage API
   # instead of egress's built-in (broken, for self-hosted Supabase) S3 upload.
+  #
+  # --user "${appuser_uid}:${appuser_gid}": this is the actual fix for the
+  # "could not remove local recording: Permission denied" warning. Without
+  # it, egress runs as image-default root and creates each room's subfolder
+  # (/recordings/<room_id>/) owned by root with a plain 0755-ish mode. The
+  # ensure_recordings_volume() default ACL above still grants o::rwx on
+  # paper, but POSIX ACL inheritance intersects the default ACL's "other"
+  # entry with whatever "other" bits the creating process actually
+  # requested at mkdir time — root's 0755 leaves other at r-x, no write bit
+  # — so the backend (appuser, uid 1000, hitting that folder as "other")
+  # can read/upload the finished file but can't unlink it afterwards.
+  # Running egress AS uid 1000 sidesteps the whole "other"-class intersection
+  # problem: it makes appuser the OWNER of every subfolder egress creates,
+  # governed by the (already-open) u:: entry instead of o::, so delete just
+  # works regardless of what mode bits mkdir happened to request. Must match
+  # the backend image's appuser uid exactly, or this swaps one mismatch for
+  # another — override via config.json if your backend Dockerfile ever
+  # changes appuser's uid/gid.
+  local appuser_uid appuser_gid
+  appuser_uid=$(read_config "['recordings']['appuser_uid']" "1000")
+  appuser_gid=$(read_config "['recordings']['appuser_gid']" "1000")
   docker run -d \
     --name "$EGRESS_CONTAINER" \
     --network "$NETWORK_NAME" \
     --shm-size=1gb \
+    --user "${appuser_uid}:${appuser_gid}" \
     -v "${egress_config}:/etc/egress.yaml" \
     -v "${RECORDINGS_VOLUME}:/recordings" \
     -e EGRESS_CONFIG_FILE=/etc/egress.yaml \
@@ -486,7 +508,16 @@ EOF
   if docker ps --format '{{.Names}} {{.Status}}' | grep -q "^${EGRESS_CONTAINER} Up"; then
     success "Egress container is running."
   else
+    # If this newly started failing right after adding --user above: the
+    # room-composite egress path runs headless Chrome internally, and
+    # Chrome's own sandboxing sometimes assumes it's root (setuid sandbox
+    # helper). If `docker logs` shows a Chrome/sandbox-related crash rather
+    # than a config error, that's what's happening — the workaround is
+    # passing `--cap-add=SYS_ADMIN` here (loosens container isolation, but
+    # keeps the uid-1000 permission fix) rather than reverting to root.
     warn "Egress container isn't staying up — check logs: docker logs ${EGRESS_CONTAINER}"
+    warn "(If logs mention Chrome/sandbox failing under uid ${appuser_uid}, see the" \
+         "--user comment just above this docker run block for the workaround.)"
   fi
 
   echo "  Logs:  docker logs -f ${EGRESS_CONTAINER}"
@@ -728,6 +759,22 @@ set_storage_port() {
 # every "download"/public asset link against the backend's port instead of
 # Kong's, and it 404s — that's the "Failed to download <file>.mp4" dashboard
 # error. Safe to re-run: no-ops if both already match.
+#
+# IMPORTANT — the host half matters as much as the port. This URL isn't
+# just used server-side: Studio ships it straight into the browser as the
+# base for every storage/download link, so it has to be an address the
+# BROWSER can resolve, not the Supabase container's own idea of itself.
+# "localhost" only works when Studio is opened on citi-condor itself — open
+# it from anywhere else (LAN IP, Tailscale, a public hostname) and the
+# browser tries to hit that port on ITS OWN machine and gets
+# ERR_CONNECTION_REFUSED, even though `curl localhost:8080` on the server
+# itself looks perfectly fine. This is the exact same class of problem
+# start_livekit()'s `node_ip` already solves for WebRTC media, so it reuses
+# that same config.json value (livekit.node_ip) as the browser-reachable
+# host instead of hardcoding "localhost". Set livekit.node_ip in
+# config.json to whatever address you actually type into the browser (e.g.
+# your Tailscale IP) and both LiveKit media AND Supabase download links
+# pick it up together — one knob, no more drift between the two.
 set_public_url() {
   local env_file="$1"
   local url="$2"
@@ -794,8 +841,13 @@ start_supabase() {
 
   # ── Step 2c-2: keep Studio/GoTrue's public URLs in sync with that move ───
   # Must come right after set_kong_port() — see set_public_url()'s comment
-  # for why leaving these on the upstream default breaks Studio downloads.
-  set_public_url "$env_file" "http://localhost:${SUPABASE_API_PORT}"
+  # for why leaving these on the upstream default breaks Studio downloads,
+  # and why the host is read from livekit.node_ip rather than hardcoded to
+  # "localhost" (same browser-reachable-address problem as LiveKit's WebRTC
+  # media, same fix).
+  local public_host
+  public_host=$(read_config "['livekit']['node_ip']" "localhost")
+  set_public_url "$env_file" "http://${public_host}:${SUPABASE_API_PORT}"
 
   # ── Step 2d: publish storage-api directly, bypassing Kong ────────────────
   # See patch_supabase_compose()'s storage block for why this matters for

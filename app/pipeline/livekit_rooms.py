@@ -167,11 +167,15 @@ async def delete_room(session_id: str) -> bool:
         return False
 
 
-# ── Egress (raw audio+video recording → local disk → Supabase Storage) ───────
+# ── Egress (room-composite recording → local disk → Supabase Storage) ────────
 #
 # This uses LiveKit's server-side Egress feature rather than hand-rolling a
 # JPEG-frame/audio-segment uploader: Egress records the actual room composite
-# (mixed audio+video, matching what a participant would see/hear).
+# (matching what a participant would hear). NOTE: start_egress() below sets
+# audio_only=True — this is audio-only now (video encoding was cut for file
+# size), so "composite" here means "mixed audio from all participants", not
+# audio+video. Written as .mp4 with an AAC audio track; that's intentional,
+# not a leftover from the video path.
 #
 # NOT going through egress's built-in S3 upload (S3Upload) anymore: self-
 # hosted Supabase Storage's S3-compatible endpoint has a longstanding,
