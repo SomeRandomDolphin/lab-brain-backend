@@ -37,7 +37,8 @@ try:
         RoomCompositeEgressRequest,
         EncodedFileOutput,
         EncodedFileType,
-        S3Upload,
+        ListEgressRequest,
+        EgressStatus,
         StopEgressRequest,
     )
     LIVEKIT_AVAILABLE = True
@@ -165,45 +166,63 @@ async def delete_room(session_id: str) -> bool:
         return False
 
 
-# ── Egress (raw audio+video recording to Supabase Storage) ───────────────────
+# ── Egress (raw audio+video recording → local disk → Supabase Storage) ───────
 #
 # This uses LiveKit's server-side Egress feature rather than hand-rolling a
 # JPEG-frame/audio-segment uploader: Egress records the actual room composite
-# (mixed audio+video, matching what a participant would see/hear) and streams
-# it directly to any S3-compatible endpoint — Supabase Storage speaks S3, so
-# no intermediate handling on this server is needed at all.
+# (mixed audio+video, matching what a participant would see/hear).
 #
-# NOTE ON CONFIG: this expects the following to exist on `cfg` — they aren't
-# in config.py yet since I don't have that file, so add them there:
+# NOT going through egress's built-in S3 upload (S3Upload) anymore: self-
+# hosted Supabase Storage's S3-compatible endpoint has a longstanding,
+# unresolved upstream bug where every S3-protocol request — regardless of
+# client (aws-sdk-go-v2, boto3, aws-cli), regardless of proxy/network path —
+# fails signature verification with SignatureDoesNotMatch, even with
+# byte-verified-correct credentials. See:
+#   https://github.com/supabase/storage/issues/572
+#   https://github.com/supabase/storage/issues/646
+# No client-side config change works around it. Instead: egress writes the
+# finished recording to local disk on a Docker volume SHARED between the
+# egress container and this app's container (RECORDINGS_MOUNT below — must
+# match the mount point in both start_services.sh's start_egress() and
+# docker-compose.yml's backend service), and stop_egress() picks the file up
+# from there once egress reports it complete, then uploads it via the
+# JWT-authenticated Supabase Storage API — the same path report.md/
+# summary.md already use successfully (see app/db/supabase_client.py).
+#
+# NOTE ON CONFIG: this still expects the following to exist on `cfg`:
 #   cfg.livekit.egress_enabled     (bool)
-#   cfg.supabase.s3_endpoint       (str, e.g. "https://<project>.supabase.co/storage/v1/s3")
-#   cfg.supabase.s3_bucket         (str)
-#   cfg.supabase.s3_region         (str — Supabase accepts a placeholder like "us-east-1" if unused)
-#   cfg.supabase.s3_access_key     (str)
-#   cfg.supabase.s3_secret_key     (str)
 #
-# Treat these as secrets (env vars), same as the existing Supabase service
-# key — do not commit them.
+# The cfg.supabase.s3_* fields added for the old S3 upload path are no
+# longer read here — they can stay in config.py/​.env harmlessly (unused)
+# or be removed once you're confident nothing else references them.
+
+# Must match the volume mount point used for the egress container in
+# start_services.sh's start_egress() AND the `backend` service in
+# docker-compose.yml — a mismatch here means this app looks for finished
+# recordings somewhere egress never wrote them.
+RECORDINGS_MOUNT = "/recordings"
+
+# How long to wait, after StopEgressRequest is accepted, for egress to
+# actually finish flushing the file to disk and report EGRESS_COMPLETE.
+# StopEgressRequest returns as soon as the stop is ACCEPTED, not once the
+# file is fully written — uploading before that risks a half-written file.
+# 30s is generous for a local-disk flush (there's no network upload for
+# egress itself to wait on anymore, unlike the old S3 path).
+_EGRESS_POLL_INTERVAL = 1.0
+_EGRESS_POLL_TIMEOUT = 30.0
 
 async def start_egress(session_id: str) -> Optional[str]:
-    """Start a room-composite (single mixed file) recording, uploaded
-    directly to Supabase Storage via its S3-compatible endpoint. Returns the
-    egress_id (used to stop it later) or None if egress is disabled/unavailable.
+    """Start a room-composite (single mixed file) recording, written to
+    local disk on the shared RECORDINGS_MOUNT volume. Returns the egress_id
+    (used to stop it later) or None if egress is disabled/unavailable.
     """
     if not LIVEKIT_AVAILABLE or not getattr(cfg.livekit, "egress_enabled", False):
         return None
 
+    relative_path = f"{session_id}/{session_id}-{int(time.time())}.mp4"
     file_output = EncodedFileOutput(
         file_type=EncodedFileType.MP4,
-        filepath=f"{session_id}/{session_id}-{int(time.time())}.mp4",
-        s3=S3Upload(
-            access_key=cfg.supabase.s3_access_key,
-            secret=cfg.supabase.s3_secret_key,
-            bucket=cfg.supabase.s3_bucket,
-            region=cfg.supabase.s3_region,
-            endpoint=cfg.supabase.s3_endpoint,
-            force_path_style=True,  # required for most S3-compatible (non-AWS) endpoints
-        ),
+        filepath=f"{RECORDINGS_MOUNT}/{relative_path}",
     )
     try:
         async with LiveKitAPI(
@@ -220,6 +239,7 @@ async def start_egress(session_id: str) -> Optional[str]:
                 )
             )
         _egress_ids[session_id] = info.egress_id
+        _egress_paths[info.egress_id] = f"{RECORDINGS_MOUNT}/{relative_path}"
         log.info(f"[livekit:{session_id}] egress started: egress_id={info.egress_id}")
         return info.egress_id
     except Exception as exc:
@@ -227,10 +247,32 @@ async def start_egress(session_id: str) -> Optional[str]:
         return None
 
 
+async def _wait_for_egress_complete(api: "LiveKitAPI", egress_id: str):
+    """Poll list_egress until *egress_id* reaches a terminal state, or
+    _EGRESS_POLL_TIMEOUT elapses (returns None in that case)."""
+    elapsed = 0.0
+    while elapsed < _EGRESS_POLL_TIMEOUT:
+        result = await api.egress.list_egress(ListEgressRequest(egress_id=egress_id))
+        if result.items:
+            info = result.items[0]
+            if info.status in (
+                EgressStatus.EGRESS_COMPLETE,
+                EgressStatus.EGRESS_FAILED,
+                EgressStatus.EGRESS_ABORTED,
+            ):
+                return info
+        await asyncio.sleep(_EGRESS_POLL_INTERVAL)
+        elapsed += _EGRESS_POLL_INTERVAL
+    return None
+
+
 async def stop_egress(session_id: str) -> None:
     egress_id = _egress_ids.pop(session_id, None)
     if not egress_id:
         return
+    local_path = _egress_paths.pop(egress_id, None)
+
+    info = None
     try:
         async with LiveKitAPI(
             url=cfg.livekit.url,
@@ -238,9 +280,44 @@ async def stop_egress(session_id: str) -> None:
             api_secret=cfg.livekit.api_secret,
         ) as api:
             await api.egress.stop_egress(StopEgressRequest(egress_id=egress_id))
-        log.info(f"[livekit:{session_id}] egress stopped: egress_id={egress_id}")
+            log.info(f"[livekit:{session_id}] egress stopped: egress_id={egress_id}")
+            info = await _wait_for_egress_complete(api, egress_id)
     except Exception as exc:
         log.warning(f"[livekit:{session_id}] stop_egress failed: {exc!r}")
+        return
+
+    if info is None:
+        log.warning(
+            f"[livekit:{session_id}] egress {egress_id} did not reach a terminal "
+            f"state within {_EGRESS_POLL_TIMEOUT}s — skipping upload"
+        )
+        return
+
+    if info.status != EgressStatus.EGRESS_COMPLETE:
+        log.warning(
+            f"[livekit:{session_id}] egress {egress_id} ended with "
+            f"status={info.status!r} error={info.error!r} — skipping upload"
+        )
+        return
+
+    # Prefer the path LiveKit itself reports over the one we requested —
+    # they should match, but file_results is the source of truth if they
+    # ever diverge (e.g. a filename-collision suffix LiveKit adds).
+    reported_path = info.file_results[0].filename if info.file_results else None
+    path_to_upload = reported_path or local_path
+    if not path_to_upload:
+        log.error(
+            f"[livekit:{session_id}] egress {egress_id} completed but no file "
+            "path is known — cannot upload recording"
+        )
+        return
+
+    from app.db.supabase_client import upload_recording
+    url = await upload_recording(session_id, path_to_upload)
+    if url:
+        log.info(f"[livekit:{session_id}] recording uploaded: {url}")
+    else:
+        log.error(f"[livekit:{session_id}] recording upload failed for {path_to_upload}")
 
 
 # ── Active subscriber tasks ───────────────────────────────────────────────────
@@ -273,6 +350,11 @@ _known_identities: dict[str, dict[str, str]] = {}
 # room deletion to implicitly kill it (which risks losing the tail of the
 # recording depending on how LiveKit's server handles that).
 _egress_ids: dict[str, str] = {}
+
+# Local filesystem path (on the shared RECORDINGS_MOUNT volume) each active
+# egress_id is writing to — stop_egress() needs this as a fallback if
+# EgressInfo.file_results is ever empty/missing on completion.
+_egress_paths: dict[str, str] = {}
 
 
 def get_known_identity(session_id: str, participant_identity: Optional[str] = None) -> Optional[str]:

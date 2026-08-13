@@ -49,6 +49,18 @@ services:
       # supabase.url/key are left in config.json instead of .env: env vars
       # above take precedence, but only for those 5 keys.
       - ./config.json:/app/config.json
+      # Shared with the lab-brain-egress container (see start_services.sh's
+      # start_egress()) — egress writes finished recordings here instead of
+      # uploading via S3 directly (self-hosted Supabase Storage's S3
+      # protocol has an unresolved signature-verification bug; see the
+      # comment above RECORDINGS_MOUNT in app/pipeline/livekit_rooms.py).
+      # This app picks the file up from here and uploads it via the JWT
+      # Storage API instead. `external: true` below because
+      # start_services.sh creates this volume (`docker volume create`), not
+      # this compose file — if you run this compose file before ever
+      # running start_services.sh, create it manually first:
+      #   docker volume create lab-brain-recordings
+      - lab-brain-recordings:/recordings
     extra_hosts:
       # Makes host.docker.internal resolve on Linux too (Docker Desktop for
       # Mac/Windows already provides it). Needed because start_services.sh's
@@ -57,3 +69,7 @@ services:
       # container itself, not the host.
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
+
+volumes:
+  lab-brain-recordings:
+    external: true

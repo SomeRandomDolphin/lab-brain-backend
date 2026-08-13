@@ -140,6 +140,18 @@ ensure_network() {
   fi
 }
 
+# ── ensure_recordings_volume ──────────────────────────────────────────────────
+# Shared between the egress container and the app's backend container
+# (docker-compose.yml) so the app can read a finished recording off disk
+# after egress writes it — see the RECORDINGS_VOLUME comment above. Safe to
+# call repeatedly (no-ops if it exists), same pattern as ensure_network.
+ensure_recordings_volume() {
+  if ! docker volume inspect "$RECORDINGS_VOLUME" >/dev/null 2>&1; then
+    info "Creating Docker volume '${RECORDINGS_VOLUME}'..."
+    docker volume create "$RECORDINGS_VOLUME" >/dev/null
+  fi
+}
+
 # ── remove_container <name> ───────────────────────────────────────────────────
 remove_container() {
   local name="$1"
@@ -232,6 +244,14 @@ LIVEKIT_PORT_RTC_UDP=7882
 REDIS_CONTAINER="lab-brain-redis"
 REDIS_PORT=6379
 EGRESS_CONTAINER="lab-brain-egress"
+# Shared Docker volume between lab-brain-egress and the app's backend
+# container (docker-compose.yml) — egress writes finished recordings here
+# instead of uploading via S3 directly. See the comment above
+# RECORDINGS_MOUNT in app/pipeline/livekit_rooms.py for why: self-hosted
+# Supabase Storage's S3-compatible endpoint has an unresolved upstream
+# signature-verification bug (SignatureDoesNotMatch) that no client-side
+# config change works around — https://github.com/supabase/storage/issues/572
+RECORDINGS_VOLUME="lab-brain-recordings"
 
 start_livekit() {
   info "Setting up LiveKit..."
@@ -402,6 +422,7 @@ start_redis() {
 start_egress() {
   info "Setting up LiveKit Egress (room recording/compositing)..."
   ensure_network
+  ensure_recordings_volume
 
   local api_key api_secret
   api_key=$(read_config    "['livekit']['api_key']"    "devkey")
@@ -424,11 +445,18 @@ EOF
   # room-composite recordings, which needs more /dev/shm than Docker's
   # 64MB default — too little and Chrome crashes mid-recording rather than
   # failing at startup, so this is easy to miss in short manual tests.
+  #
+  # -v "${RECORDINGS_VOLUME}:/recordings": shared with the app's backend
+  # container (docker-compose.yml) — must match RECORDINGS_MOUNT in
+  # app/pipeline/livekit_rooms.py. Egress writes finished recordings here;
+  # the app reads them from here and uploads via Supabase's JWT Storage API
+  # instead of egress's built-in (broken, for self-hosted Supabase) S3 upload.
   docker run -d \
     --name "$EGRESS_CONTAINER" \
     --network "$NETWORK_NAME" \
     --shm-size=1gb \
     -v "${egress_config}:/etc/egress.yaml" \
+    -v "${RECORDINGS_VOLUME}:/recordings" \
     -e EGRESS_CONFIG_FILE=/etc/egress.yaml \
     livekit/egress \
     >/dev/null
@@ -443,11 +471,12 @@ EOF
   echo "  Logs:  docker logs -f ${EGRESS_CONTAINER}"
   echo "  Stop:  docker rm -f ${EGRESS_CONTAINER}"
   echo ""
-  warn "This config sets no default S3/file output target. If"
-  warn "app/pipeline/livekit_rooms.py's start_room_composite_egress call"
-  warn "doesn't specify file_outputs/segment_outputs itself in the request,"
-  warn "recordings will fail with a 'no output configured' error — check"
-  warn "that call site before relying on this."
+  info "Recordings write to the shared '${RECORDINGS_VOLUME}' volume"
+  info "(/recordings in this container) — app/pipeline/livekit_rooms.py"
+  info "uploads them to Supabase via the JWT Storage API from there, not"
+  info "egress's S3 output (self-hosted Supabase Storage's S3 protocol has"
+  info "an unresolved signature-verification bug — see the RECORDINGS_VOLUME"
+  info "comment above for details)."
   echo ""
 }
 

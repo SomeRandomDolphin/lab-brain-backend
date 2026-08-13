@@ -21,6 +21,9 @@ Postgres tables (SQLAlchemy ORM — see models.py):
 Supabase Storage buckets (supabase-py):
   audio-segments    — raw float32 PCM blobs
   report-exports    — generated markdown summary exports
+  recordings        — LiveKit Egress room-composite recordings (uploaded via
+                       upload_recording() — see its docstring for why this
+                       goes through the JWT Storage API, not the S3 protocol)
 
 Required environment variables
 -------------------------------
@@ -489,6 +492,56 @@ async def upload_audio_segment(
         return client.storage.from_("audio-segments").get_public_url(path)
     except Exception:
         return None
+
+
+async def upload_recording(session_id: str, local_path: str) -> Optional[str]:
+    """
+    Read a finished LiveKit Egress recording off the shared /recordings
+    volume (see livekit_rooms.py's RECORDINGS_MOUNT) and push it to the
+    'recordings' Supabase Storage bucket via the JWT-authenticated Storage
+    API — NOT the S3 protocol. Self-hosted Supabase Storage's S3-compatible
+    endpoint has a longstanding, unresolved SignatureDoesNotMatch bug
+    (https://github.com/supabase/storage/issues/572) that affects every S3
+    client regardless of config, so egress now writes locally and this is
+    the upload step instead.
+
+    NOTE: storage-api's FILE_SIZE_LIMIT env var (set in
+    supabase-project/docker-compose.yml) caps a single upload — default
+    52428800 bytes (50MB). Unlike the S3 protocol's multipart upload, this
+    single-request JWT upload does NOT chunk large files, so a recording
+    longer than fits under that limit will fail outright. Raise
+    FILE_SIZE_LIMIT there if meetings routinely exceed 50MB.
+
+    Unlike upload_audio_segment/export_report (fire-and-forget via
+    _fire_sync), this awaits the upload and returns its result — the caller
+    (stop_egress) logs success/failure per recording, so silently firing
+    and forgetting isn't appropriate here.
+    """
+    if not os.path.exists(local_path):
+        log.error(f"[supabase] recording file not found at {local_path}")
+        return None
+
+    def _read_and_upload() -> Optional[str]:
+        with open(local_path, "rb") as f:
+            data = f.read()
+        return _safe_storage_upload(
+            "recordings",
+            f"{session_id}/{os.path.basename(local_path)}",
+            data,
+            "video/mp4",
+        )
+
+    loop = asyncio.get_event_loop()
+    url = await loop.run_in_executor(None, _read_and_upload)
+
+    # Best-effort local cleanup — the shared volume is just a handoff point
+    # between egress and this upload step, not meant as permanent storage.
+    try:
+        os.remove(local_path)
+    except OSError as exc:
+        log.warning(f"[supabase] could not remove local recording {local_path}: {exc}")
+
+    return url
 
 
 async def export_report(
