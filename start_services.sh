@@ -150,6 +150,17 @@ ensure_recordings_volume() {
     info "Creating Docker volume '${RECORDINGS_VOLUME}'..."
     docker volume create "$RECORDINGS_VOLUME" >/dev/null
   fi
+
+  # Named volumes are created root:root by default. The livekit/egress
+  # image runs as a non-root user internally, so its first `mkdir
+  # /recordings/<room_id>/` on a fresh (or pre-existing, root-owned) volume
+  # fails with "permission denied" — this is what produced the
+  # "Local upload failed: mkdir /recordings/<room>/: permission denied"
+  # errors and silently skipped uploads. Open the volume up so any UID
+  # inside a container can create room subfolders under it. Safe to run
+  # every time (idempotent) — this also repairs a volume left root-owned
+  # by an earlier run before this fix existed.
+  docker run --rm -v "${RECORDINGS_VOLUME}:/recordings" alpine chmod 777 /recordings >/dev/null
 }
 
 # ── remove_container <name> ───────────────────────────────────────────────────
