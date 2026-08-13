@@ -37,6 +37,7 @@ try:
         RoomCompositeEgressRequest,
         EncodedFileOutput,
         EncodedFileType,
+        EncodingOptions,
         ListEgressRequest,
         EgressStatus,
         StopEgressRequest,
@@ -235,6 +236,24 @@ async def start_egress(session_id: str) -> Optional[str]:
                     room_name=session_id,
                     audio_only=False,
                     video_only=False,
+                    # Confirmed field names against this installed version
+                    # via EncodingOptions.DESCRIPTOR.fields_by_name — no
+                    # built-in preset here goes below 720p, so a custom
+                    # EncodingOptions is the only way to get meaningfully
+                    # smaller output. 960x540/15fps/800kbps video + 64kbps
+                    # audio is plenty for an archival talking-heads meeting
+                    # recording nobody's watching closely — should land
+                    # well under half of what H264_720P_30 would produce.
+                    # audio_codec/video_codec left unset (MP4 defaults:
+                    # AAC/H264) since their exact enum member names haven't
+                    # been confirmed against this version yet.
+                    advanced=EncodingOptions(
+                        width=960,
+                        height=540,
+                        framerate=15,
+                        video_bitrate=800_000,
+                        audio_bitrate=64_000,
+                    ),
                     file_outputs=[file_output],
                 )
             )

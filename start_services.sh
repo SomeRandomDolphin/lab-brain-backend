@@ -151,16 +151,26 @@ ensure_recordings_volume() {
     docker volume create "$RECORDINGS_VOLUME" >/dev/null
   fi
 
-  # Named volumes are created root:root by default. The livekit/egress
-  # image runs as a non-root user internally, so its first `mkdir
-  # /recordings/<room_id>/` on a fresh (or pre-existing, root-owned) volume
-  # fails with "permission denied" — this is what produced the
-  # "Local upload failed: mkdir /recordings/<room>/: permission denied"
-  # errors and silently skipped uploads. Open the volume up so any UID
-  # inside a container can create room subfolders under it. Safe to run
-  # every time (idempotent) — this also repairs a volume left root-owned
-  # by an earlier run before this fix existed.
-  docker run --rm -v "${RECORDINGS_VOLUME}:/recordings" alpine chmod 777 /recordings >/dev/null
+  # Named volumes are created root:root by default. egress and the backend
+  # (appuser, uid 1000) run as different non-root users, so a plain chmod on
+  # just the top-level /recordings directory only fixes THAT directory —
+  # each room subfolder egress creates later (/recordings/<room_id>/) gets
+  # its own default permissions at creation time, not inherited from the
+  # parent. That's what caused two separate symptoms: egress's own
+  # "mkdir ...: permission denied" on a fresh volume, AND (after that was
+  # fixed) the backend's "could not remove local recording: Permission
+  # denied" during upload_recording()'s cleanup — appuser could read/upload
+  # the file but lacked write access on the room subfolder egress owned, so
+  # os.remove() failed. A recursive chmod fixes what already exists; a
+  # default ACL (setfacl -d) makes every FUTURE file/subfolder inherit open
+  # permissions too, so this doesn't need to be re-run after every
+  # recording. Safe to call every time (idempotent).
+  docker run --rm -v "${RECORDINGS_VOLUME}:/recordings" alpine sh -c "
+    apk add --no-cache acl >/dev/null 2>&1
+    chmod -R 777 /recordings
+    setfacl -R -d -m u::rwx,g::rwx,o::rwx /recordings 2>/dev/null || true
+    setfacl -R -m u::rwx,g::rwx,o::rwx /recordings 2>/dev/null || true
+  " >/dev/null
 }
 
 # ── remove_container <name> ───────────────────────────────────────────────────
@@ -708,6 +718,34 @@ set_storage_port() {
   success "Set SUPABASE_STORAGE_PORT=${port} in ${env_file}."
 }
 
+# Writes API_EXTERNAL_URL and SUPABASE_PUBLIC_URL into supabase-project/.env
+# so they match SUPABASE_API_PORT instead of the upstream .env.example
+# default (http://localhost:8000). Kong lives on ${SUPABASE_API_PORT}
+# (8080) specifically to stay off port 8000, which the backend's own
+# uvicorn already occupies (docker-compose.yml: "8000:8000") — but these
+# two vars are never touched by set_kong_port(), so left alone they keep
+# pointing Studio (and GoTrue's redirect URLs) at :8000. Studio then builds
+# every "download"/public asset link against the backend's port instead of
+# Kong's, and it 404s — that's the "Failed to download <file>.mp4" dashboard
+# error. Safe to re-run: no-ops if both already match.
+set_public_url() {
+  local env_file="$1"
+  local url="$2"
+
+  for key in API_EXTERNAL_URL SUPABASE_PUBLIC_URL; do
+    if grep -q "^${key}=${url}$" "$env_file"; then
+      info "${key} already set to ${url} — nothing to do."
+      continue
+    fi
+    if grep -q "^${key}=" "$env_file"; then
+      sed -i "s|^${key}=.*|${key}=${url}|" "$env_file"
+    else
+      echo "${key}=${url}" >> "$env_file"
+    fi
+    success "Set ${key}=${url} in ${env_file}."
+  done
+}
+
 start_supabase() {
   info "Setting up Supabase (official self-hosting guide)..."
 
@@ -753,6 +791,11 @@ start_supabase() {
 
   # ── Step 2c: move Kong off its default port ──────────────────────────────
   set_kong_port "$env_file" "$SUPABASE_API_PORT"
+
+  # ── Step 2c-2: keep Studio/GoTrue's public URLs in sync with that move ───
+  # Must come right after set_kong_port() — see set_public_url()'s comment
+  # for why leaving these on the upstream default breaks Studio downloads.
+  set_public_url "$env_file" "http://localhost:${SUPABASE_API_PORT}"
 
   # ── Step 2d: publish storage-api directly, bypassing Kong ────────────────
   # See patch_supabase_compose()'s storage block for why this matters for
