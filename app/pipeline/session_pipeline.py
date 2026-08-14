@@ -344,7 +344,36 @@ async def livekit_pipeline(
             # here would silently apply the account holder's consent to
             # everyone else picked up on that mic, so this MUST stay keyed
             # on the per-voice diarization label, not the account identity.
-            consent_key = speaker
+            # Single LiveKit participant AND diarization has only ever
+            # detected one distinct voice this session => genuinely one
+            # person on this track, not a shared mic picking up several
+            # physical speakers (the actual case this branch's diarization
+            # exists for). Substitute their real known identity for
+            # diarization's generic "Person A" placeholder — every solo
+            # session was showing "Person A" instead of the account
+            # holder's actual name, since nothing in this branch ever
+            # consulted get_known_identity() the way the multi-participant
+            # branch above does. Key consent on the real LiveKit identity
+            # here too (matching the multi-participant branch), not the
+            # diarization label, since we now know who they actually are.
+            #
+            # The moment a second distinct voice is detected
+            # (dlg._speaker_map grows past 1 entry), this stops
+            # substituting and reverts to per-voice diarization labels/
+            # consent below — that's the genuine shared-mic case, where
+            # different physical people can have different consent and
+            # a single blanket real name would be wrong.
+            single_known_name = None
+            if len(_seen_audio_identities) == 1 and len(dlg._speaker_map) <= 1:
+                single_known_name = get_known_identity(session_id, identity)
+
+            if single_known_name:
+                speaker = single_known_name
+                if word_timestamps:
+                    word_timestamps = [{**w, "speaker": single_known_name} for w in word_timestamps]
+                consent_key = identity
+            else:
+                consent_key = speaker
 
         # Privacy
         redacted_text = (

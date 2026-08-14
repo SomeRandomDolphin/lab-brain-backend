@@ -546,7 +546,12 @@ async def _subscriber_loop(session_id: str, pipeline_fn) -> None:
 
     @room.on("connection_state_changed")
     def on_conn_state(state):
-        log.warning(f"[livekit:{session_id}] connection_state_changed -> {state!r}")
+        # Was WARNING — fired on every transition including the completely
+        # normal 0->1 (connected), so a routine connect logged identically
+        # to something actually worth noticing. on_disconnect and
+        # on_reconnecting above already flag the transitions that matter;
+        # this one is just informational.
+        log.info(f"[livekit:{session_id}] connection_state_changed -> {state!r}")
 
     @room.on("reconnecting")
     def on_reconnecting():
