@@ -677,11 +677,27 @@ async def generate_response(
 
 # ── Summary generator ─────────────────────────────────────────────────────────
 
-async def generate_summary(state: DialogueState, session_tags: dict) -> str:
+async def generate_summary(session_id: str, transcript_text: str, session_tags: dict) -> str:
+    """
+    session_id/transcript_text replace the old `state: DialogueState` param.
+    Summary generation used to read state.context_block() — the in-memory
+    DialogueState's own transcript_context list — but DELETE /livekit/room
+    calls clear_dialogue(session_id) as part of its teardown, which pops
+    that DialogueState out of _dialogue_states entirely. If the frontend
+    then calls POST /summary/{session_id} (a completely normal teardown
+    order — end the room, then fetch the recap), get_dialogue() silently
+    handed back a brand-new, empty DialogueState instead of raising, so
+    this function saw "0 words" and returned the "not enough was captured"
+    stub even when a real conversation had just happened and was already
+    durably persisted via Supabase/the LKC graph. The caller (sessions.py's
+    post_summary) now builds transcript_text from those durable records
+    instead, so this function no longer depends on in-memory state that
+    another endpoint may have already torn down by the time it runs.
+    """
     if not LOCAL_LLM_AVAILABLE:
         return "## Session Summary (stub)\nLocal LLM unavailable — configure local_llm.\n"
 
-    context = state.context_block()
+    context = transcript_text
 
     # Hallucination guard. The prompt below demands 4 populated markdown
     # sections no matter what — that's fine for a real meeting, but for a
@@ -697,7 +713,7 @@ async def generate_summary(state: DialogueState, session_tags: dict) -> str:
     MIN_SUMMARY_WORDS = 25
     if len(context.split()) < MIN_SUMMARY_WORDS:
         log.info(
-            f"[dialogue:{state.session_id}] summary skipped — transcript too short "
+            f"[dialogue:{session_id}] summary skipped — transcript too short "
             f"({len(context.split())} words < {MIN_SUMMARY_WORDS}); returning stub instead of risking hallucination"
         )
         return (
@@ -720,7 +736,7 @@ async def generate_summary(state: DialogueState, session_tags: dict) -> str:
         f"plausible for a research lab meeting. If a section has no "
         f"supporting content in the transcript, write exactly 'None' for "
         f"that section instead of fabricating something to fill it.\n\n"
-        f"Recent transcript (last {state.CONTEXT_WINDOW} turns):\n{context}\n\n"
+        f"Session transcript:\n{context}\n\n"
         f"Action items:\n{action_block}\n\nDecisions:\n{decision_block}\n\n"
         f"Deadlines:\n{deadline_block}\n\nKey entities: {entity_block}\n\n"
         f"Produce a concise meeting summary in markdown: "
@@ -730,7 +746,7 @@ async def generate_summary(state: DialogueState, session_tags: dict) -> str:
 
     call_id = uuid.uuid4().hex[:8]
     loop = asyncio.get_event_loop()
-    log.info(f"[dialogue:{state.session_id}] LLM dispatch summary call_id={call_id}")
+    log.info(f"[dialogue:{session_id}] LLM dispatch summary call_id={call_id}")
     t0 = time.perf_counter()
     try:
         response = await loop.run_in_executor(
@@ -749,20 +765,20 @@ async def generate_summary(state: DialogueState, session_tags: dict) -> str:
         elapsed = time.perf_counter() - t0
         finish_reason = response.choices[0].finish_reason
         log.info(
-            f"[dialogue:{state.session_id}] LLM complete summary call_id={call_id} "
+            f"[dialogue:{session_id}] LLM complete summary call_id={call_id} "
             f"({elapsed:.1f}s) finish_reason={finish_reason}"
         )
         raw = response.choices[0].message.content.strip()
         summary = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
         if not summary:
             log.warning(
-                f"[dialogue:{state.session_id}] summary call_id={call_id} returned EMPTY "
+                f"[dialogue:{session_id}] summary call_id={call_id} returned EMPTY "
                 f"content (finish_reason={finish_reason}) — falling back to tag-based summary"
             )
             raise ValueError("empty summary content")
         return summary
     except Exception as exc:
-        log.warning(f"[dialogue:{state.session_id}] summary failed call_id={call_id}: {exc}")
+        log.warning(f"[dialogue:{session_id}] summary failed call_id={call_id}: {exc}")
         return (
             f"## Session Summary (fallback)\n"
             f"**Action items:**\n{action_block}\n\n"

@@ -39,8 +39,14 @@ async def post_summary(session_id: str = Depends(require_session_access)):
     _log = logging.getLogger(__name__)
     try:
         dialogue = _get_dialogue_module()
-        dlg_state = dialogue.get_dialogue(session_id)
-        records   = await lkc_graph.read_lkc(session_id=session_id, record_type="transcript")
+        records  = await lkc_graph.read_lkc(session_id=session_id, record_type="transcript")
+
+        # Chronological order isn't guaranteed by read_lkc — sort defensively
+        # so the summary prompt reads as an actual conversation rather than
+        # whatever order the records happen to come back in. Records without
+        # a timestamp (shouldn't normally happen) sort first rather than
+        # raising on a missing key.
+        records = sorted(records, key=lambda r: r.get("timestamp_unix", 0))
 
         tags: dict = {"action_items": [], "decisions": [], "deadlines": [], "entities": []}
         for r in records:
@@ -51,8 +57,31 @@ async def post_summary(session_id: str = Depends(require_session_access)):
             tags["entities"].extend(t.get("entities",      []))
         tags["entities"] = sorted(set(tags["entities"]))
 
+        # Built from the same durable `records` as `tags` above, NOT from
+        # dialogue.get_dialogue(session_id)'s in-memory transcript_context.
+        # DELETE /livekit/room/{session_id} calls clear_dialogue(session_id)
+        # as part of normal teardown — a perfectly reasonable thing for it
+        # to do — but that meant a completely ordinary frontend flow (end
+        # session, then fetch the recap) raced against it: get_dialogue()
+        # would silently hand back a fresh, empty DialogueState instead of
+        # the one the meeting had actually populated, so this endpoint saw
+        # "0 words" and returned the "not enough was captured" stub even
+        # when a real conversation had just happened and was already
+        # sitting right here in `records`. Reading from `records` instead
+        # means summary generation no longer depends on in-memory state
+        # that another endpoint may have already torn down, and no longer
+        # cares what order the frontend calls DELETE vs POST /summary in.
+        #
+        # Capped to the same window size the old in-memory context used, so
+        # a very long session doesn't blow up the prompt token budget.
+        transcript_lines = [
+            f"{r.get('speaker', 'Unknown')}: {r.get('text', '')}"
+            for r in records if r.get("text")
+        ]
+        transcript_text = "\n".join(transcript_lines[-cfg.dialogue.context_window:])
+
         try:
-            summary_md = await dialogue.generate_summary(dlg_state, tags)
+            summary_md = await dialogue.generate_summary(session_id, transcript_text, tags)
         except Exception as exc:
             # LLM unavailable (e.g. Ollama not running) — return a graceful
             # stub so the frontend session teardown can still complete cleanly.
