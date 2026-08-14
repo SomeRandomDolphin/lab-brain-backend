@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import mimetypes
 import os
 import time
 from datetime import datetime, timezone
@@ -524,11 +525,22 @@ async def upload_recording(session_id: str, local_path: str) -> Optional[str]:
     def _read_and_upload() -> Optional[str]:
         with open(local_path, "rb") as f:
             data = f.read()
+        # Derived from the actual file extension rather than hardcoded —
+        # this used to be a hardcoded "video/mp4" left over from when
+        # egress recorded audio+video. It silently went stale once
+        # livekit_rooms.py's start_egress() switched to audio_only MP3
+        # output: the upload itself still succeeded, but Storage served
+        # every recording back tagged as video/mp4, which is wrong for an
+        # MP3 file and breaks browser playback/preview. guess_type() keeps
+        # this correct automatically if the output format ever changes
+        # again (e.g. back to OGG) without needing another manual edit here.
+        content_type, _ = mimetypes.guess_type(local_path)
+        content_type = content_type or "application/octet-stream"
         return _safe_storage_upload(
             "recordings",
             f"{session_id}/{os.path.basename(local_path)}",
             data,
-            "video/mp4",
+            content_type,
         )
 
     loop = asyncio.get_event_loop()

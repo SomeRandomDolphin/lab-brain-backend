@@ -174,8 +174,12 @@ async def delete_room(session_id: str) -> bool:
 # (matching what a participant would hear). NOTE: start_egress() below sets
 # audio_only=True — this is audio-only now (video encoding was cut for file
 # size), so "composite" here means "mixed audio from all participants", not
-# audio+video. Written as .mp4 with an AAC audio track; that's intentional,
-# not a leftover from the video path.
+# audio+video. Written as .mp3 (audio only, no video track) rather than
+# .mp4 — an MP4 with only an AAC audio track is valid but is a video-shaped
+# container, which can render as a blank/broken player if anything ever
+# plays it back via <video> instead of <audio>. MP3 sidesteps that and
+# gets a native audio player in virtually every browser without relying on
+# the frontend picking the right tag.
 #
 # NOT going through egress's built-in S3 upload (S3Upload) anymore: self-
 # hosted Supabase Storage's S3-compatible endpoint has a longstanding,
@@ -224,9 +228,9 @@ async def start_egress(session_id: str) -> Optional[str]:
     if not LIVEKIT_AVAILABLE or not getattr(cfg.livekit, "egress_enabled", False):
         return None
 
-    relative_path = f"{session_id}/{session_id}-{int(time.time())}.mp4"
+    relative_path = f"{session_id}/{session_id}-{int(time.time())}.mp3"
     file_output = EncodedFileOutput(
-        file_type=EncodedFileType.MP4,
+        file_type=EncodedFileType.MP3,
         filepath=f"{RECORDINGS_MOUNT}/{relative_path}",
     )
     try:
