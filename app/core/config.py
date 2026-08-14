@@ -38,7 +38,7 @@ class LocalLLMConfig:
 
 @dataclass
 class WhisperConfig:
-    model_size:   str           = "small"
+    model_size:   str           = "large-v3-turbo"
     device:       str           = "cpu"
     compute_type: str           = "int8"
     beam_size:    int           = 1
