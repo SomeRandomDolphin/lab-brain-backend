@@ -525,6 +525,17 @@ EOF
   # a permissions problem on our tmpfs. If a newer egress image changes
   # its default user's group memberships, re-check with the `id egress`
   # probe in the troubleshooting notes and update these two numbers.
+  #
+  # -e XDG_RUNTIME_DIR + matching --tmpfs: the image bakes
+  # XDG_RUNTIME_DIR=/home/egress/.cache/xdgr, owned by the real egress user
+  # (uid 1001). PulseAudio does a hard ownership check on this path at
+  # startup ("XDG_RUNTIME_DIR ... is not owned by us (uid X), but by uid
+  # 1001!") and aborts if it doesn't match the running uid — unlike the
+  # earlier /home/egress/tmp issue, this isn't a traversal/permission
+  # problem group-add can fix, it's a straight uid mismatch. Pointing
+  # XDG_RUNTIME_DIR at a fresh tmpfs owned by appuser_uid sidesteps the
+  # image's baked-in path entirely, same approach as the /home/egress/tmp
+  # fix above.
   docker run -d \
     --name "$EGRESS_CONTAINER" \
     --network "$NETWORK_NAME" \
@@ -533,6 +544,8 @@ EOF
     --group-add 102 \
     --group-add 103 \
     --tmpfs "/home/egress/tmp:rw,uid=${appuser_uid},gid=${appuser_gid},mode=1777" \
+    --tmpfs "/tmp/xdgr:rw,uid=${appuser_uid},gid=${appuser_gid},mode=0700" \
+    -e XDG_RUNTIME_DIR=/tmp/xdgr \
     -v "${egress_config}:/etc/egress.yaml" \
     -v "${RECORDINGS_VOLUME}:/recordings" \
     -e EGRESS_CONFIG_FILE=/etc/egress.yaml \
