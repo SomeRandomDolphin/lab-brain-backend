@@ -515,11 +515,23 @@ EOF
   # doesn't loosen anything beyond directory traversal. uid stays at
   # appuser_uid — that's what keeps /recordings ownership matched with the
   # backend container (see --tmpfs comment further below).
+  # --group-add 102/103 (pulse, pulse-access): --user only sets the primary
+  # uid:gid — it silently drops supplementary groups. The image's built-in
+  # egress user is a member of "pulse" (102) and "pulse-access" (103)
+  # (confirmed via `id egress` inside the image), which PulseAudio's init
+  # needs to set up its runtime dir/socket. Without these, `pulseaudio -D`
+  # in the entrypoint fails immediately with no stdout/stderr output at
+  # all — that's what an empty `docker logs` + exitcode=1 meant here, not
+  # a permissions problem on our tmpfs. If a newer egress image changes
+  # its default user's group memberships, re-check with the `id egress`
+  # probe in the troubleshooting notes and update these two numbers.
   docker run -d \
     --name "$EGRESS_CONTAINER" \
     --network "$NETWORK_NAME" \
     --shm-size=1gb \
     --user "${appuser_uid}:0" \
+    --group-add 102 \
+    --group-add 103 \
     --tmpfs "/home/egress/tmp:rw,uid=${appuser_uid},gid=${appuser_gid},mode=1777" \
     -v "${egress_config}:/etc/egress.yaml" \
     -v "${RECORDINGS_VOLUME}:/recordings" \
