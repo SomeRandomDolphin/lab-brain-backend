@@ -503,11 +503,23 @@ EOF
   local appuser_uid appuser_gid
   appuser_uid=$(read_config "['recordings']['appuser_uid']" "1000")
   appuser_gid=$(read_config "['recordings']['appuser_gid']" "1000")
+  # --user "${appuser_uid}:0": gid is 0 (root), NOT appuser_gid. The
+  # livekit/egress image's own /home/egress is owned by egress:root, mode
+  # 750 (owner rwx, group r-x, other ---). Using appuser_gid here landed us
+  # in neither the owning uid nor the group with access, so the process
+  # couldn't even traverse into /home/egress to reach the tmpfs mount below
+  # ("rm: cannot remove '/home/egress/tmp/*': Permission denied", even with
+  # the tmpfs fix in place). gid=0 rides the image's built-in group-root
+  # read+execute grant on /home/egress; the tmpfs mount's own uid/gid/mode
+  # below govern actual read/write/delete inside /home/egress/tmp, so this
+  # doesn't loosen anything beyond directory traversal. uid stays at
+  # appuser_uid — that's what keeps /recordings ownership matched with the
+  # backend container (see --tmpfs comment further below).
   docker run -d \
     --name "$EGRESS_CONTAINER" \
     --network "$NETWORK_NAME" \
     --shm-size=1gb \
-    --user "${appuser_uid}:${appuser_gid}" \
+    --user "${appuser_uid}:0" \
     --tmpfs "/home/egress/tmp:rw,uid=${appuser_uid},gid=${appuser_gid},mode=1777" \
     -v "${egress_config}:/etc/egress.yaml" \
     -v "${RECORDINGS_VOLUME}:/recordings" \
