@@ -757,7 +757,7 @@ async def generate_summary(session_id: str, transcript_text: str, session_tags: 
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user",   "content": user_message},
                 ],
-                max_tokens=4096,  # same thinking-budget headroom as generate_response()
+                max_tokens=16384,  # more thinking-budget headroom compared to generate_response()
                 temperature=0.1,  # was 0.3 — summarization should be low-creativity
                 timeout=30,
             )
