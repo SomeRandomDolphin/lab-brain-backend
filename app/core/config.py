@@ -146,6 +146,28 @@ class SupabaseConfig:
 
 
 @dataclass
+class KgAgentConfig:
+    """
+    Client config for the shared, read-only kg-agent service on citi-condor
+    — Neo4j-backed QA over a fixed 8-paper corpus (servitization, ISO 9001,
+    supply chain integration, the Hawthorne effect). This is NOT session-
+    transcript retrieval — that's LkcConfig.retrieval_top_k / lkc_retrieval.py,
+    a separate system this doesn't replace. session_pipeline.py races the
+    two and falls back to the transcript when a question isn't in-corpus.
+
+    See app/services/kg_agent_client.py for the full contract notes
+    (agentic must stay False, `passed` isn't a quality signal, don't lower
+    request_timeout_seconds below the server's own 300s ceiling).
+    """
+    enabled:                          bool  = True
+    base_url:                         str   = "http://100.122.56.39:8003"
+    request_timeout_seconds:          float = 300.0  # server-side ceiling — do not lower
+    soft_deadline_seconds:            float = 6.0    # UX budget for the hybrid race in live QA
+    faithfulness_threshold:           float = 0.7     # documented gate; passed:false is expected/ignored
+    circuit_breaker_cooldown_seconds: float = 30.0
+
+
+@dataclass
 class Config:
     local_llm: LocalLLMConfig = field(default_factory=LocalLLMConfig)
     whisper:   WhisperConfig  = field(default_factory=WhisperConfig)
@@ -158,6 +180,7 @@ class Config:
     spacy:     SpacyConfig    = field(default_factory=SpacyConfig)
     livekit:   LiveKitConfig  = field(default_factory=LiveKitConfig)
     supabase:  SupabaseConfig = field(default_factory=SupabaseConfig)
+    kg_agent:  KgAgentConfig  = field(default_factory=KgAgentConfig)
 
 
 # ── Loader ─────────────────────────────────────────────────────────────────────
@@ -252,6 +275,7 @@ def load(path: Path = CONFIG_PATH) -> Config:
         "spacy":     c.spacy,
         "livekit":   c.livekit,
         "supabase":  c.supabase,
+        "kg_agent":  c.kg_agent,
     }
     for section, obj in section_map.items():
         if section in raw:
@@ -371,13 +395,27 @@ def load(path: Path = CONFIG_PATH) -> Config:
     if not c.livekit.public_url:
         c.livekit.public_url = c.livekit.url
 
+    # ── kg-agent (env override, same env-wins reasoning as above) ─────────────
+    # Not a secret — the service has no auth, Tailscale is the access
+    # boundary — but still overridable so a dev box can point at a
+    # different kg-agent deployment without editing config.json.
+    env_kg_base_url = (os.environ.get("KG_AGENT_BASE_URL") or "").strip()
+    env_kg_enabled  = (os.environ.get("KG_AGENT_ENABLED") or "").strip().lower()
+    if env_kg_base_url:
+        c.kg_agent.base_url = env_kg_base_url
+    if env_kg_enabled in ("1", "true", "yes"):
+        c.kg_agent.enabled = True
+    elif env_kg_enabled in ("0", "false", "no"):
+        c.kg_agent.enabled = False
+
     log.info(
         f"Config loaded. LLM: {c.local_llm.base_url} | "
         f"summon_required={c.summon.require_summon} | "
         f"NER={c.spacy.model} | graph={c.lkc.db_file} | "
         f"livekit={c.livekit.url} public={c.livekit.public_url} "
         f"(egress={'on' if c.livekit.egress_enabled else 'off'}) | "
-        f"supabase={'configured' if c.supabase.url else 'disabled'}"
+        f"supabase={'configured' if c.supabase.url else 'disabled'} | "
+        f"kg_agent={c.kg_agent.base_url if c.kg_agent.enabled else 'disabled'}"
     )
     return c
 

@@ -7,19 +7,31 @@ GET    /lkc/sessions                  — list sessions the caller can access (o
 GET    /lkc/sessions/{sid}            — session records, filterable (owner or participant)
 DELETE /lkc                           — wipe entire graph (admin only)
 DELETE /lkc/sessions/{sid}            — wipe one session (owner only)
+POST   /lkc/kg-query                  — ask the shared kg-agent literature KG directly (any authenticated user)
 
 Confirmed decision: admin-gate the operator-only routes (full dump, full
 wipe) rather than leaving them open. See app.api.deps.require_admin.
+
+POST /lkc/kg-query is NOT a query over the session records above — it's a
+separate corpus (a fixed 8-paper Neo4j knowledge graph on citi-condor, see
+app/services/kg_agent_client.py) exposed here for the frontend to query
+directly (e.g. a "search the literature" UI action), independent of the
+live-session hybrid QA path in session_pipeline.py. Not session-scoped —
+kg-agent's corpus doesn't vary by session — so no session ownership check,
+just standard auth.
 """
 
 import json
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
 
 from app.api.deps import get_current_user, require_admin, require_session_access, require_session_owner
+from app.core.config import cfg
 from app.db import lkc_graph, supabase_client
+from app.schemas import KgQueryRequest, KgQueryResponse
+from app.services import kg_agent_client
 
 router = APIRouter(prefix="/lkc", tags=["lkc"])
 
@@ -64,6 +76,34 @@ async def get_session_records(
         limit=limit,
     )
     return {"session_id": session_id, "count": len(records), "records": records}
+
+
+@router.post("/kg-query", response_model=KgQueryResponse)
+async def kg_query(
+    body: KgQueryRequest,
+    _current_user: dict = Depends(get_current_user),
+):
+    result = await kg_agent_client.query(body.query)
+    if result is None:
+        # Covers: kg-agent disabled, circuit-broken from a recent failure,
+        # unreachable, Neo4j degraded, or the empty-answer sentinel — all
+        # server-side conditions per the kg-agent doc, none of them the
+        # caller's fault, so 503 rather than 4xx.
+        raise HTTPException(
+            status_code=503,
+            detail="kg-agent is unavailable right now — check citi-condor/Tailscale, or try again shortly.",
+        )
+    grounded = result.in_corpus and result.faithfulness >= cfg.kg_agent.faithfulness_threshold
+    return KgQueryResponse(
+        answer=result.answer,
+        grounded=grounded,
+        faithfulness=result.faithfulness,
+        overall_confidence=result.overall_confidence,
+        temporal_validity_status=result.temporal_validity_status,
+        documents_used=result.documents_used,
+        disclaimer=result.disclaimer or None,
+        strategy=result.strategy or None,
+    )
 
 
 @router.delete("")

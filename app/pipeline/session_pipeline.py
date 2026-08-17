@@ -19,7 +19,7 @@ import numpy as np
 from app.core.config import cfg
 from app.db import lkc_graph, supabase_client
 from app.services import vision, eval_metrics, capture as _capture, privacy as _privacy
-from app.services import lkc_retrieval
+from app.services import lkc_retrieval, kg_agent_client
 from app.pipeline.asr import VadChunker, transcribe, resample_livekit_frame
 from app.pipeline.dialogue_service import (
     get_dialogue, assign_speaker, assign_speaker_words,
@@ -64,34 +64,127 @@ def _vision_record(session_id, ts, scene_summary, speakers, cues, env_state):
     return r
 
 
-def _agent_record(session_id, ts, reply_text, mode):
-    return {
+def _agent_record(session_id, ts, reply_text, mode, source="transcript", kg_answer=None):
+    """
+    source: "transcript" (existing lkc_retrieval-grounded path) or
+    "kg_agent" (literature-grounded path — see _handle_qa_sse). kg_answer,
+    when given, is the KgAgentAnswer that produced this reply; its
+    provenance fields are folded into the record's JSONB payload so they're
+    queryable later without a schema change (lkc_records.payload stores the
+    whole dict as-is — see lkc_graph.write_to_lkc).
+    """
+    record = {
         "type":           "agent_reply",
         "session_id":     session_id,
         "timestamp_iso":  datetime.utcfromtimestamp(ts).isoformat() + "Z",
         "timestamp_unix": round(ts, 3),
         "text":           reply_text,
         "mode":           mode,
+        "source":         source,
     }
+    if kg_answer is not None:
+        record["kg_faithfulness"]        = kg_answer.faithfulness
+        record["kg_overall_confidence"]  = kg_answer.overall_confidence
+        record["kg_documents_used"]      = kg_answer.documents_used
+        record["kg_disclaimer"]          = kg_answer.disclaimer
+    return record
 
 
 # ── QA reply (SSE path) ───────────────────────────────────────────────────────
 
+def _log_late_kg_result(session_id: str, task: asyncio.Task) -> None:
+    """
+    Done-callback for a kg-agent call that outran the soft deadline. We
+    deliberately do NOT cancel that task (see the comment in
+    _handle_qa_sse below) — this just logs what happened once it finally
+    resolves, for visibility, since the current turn already answered via
+    the transcript-grounded fallback by the time this fires.
+    """
+    try:
+        result = task.result()
+    except Exception as exc:
+        log.warning(f"[dialogue:{session_id}] kg-agent query failed (after soft deadline): {exc}")
+        return
+    if result is not None:
+        log.info(
+            f"[dialogue:{session_id}] kg-agent answered after the soft deadline "
+            f"(faithfulness={result.faithfulness:.2f}, in_corpus={result.in_corpus}) "
+            f"— too late for that turn, transcript fallback already replied"
+        )
+
+
 async def _handle_qa_sse(session_id, dlg, full_text, retriever, mode, tts_queue):
+    # Fire both retrieval paths concurrently: kg-agent (literature, over
+    # citi-condor's network — can take up to ~13s cold, ~2-4s warm) and the
+    # local transcript retriever (in-process, fast). They answer different
+    # questions from different corpora — see kg_agent_client.py's module
+    # docstring — so this isn't a redundant double-call, it's a race to see
+    # which one is actually relevant to what was asked.
+    kg_task = asyncio.create_task(kg_agent_client.query(full_text))
     lkc_context = await retriever.query(
         full_text, top_k=cfg.lkc.retrieval_top_k, session_id=session_id
     )
-    reply = await generate_response(dlg, full_text, lkc_context)
+
+    kg_result = None
+    done, _pending = await asyncio.wait(
+        {kg_task}, timeout=cfg.kg_agent.soft_deadline_seconds
+    )
+    if kg_task in done:
+        try:
+            kg_result = kg_task.result()
+        except Exception as exc:
+            log.warning(f"[dialogue:{session_id}] kg-agent query failed: {exc}")
+    else:
+        # Past the soft deadline but NOT cancelled on purpose: the kg-agent
+        # doc warns that a client giving up early still leaves the server
+        # burning a worker/Ollama slot for a request nobody's waiting on.
+        # Let it finish in the background; this turn falls through to the
+        # transcript-grounded reply below regardless.
+        kg_task.add_done_callback(lambda t: _log_late_kg_result(session_id, t))
+
+    use_kg = (
+        kg_result is not None
+        and kg_result.in_corpus  # empty documents_used == outside the 8-paper corpus
+        and kg_result.faithfulness >= cfg.kg_agent.faithfulness_threshold
+    )
+
+    if use_kg:
+        reply  = kg_result.answer
+        source = "kg_agent"
+        grounded = True
+        log.info(
+            f"[dialogue:{session_id}] answered from kg-agent "
+            f"(faithfulness={kg_result.faithfulness:.2f}, "
+            f"docs={[d.get('name') for d in kg_result.documents_used]})"
+        )
+    else:
+        reply  = await generate_response(dlg, full_text, lkc_context)
+        source = "transcript"
+        grounded = bool(lkc_context.strip())
+
     if reply:
         ts = time.time()
-        await lkc_graph.write_to_lkc(_agent_record(session_id, ts, reply, mode.value))
+        record = _agent_record(
+            session_id, ts, reply, mode.value,
+            source=source, kg_answer=kg_result if use_kg else None,
+        )
+        await lkc_graph.write_to_lkc(record)
         tts_queue.put_nowait(reply)
-        broadcast(session_id, {"type": "agent_reply", "text": reply,
-                               "mode": mode.value, "grounded": bool(lkc_context.strip())})
+        agent_reply_event = {
+            "type": "agent_reply", "text": reply,
+            "mode": mode.value, "grounded": grounded, "source": source,
+        }
+        if use_kg:
+            agent_reply_event.update({
+                "faithfulness":    kg_result.faithfulness,
+                "documents_used":  kg_result.documents_used,
+                "disclaimer":      kg_result.disclaimer,  # "" when all gates passed
+            })
+        broadcast(session_id, agent_reply_event)
         broadcast(session_id, {"type": "speak", "text": reply})
         await supabase_client.insert_agent_reply(
             session_id=session_id, text=reply, mode=mode.value,
-            timestamp_unix=ts, grounded=bool(lkc_context.strip()), lkc_context=lkc_context,
+            timestamp_unix=ts, grounded=grounded, lkc_context=lkc_context,
         )
     # NOTE: clear_summon() used to live here, i.e. it only ran once the LLM
     # reply finished. It's now consumed at task-creation time in

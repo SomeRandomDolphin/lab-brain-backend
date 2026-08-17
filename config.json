@@ -23,6 +23,15 @@
     "db_file": "lkc_graph.db",
     "retrieval_top_k": 4
   },
+  "kg_agent": {
+    "_comment": "Read-only kg-agent literature-QA service on citi-condor. Separate from lkc above (that's session-transcript retrieval) — this answers domain questions from the 8-paper knowledge graph. Tailnet-only, no auth. See kg-agent integration doc, verified 2026-08-17.",
+    "enabled": true,
+    "base_url": "http://100.122.56.39:8003",
+    "request_timeout_seconds": 300.0,
+    "soft_deadline_seconds": 6.0,
+    "faithfulness_threshold": 0.7,
+    "circuit_breaker_cooldown_seconds": 30.0
+  },
   "summon": {
     "_comment": "Wake-word phrases that trigger the agent. Case-insensitive.",
     "phrases": [

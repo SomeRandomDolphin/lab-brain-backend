@@ -178,6 +178,20 @@ def create_app() -> FastAPI:
         except Exception as exc:
             log.error(f"[startup] LKC retrieval warmup failed: {exc}")
 
+        # Check the kg-agent literature service the same way — this is just
+        # a GET /health (cheap, ~5s client timeout), not a model load, so it
+        # doesn't need run_in_executor either. Unlike the warmups below,
+        # failure here is expected/non-fatal in normal operation (e.g. off
+        # the Tailscale network, citi-condor down) — the hybrid QA path in
+        # session_pipeline.py already falls back to transcript-only when
+        # kg-agent is unavailable, so this just gets that fact into the
+        # startup log instead of surfacing silently on the first live query.
+        from app.services.kg_agent_client import warmup as _warmup_kg_agent
+        try:
+            await _warmup_kg_agent()
+        except Exception as exc:
+            log.error(f"[startup] kg-agent warmup failed: {exc}")
+
         # Warm the local dialogue LLM (Ollama) the same way — otherwise the
         # first chat.completions.create() call of the process's life is
         # whichever user's first real summon happens to be, and that call

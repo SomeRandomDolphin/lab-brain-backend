@@ -25,9 +25,9 @@
 #              All Compose containers are prefixed "lab-brain-supabase".
 #
 #   Ollama   — Local LLM inference server (OpenAI-compatible API).
-#              Pulls vision_model, dialogue_model, and embedding_model
-#              straight from config.json into a shared Docker volume so
-#              models survive restarts.
+#              Pulls vision_model, dialogue_model, embedding_model, and
+#              extra_model (hermes3:3b) straight from config.json into a
+#              shared Docker volume so models survive restarts.
 #              GPU passthrough is enabled automatically when the NVIDIA
 #              container runtime is detected.
 #
@@ -1090,13 +1090,15 @@ start_ollama() {
   info "Setting up Ollama..."
 
   # Model names come directly from config.json — stays in sync with the backend
-  local vision_model dialogue_model embedding_model
+  local vision_model dialogue_model embedding_model extra_model
   vision_model=$(read_config    "['local_llm']['vision_model']"    "qwen3-vl:4b")
   dialogue_model=$(read_config  "['local_llm']['dialogue_model']"  "qwen3:4b")
   embedding_model=$(read_config "['local_llm']['embedding_model']" "qwen3-embedding:0.6b")
+  extra_model=$(read_config     "['local_llm']['extra_model']"     "hermes3:3b")
   echo "  vision_model    = ${vision_model}"
   echo "  dialogue_model  = ${dialogue_model}"
   echo "  embedding_model = ${embedding_model}"
+  echo "  extra_model     = ${extra_model}"
 
   # GUARD: if config.json points both roles at the same model tag, every
   # dialogue/QA call queues behind vision calls on the same model-runner
@@ -1134,27 +1136,26 @@ dialogue_model — or dialogue/QA calls will queue behind every vision call. Fix
   # meeting length; adjust if RAM/VRAM is tight.
   local ollama_keep_alive="1h"
 
-  # OLLAMA_MAX_LOADED_MODELS: this app runs THREE models against the same
+  # OLLAMA_MAX_LOADED_MODELS: this app runs FOUR models against the same
   # Ollama instance — dialogue_model (qwen3:4b) for QA/summary, vision_model
   # (qwen3-vl:4b) for the periodic frame analysis in session_pipeline.py's
-  # _vision_worker, and (as of the qwen3-embedding switch) embedding_model
-  # (qwen3-embedding:0.6b) for LKC retrieval in lkc_retrieval.py, which now
-  # gets called on essentially every QA turn. Ollama's default cap on
+  # _vision_worker, embedding_model (qwen3-embedding:0.6b) for LKC retrieval
+  # in lkc_retrieval.py (called on essentially every QA turn), and
+  # extra_model (hermes3:3b) alongside them. Ollama's default cap on
   # simultaneously loaded models is 1 in CPU-only setups (which this
   # already falls back to whenever GPU passthrough fails — see the
-  # nvidia-smi check below). With the cap too low, any embedding call that
-  # comes in while the dialogue/vision model is loaded forces Ollama to
-  # evict one and reload it — a full cold-start on the next call, despite
-  # warmup() and OLLAMA_KEEP_ALIVE both being set correctly. That model-swap
-  # thrashing, not a slow model, is what actually produced a 147s "warm" QA
-  # reply in one observed session (before embedding was even in the mix).
-  # Raising this to 3 lets all three stay resident together as long as
-  # there's enough RAM/VRAM for all of them at once — the embedding model is
-  # small (639 MB at the 0.6b tag) so this is usually the cheapest of the
-  # three slots. Confirm afterwards with `docker exec lab-brain-ollama
-  # ollama ps`, which should list all THREE models at once instead of
-  # swapping between them.
-  local ollama_max_loaded_models="3"
+  # nvidia-smi check below). With the cap too low, any call that comes in
+  # while another model is loaded forces Ollama to evict one and reload it
+  # — a full cold-start on the next call, despite warmup() and
+  # OLLAMA_KEEP_ALIVE both being set correctly. That model-swap thrashing,
+  # not a slow model, is what actually produced a 147s "warm" QA reply in
+  # one observed session. Raising this to 4 lets all four stay resident
+  # together as long as there's enough RAM/VRAM for all of them at once —
+  # the embedding model is small (639 MB at the 0.6b tag) and hermes3:3b is
+  # also modest, so these are usually the cheapest slots. Confirm afterwards
+  # with `docker exec lab-brain-ollama ollama ps`, which should list all
+  # FOUR models at once instead of swapping between them.
+  local ollama_max_loaded_models="4"
 
   # OLLAMA_NUM_PARALLEL: number of concurrent requests a single loaded model
   # will process at once (default 1). Each extra slot allocates its own
@@ -1227,10 +1228,11 @@ dialogue_model — or dialogue/QA calls will queue behind every vision call. Fix
   pull_model "$vision_model"
   pull_model "$dialogue_model"
   pull_model "$embedding_model"
+  pull_model "$extra_model"
 
-  # Verify all three models actually end up loaded SIMULTANEOUSLY, not just
+  # Verify all four models actually end up loaded SIMULTANEOUSLY, not just
   # pulled — a bad OLLAMA_MAX_LOADED_MODELS value, insufficient RAM/VRAM for
-  # all three at once, or the vision/dialogue-model-collision bug guarded
+  # all four at once, or the vision/dialogue-model-collision bug guarded
   # against above could all still leave you with model-swap thrashing at
   # runtime. A single pull doesn't load a model into memory, so ping each
   # with a trivial call first.
@@ -1239,9 +1241,10 @@ dialogue_model — or dialogue/QA calls will queue behind every vision call. Fix
   # template and will error out on `ollama run <model> "hi"` (that path
   # calls the generate/chat endpoint). Warm it up via /api/embed instead,
   # which is the same endpoint lkc_retrieval.py actually calls at runtime.
-  info "Verifying all three models can stay resident together..."
+  info "Verifying all four models can stay resident together..."
   docker exec "$OLLAMA_CONTAINER" ollama run "$vision_model" "hi" >/dev/null 2>&1 || true
   docker exec "$OLLAMA_CONTAINER" ollama run "$dialogue_model" "hi" >/dev/null 2>&1 || true
+  docker exec "$OLLAMA_CONTAINER" ollama run "$extra_model" "hi" >/dev/null 2>&1 || true
   # NOTE: `docker exec ... curl` doesn't work here — the official
   # ollama/ollama image does not ship curl (a long-standing known gap, see
   # ollama/ollama#9781 — it's also why the image's own default healthcheck
@@ -1256,13 +1259,14 @@ dialogue_model — or dialogue/QA calls will queue behind every vision call. Fix
   echo "$loaded"
   if echo "$loaded" | grep -qF "$vision_model" \
     && echo "$loaded" | grep -qF "$dialogue_model" \
-    && echo "$loaded" | grep -qF "$embedding_model"; then
-    success "All three models resident simultaneously — no swap thrashing expected."
+    && echo "$loaded" | grep -qF "$embedding_model" \
+    && echo "$loaded" | grep -qF "$extra_model"; then
+    success "All four models resident simultaneously — no swap thrashing expected."
   else
-    warn "Not all three models show as loaded. Either RAM/VRAM can't hold all of them at"
+    warn "Not all four models show as loaded. Either RAM/VRAM can't hold all of them at"
     warn "once, or OLLAMA_MAX_LOADED_MODELS (${ollama_max_loaded_models}) is being capped"
-    warn "by the runtime. A dialogue/vision/embedding call arriving while another is in"
-    warn "flight will trigger a cold reload each time. Check available memory, or drop to"
+    warn "by the runtime. A dialogue/vision/embedding/extra call arriving while another is"
+    warn "in flight will trigger a cold reload each time. Check available memory, or drop to"
     warn "a smaller embedding tag (qwen3-embedding:0.6b is already the smallest)."
   fi
 
