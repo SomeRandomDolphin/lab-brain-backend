@@ -216,7 +216,36 @@ class _IndexEntry:
         else:
             return ""
 
-        top_idx = scores.argsort()[::-1][:top_k]
+        top_idx = list(scores.argsort()[::-1][:top_k])
+
+        # Past QA turns get persisted as ordinary transcript records too —
+        # so a question like "what's the summary of the last meeting?" can
+        # score higher against OTHER PEOPLE'S PAST INSTANCES OF THAT SAME
+        # QUESTION than against an actual session_summary record, since a
+        # near-duplicate question is closer in embedding space than a long
+        # markdown answer is. That crowds every summary out of top_k even
+        # when a clearly-relevant one exists (score >= floor) — reproduced
+        # directly: a "recap"-style query returned 4/4 hits that were other
+        # transcript lines of people asking the same question, zero actual
+        # summaries, even though a matching summary was in the corpus and
+        # scored above floor. Guarantee it a slot instead of leaving this
+        # purely to raw cosine rank: if the best-scoring session_summary
+        # record clears the floor and isn't already in top_idx, swap it in
+        # for the current lowest-ranked slot rather than dropping it.
+        summary_positions = [
+            i for i, r in enumerate(self.records) if r.get("type") == "session_summary"
+        ]
+        if summary_positions:
+            best_summary_idx = max(summary_positions, key=lambda i: scores[i])
+            if (
+                float(scores[best_summary_idx]) >= floor
+                and best_summary_idx not in top_idx
+            ):
+                top_idx[-1] = best_summary_idx
+                # Keep the guaranteed slot in score order with the rest so
+                # a strong summary still reads before weaker general hits.
+                top_idx.sort(key=lambda i: -scores[i])
+
         hits: list[str] = []
         for idx in top_idx:
             if float(scores[idx]) < floor:
@@ -341,7 +370,8 @@ class LKCRetriever:
         lightweight = [
             {"timestamp_iso": r.get("timestamp_iso", ""),
              "speaker": r.get("speaker", ""),
-             "text": r.get("text") or r.get("summary") or ""}
+             "text": r.get("text") or r.get("summary") or "",
+             "type": r.get("type")}
             for r in all_records
             if r.get("text") or r.get("summary")
         ]
