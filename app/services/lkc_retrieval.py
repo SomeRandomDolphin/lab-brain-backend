@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -82,6 +83,19 @@ except ImportError:
     log.warning("[retrieval] scikit-learn not installed — TF-IDF fallback disabled.")
 
 _http_client: Optional[httpx.AsyncClient] = None
+
+# Matches "last/previous/prior/most recent meeting", "what happened last
+# time", "recap the last meeting", etc. Deliberately conservative (doesn't
+# try to catch every phrasing) — a false negative just falls back to normal
+# semantic ranking, which is the existing behaviour; a false positive would
+# override semantic relevance with recency for a query that didn't want
+# that, which is the worse failure mode, so this stays narrow rather than
+# broad.
+_RECENCY_QUERY_RE = re.compile(
+    r"\b(last|previous|prior|most recent)\b.{0,15}\bmeeting\b"
+    r"|\bwhat happened\b.{0,15}\b(last time|previously)\b",
+    re.IGNORECASE,
+)
 
 
 def _get_http_client() -> httpx.AsyncClient:
@@ -194,7 +208,9 @@ class _IndexEntry:
                 None, _fit_tfidf, self.corpus
             )
 
-    async def search(self, question: str, top_k: int) -> str:
+    async def search(
+        self, question: str, top_k: int, exclude_session_id: Optional[str] = None
+    ) -> str:
         if self._embeddings is not None:
             q_emb = await _ollama_embed([question])
             if q_emb is None:
@@ -229,18 +245,34 @@ class _IndexEntry:
         # transcript lines of people asking the same question, zero actual
         # summaries, even though a matching summary was in the corpus and
         # scored above floor. Guarantee it a slot instead of leaving this
-        # purely to raw cosine rank: if the best-scoring session_summary
-        # record clears the floor and isn't already in top_idx, swap it in
-        # for the current lowest-ranked slot rather than dropping it.
+        # purely to raw cosine rank.
         summary_positions = [
-            i for i, r in enumerate(self.records) if r.get("type") == "session_summary"
+            i for i, r in enumerate(self.records)
+            if r.get("type") == "session_summary"
+            and (exclude_session_id is None or r.get("session_id") != exclude_session_id)
         ]
         if summary_positions:
-            best_summary_idx = max(summary_positions, key=lambda i: scores[i])
-            if (
-                float(scores[best_summary_idx]) >= floor
-                and best_summary_idx not in top_idx
-            ):
+            if _RECENCY_QUERY_RE.search(question):
+                # "Last meeting" is a RECENCY request, not a topical one —
+                # cosine similarity has no notion of "most recent"; it just
+                # picks whichever summary happens to embed closest to the
+                # query text, which among a pile of near-identical "not
+                # enough content" stub summaries is close to arbitrary
+                # (reproduced directly: it picked a random all-None fallback
+                # summary from days earlier over the actual last session).
+                # timestamp_iso sorts correctly as a plain string (ISO 8601),
+                # so pick by max timestamp instead of max score here, and
+                # skip the floor check entirely — recency intent means we
+                # want the last summary regardless of how it happens to
+                # embed against the question text.
+                best_summary_idx = max(
+                    summary_positions, key=lambda i: self.records[i].get("timestamp_iso", "")
+                )
+            else:
+                best_summary_idx = max(summary_positions, key=lambda i: scores[i])
+                if float(scores[best_summary_idx]) < floor:
+                    best_summary_idx = None
+            if best_summary_idx is not None and best_summary_idx not in top_idx:
                 top_idx[-1] = best_summary_idx
                 # Keep the guaranteed slot in score order with the rest so
                 # a strong summary still reads before weaker general hits.
@@ -248,9 +280,12 @@ class _IndexEntry:
 
         hits: list[str] = []
         for idx in top_idx:
-            if float(scores[idx]) < floor:
+            r = self.records[idx]
+            is_recency_summary = (
+                r.get("type") == "session_summary" and _RECENCY_QUERY_RE.search(question)
+            )
+            if float(scores[idx]) < floor and not is_recency_summary:
                 continue
-            r  = self.records[idx]
             ts = r.get("timestamp_iso", "")[:19].replace("T", " ")
             body = r.get("text") or r.get("summary") or ""
             label = "summary" if r.get("type") == "session_summary" or not r.get("text") else r.get("speaker", "?")
@@ -293,10 +328,13 @@ class LKCRetriever:
         """
         if user_id is not None and user_session_ids is not None:
             entry = await self._get_user_entry(user_id, user_session_ids)
+            exclude_id = session_id  # don't let "last meeting" pick the still-live current session
         elif session_id is not None:
             entry = await self._get_session_entry(session_id)
+            exclude_id = None  # single-session scope — the current session's own summary is all there is
         else:
             entry = await self._get_global_entry()
+            exclude_id = session_id
         if entry is None or not entry.records:
             return ""
         # entry.search() is now natively async I/O (an HTTP call to
@@ -306,7 +344,7 @@ class LKCRetriever:
         # TF-IDF fallback path inside search() is a single-string
         # transform and stays cheap enough to run inline; the expensive
         # full-corpus TF-IDF fit is offloaded inside _IndexEntry.build().
-        return await entry.search(question, top_k)
+        return await entry.search(question, top_k, exclude_session_id=exclude_id)
 
     async def _get_session_entry(self, session_id: str) -> Optional[_IndexEntry]:
         # session_text_corpus() now defaults to ["transcript", "session_summary"]
