@@ -107,3 +107,27 @@ class OkResponse(BaseModel):
 
 class TosConsentRequest(BaseModel):
     accepted: bool
+
+
+# ── Profile update ──────────────────────────────────────────────────────────
+# Used by PATCH /auth/me. All fields optional — only whatever's present in
+# the request body gets changed (see UpdateProfileRequest.model_dump's use
+# of exclude_unset in the endpoint). email going through this path (rather
+# than a dedicated /auth/change-email + verification flow) means a changed
+# email takes effect immediately with no re-confirmation step — see the
+# email_confirm=True passed alongside it in supabase_auth.update_profile.
+
+class UpdateProfileRequest(BaseModel):
+    name:      Optional[str] = Field(default=None, min_length=1, max_length=100)
+    email:     Optional[str] = Field(default=None, min_length=3, max_length=254)
+    avatarUrl: Optional[str] = Field(default=None, max_length=2048)
+
+    @field_validator("email")
+    @classmethod
+    def email_lowercase(cls, v: Optional[str]) -> Optional[str]:
+        return v.strip().lower() if v is not None else v
+
+    @field_validator("name")
+    @classmethod
+    def name_strip(cls, v: Optional[str]) -> Optional[str]:
+        return v.strip() if v is not None else v

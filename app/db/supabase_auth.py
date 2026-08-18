@@ -198,6 +198,64 @@ def set_tos_consent(user_id: str, accepted: bool) -> dict:
     return updated
 
 
+def update_profile(
+    user_id: str,
+    *,
+    name: Optional[str] = None,
+    email: Optional[str] = None,
+    avatar_url: Optional[str] = None,
+) -> dict:
+    """
+    Partial update of a user's profile (name, email, avatar_url). Only the
+    keyword args passed as non-None are changed; anything else already in
+    user_metadata is preserved (same merge behavior as update_user_metadata,
+    reimplemented here rather than calling it, so the metadata merge and the
+    top-level email change go out in a single admin.update_user_by_id call
+    instead of two round trips).
+
+    `email` is a top-level Supabase Auth field, not part of user_metadata —
+    it's set alongside `email_confirm=True` so the change takes effect
+    immediately, matching create_user()'s behavior at registration, rather
+    than leaving the account in a pending-confirmation state tied to the
+    old address.
+
+    Raises ValueError if user_id doesn't exist, or if the new email is
+    already registered to a different account.
+    """
+    try:
+        resp = _get_admin().auth.admin.get_user_by_id(user_id)
+        if resp.user is None:
+            raise ValueError(f"No such user: {user_id}")
+
+        attrs: dict = {}
+
+        meta_patch: dict = {}
+        if name is not None:
+            meta_patch["name"] = name
+        if avatar_url is not None:
+            meta_patch["avatar_url"] = avatar_url
+        if meta_patch:
+            attrs["user_metadata"] = {**(resp.user.user_metadata or {}), **meta_patch}
+
+        if email is not None:
+            attrs["email"] = email
+            attrs["email_confirm"] = True
+
+        if not attrs:
+            return _user_to_dict(resp.user)
+
+        updated = _get_admin().auth.admin.update_user_by_id(user_id, attrs)
+        return _user_to_dict(updated.user)
+    except ValueError:
+        raise
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "already registered" in msg or "already exists" in msg or "unique" in msg:
+            raise ValueError(f"Email already in use: {email}") from exc
+        log.error(f"[supabase_auth] update_profile failed for {user_id}: {exc}")
+        raise
+
+
 def authenticate_user(email: str, password: str) -> Optional[tuple[dict, str, str]]:
     """
     Sign in with email + password via Supabase Auth.

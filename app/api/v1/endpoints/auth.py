@@ -6,6 +6,7 @@ POST   /auth/login            — verify credentials, return user + tokens
 POST   /auth/logout           — revoke token server-side
 POST   /auth/refresh          — exchange refresh_token for new access_token
 GET    /auth/me               — validate token, return current user
+PATCH  /auth/me               — update current user's name/email/avatarUrl
 POST   /auth/forgot-password  — trigger Supabase password-recovery email
 POST   /auth/reset-password   — consume reset token, set new password
 
@@ -30,6 +31,7 @@ from app.schemas.auth import (
     RefreshRequest,
     RegisterRequest,
     ResetPasswordRequest,
+    UpdateProfileRequest,
     UserOut,
 )
 
@@ -187,6 +189,44 @@ async def me(current_user: dict = Depends(get_current_user)):
     - **401** if the token is missing, expired, or revoked.
     """
     return {"user": UserOut(**current_user)}
+
+
+# ── PATCH /auth/me ─────────────────────────────────────────────────────────────
+
+@router.patch(
+    "/me",
+    response_model=dict,   # { "user": UserOut }
+    summary="Update the current user's profile",
+)
+async def update_me(
+    req: UpdateProfileRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Partial update of the current account's profile — name, email, and/or
+    avatarUrl. Only fields present in the request body are changed;
+    omitted fields are left as-is (exclude_unset, not "falsy value means
+    clear it" — sending `{"name": ""}` would fail Pydantic's min_length=1
+    rather than silently no-op).
+
+    - **409** if the new email is already registered to a different account.
+    """
+    patch = req.model_dump(exclude_unset=True)
+    if not patch:
+        return {"user": UserOut(**current_user)}
+
+    try:
+        updated = supabase_auth.update_profile(
+            current_user["id"],
+            name=patch.get("name"),
+            email=patch.get("email"),
+            avatar_url=patch.get("avatarUrl"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+    log.info(f"[auth] profile updated: {updated['email']} ({updated['id']})")
+    return {"user": UserOut(**updated)}
 
 
 # ── POST /auth/forgot-password ────────────────────────────────────────────────
