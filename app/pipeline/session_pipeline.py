@@ -12,7 +12,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import numpy as np
 
@@ -23,7 +23,7 @@ from app.services import lkc_retrieval, kg_agent_client
 from app.pipeline.asr import VadChunker, transcribe, resample_livekit_frame
 from app.pipeline.dialogue_service import (
     get_dialogue, assign_speaker, assign_speaker_words,
-    update_mode, push_context, generate_response, clear_dialogue, ConvMode,
+    update_mode, push_context, generate_response, ConvMode,
     QA_FOLLOW_UP_WINDOW_SECONDS,
 )
 from app.pipeline.livekit_rooms import broadcast, get_known_identity

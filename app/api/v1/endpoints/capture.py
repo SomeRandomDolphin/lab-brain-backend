@@ -16,15 +16,13 @@ GET    /retrieval/stats               — embedding retriever stats
 
 import time
 import logging
-from typing import Optional
 
 from fastapi import APIRouter
-from pydantic import BaseModel
 
 from app.db import lkc_graph
 from app.services import capture as _capture
 from app.services import lkc_retrieval
-from app.schemas import RifqiSegment
+from app.schemas.ingest import RifqiSegment
 
 log = logging.getLogger(__name__)
 

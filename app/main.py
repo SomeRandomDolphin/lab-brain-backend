@@ -32,8 +32,6 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-
-from app.core.config import cfg
 from app.core.logging import setup_logging
 
 # setup_logging() must run BEFORE importing app.api.v1.router, not after.

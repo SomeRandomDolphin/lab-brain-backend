@@ -30,7 +30,7 @@ from fastapi.responses import HTMLResponse
 from app.api.deps import get_current_user, require_admin, require_session_access, require_session_owner
 from app.core.config import cfg
 from app.db import lkc_graph, supabase_client
-from app.schemas import KgQueryRequest, KgQueryResponse
+from app.schemas.kg_agent import KgQueryRequest, KgQueryResponse
 from app.services import kg_agent_client
 
 router = APIRouter(prefix="/lkc", tags=["lkc"])

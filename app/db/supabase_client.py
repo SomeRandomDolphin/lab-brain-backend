@@ -47,7 +47,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import func, select, delete, or_, text as sa_text
+from sqlalchemy import func, select, or_, text as sa_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 

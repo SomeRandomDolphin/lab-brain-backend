@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.api.deps import get_current_user, require_session_access, require_session_owner
 from app.core.config import cfg
-from app.schemas import RoomCreateRequest, RoomCreateResponse
+from app.schemas.livekit import RoomCreateRequest, RoomCreateResponse
 from app.pipeline import livekit_rooms
 from app.db import supabase_client
 from app.services import vision, eval_metrics

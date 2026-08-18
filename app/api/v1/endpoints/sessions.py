@@ -23,7 +23,7 @@ from app.core.config import cfg
 from app.db import lkc_graph, supabase_client
 from app.services import vision, eval_metrics
 from app.services.capture import is_summoned
-from app.schemas import WerRequest
+from app.schemas.eval import WerRequest
 
 # Deferred imports to avoid circular at module load
 def _get_dialogue_module():

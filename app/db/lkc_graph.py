@@ -31,10 +31,6 @@ from .supabase_client import get_session_factory
 log = logging.getLogger(__name__)
 
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
 def _from_unix(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 

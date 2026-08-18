@@ -33,7 +33,8 @@ the fix there for why this didn't hold before.
 
 from fastapi import APIRouter, Depends
 from app.api.deps import get_current_user, require_session_access
-from app.schemas import ConsentRequest, ConsentSyncRequest, TosConsentRequest
+from app.schemas.privacy import ConsentRequest, ConsentSyncRequest
+from app.schemas.auth import TosConsentRequest
 from app.services import privacy as _privacy
 from app.db import supabase_client, supabase_auth
 

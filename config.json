@@ -58,18 +58,15 @@
     ]
   },
   "livekit": {
-    "_comment": "LiveKit SFU \u00e2\u20ac\u201d run: docker run --rm -p 7880:7880 livekit/livekit-server --dev",
+    "_comment": "LiveKit SFU — run: docker run --rm -p 7880:7880 livekit/livekit-server --dev",
     "url": "ws://host.docker.internal:7880",
     "public_url": "wss://citi-condor.tail360067.ts.net:7443",
-    "api_key": "devkey",
-    "api_secret": "QQYwEDWf1zeIPS90SP5AwEqflO+/xiz/0Gi1aOfEG9Y=",
     "node_ip": "100.122.56.39"
   },
   "supabase": {
-    "_comment": "Set SUPABASE_URL and SUPABASE_KEY env vars \u00e2\u20ac\u201d never hardcode secrets here.",
+    "_comment": "url/key intentionally blank — SUPABASE_URL / SUPABASE_SERVICE_KEY in .env are the only source of truth (see config.py load()). Leaving these blank means a missing .env fails loudly (empty supabase.url logs 'disabled') instead of silently falling back to a stale hardcoded key.",
     "url": "http://host.docker.internal:8080",
-    "key": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzgyNzEyNDE4LCJleHAiOjE5NDAzOTI0MTh9.JRXxfOd3PEP8YBvoX_u6f7WYu6Mr2ZWJfvRqL-GkUyc",
-    "store_audio": false,
-    "store_vision": true
+    "store_audio": true,
+    "store_vision": false
   }
 }
