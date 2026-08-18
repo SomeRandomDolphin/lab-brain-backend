@@ -21,13 +21,13 @@ import sys
 from logging.config import fileConfig
 from pathlib import Path
 
-# Ensure the project root is on sys.path so app.core.env is importable
+# Ensure the project root is on sys.path so core.env is importable
 # when `alembic` is invoked from the CLI outside the normal app startup.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # Load .env before anything reads os.environ (covers CLI usage;
 # no-ops in production where real env vars are already set).
-from app.core.env import load_env  # noqa: E402
+from core.env import load_env  # noqa: E402
 load_env()
 
 import logging

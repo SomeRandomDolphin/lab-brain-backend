@@ -80,7 +80,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python -m spacy download en_core_web_sm
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Stage 2: runtime — slim base + only what's needed to RUN the app.
+# Stage 2: runtime — slim base + only what's needed to RUN the app
 # No compilers, no git, no pip cache.
 # ═══════════════════════════════════════════════════════════════════════════
 # Pinned to -bookworm — see the matching comment on the builder stage's

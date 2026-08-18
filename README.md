@@ -194,7 +194,7 @@ SQL-file runner). Revisions live in `alembic/versions/` as Python scripts with
 `upgrade()` / `downgrade()` functions, and applied state is tracked in Postgres'
 own `alembic_version` table (the old custom `schema_migrations` table is no longer used).
 
-**Automatic on startup:** `app/main.py` calls `app.db.migrations.run_migrations()`
+**Automatic on startup:** `app/main.py` calls `db.migrations.run_migrations()`
 during FastAPI startup, which runs `alembic upgrade head`. Already-applied
 revisions are skipped — safe to run on every restart. If `SUPABASE_DB_URL` isn't
 set, the app logs a warning and continues rather than failing to boot.
@@ -336,7 +336,7 @@ python main.py
 
 `app/core/env.py` (`load_env()`) parses `.env` from the project root and applies its
 `KEY=VALUE` pairs to `os.environ` as the very first thing `app/main.py` does — before
-`app.core.config`, `app.db.supabase_client`, or `app.db.migrations` get a chance to read
+`core.config`, `db.supabase_client`, or `db.migrations` get a chance to read
 any environment variables. It's a small, dependency-free parser (no `python-dotenv`
 required) that supports:
 
@@ -354,9 +354,9 @@ convenience, not a way to override production config.
 A missing `.env` file is not an error — it just means "nothing to load," which is the
 normal case in production where real env vars are set directly.
 
-> **Note:** `load_env()` is called at the top of `app/main.py`, before `app.core.config`
+> **Note:** `load_env()` is called at the top of `app/main.py`, before `core.config`
 > is imported. That's early enough as long as the top-level `main.py` (the uvicorn
-> entry point) does `from app.main import app` without importing anything else that
+> entry point) does `from main import app` without importing anything else that
 > reads `os.environ` at import time first. If you add such an import to the top-level
 > `main.py`, move the `load_env()` call there instead, as the very first line.
 
