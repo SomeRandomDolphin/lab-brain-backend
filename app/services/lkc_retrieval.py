@@ -173,8 +173,12 @@ class _IndexEntry:
     async def build(self) -> None:
         if not self.records:
             return
+        # A session_summary record's raw payload has a `summary` key, not
+        # `text` — without this fallback, every summary record embeds as
+        # an empty string and is functionally invisible to search
+        # regardless of whether it's included in self.records at all.
         self.corpus = [
-            f"{r.get('speaker', '')} {r.get('text', '')}".strip()
+            f"{r.get('speaker', '')} {r.get('text') or r.get('summary') or ''}".strip()
             for r in self.records
         ]
         embeddings = await _ollama_embed(self.corpus)
@@ -219,7 +223,9 @@ class _IndexEntry:
                 continue
             r  = self.records[idx]
             ts = r.get("timestamp_iso", "")[:19].replace("T", " ")
-            hits.append(f"[{ts}] {r.get('speaker','?')}: {r.get('text','')}")
+            body = r.get("text") or r.get("summary") or ""
+            label = "summary" if r.get("type") == "session_summary" or not r.get("text") else r.get("speaker", "?")
+            hits.append(f"[{ts}] {label}: {body}")
         return "\n".join(hits)
 
 
@@ -274,6 +280,10 @@ class LKCRetriever:
         return await entry.search(question, top_k)
 
     async def _get_session_entry(self, session_id: str) -> Optional[_IndexEntry]:
+        # session_text_corpus() now defaults to ["transcript", "session_summary"]
+        # (see lkc_graph.py) — this is the fallback scope used when a
+        # session's owner couldn't be resolved (see session_pipeline.py),
+        # so it needs the same summary visibility as the user/global scopes.
         records = await lkc_graph.session_text_corpus(session_id)
         cached  = self._sessions.get(session_id)
         if cached is None or len(records) != cached.record_count:
@@ -307,7 +317,9 @@ class LKCRetriever:
         """
         if not session_ids:
             return None
-        records = await lkc_graph.read_lkc(session_ids=session_ids, record_type="transcript")
+        records = await lkc_graph.read_lkc(
+            session_ids=session_ids, record_type=["transcript", "session_summary"]
+        )
         cached = self._users.get(user_id)
         if cached is None or len(records) != cached.record_count:
             # Same cost caveat as _get_session_entry: this re-embeds the
@@ -323,15 +335,15 @@ class LKCRetriever:
         return self._users.get(user_id)
 
     async def _get_global_entry(self) -> Optional[_IndexEntry]:
-        all_records = await lkc_graph.read_lkc(record_type="transcript")
+        all_records = await lkc_graph.read_lkc(record_type=["transcript", "session_summary"])
         if len(all_records) == self._global_record_count and self._global is not None:
             return self._global
         lightweight = [
             {"timestamp_iso": r.get("timestamp_iso", ""),
              "speaker": r.get("speaker", ""),
-             "text": r.get("text", "")}
+             "text": r.get("text") or r.get("summary") or ""}
             for r in all_records
-            if r.get("text")
+            if r.get("text") or r.get("summary")
         ]
         self._global = _IndexEntry(lightweight)
         await self._global.build()

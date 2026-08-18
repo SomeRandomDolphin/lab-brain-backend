@@ -70,7 +70,7 @@ async def write_to_lkc(record: dict) -> None:
 async def read_lkc(
     session_id: Optional[str] = None,
     session_ids: Optional[list[str]] = None,
-    record_type: Optional[str] = None,
+    record_type: Optional[str | list[str]] = None,
     since_unix: Optional[float] = None,
     limit: int = 2000,
 ) -> list[dict]:
@@ -80,6 +80,10 @@ async def read_lkc(
         scoped to only the sessions the requesting user can access). If both
         are given, session_id wins for that one session; session_ids alone
         restricts to that set.
+    record_type: a single type string (existing callers), or a list of
+        types (e.g. ["transcript", "session_summary"] — see lkc_retrieval's
+        user/global-scoped corpora, which need both what was actually said
+        AND the generated summary of each past meeting, not just one).
     """
     stmt = select(LkcRecord).order_by(LkcRecord.timestamp_unix.asc()).limit(limit)
 
@@ -88,7 +92,10 @@ async def read_lkc(
     elif session_ids is not None:
         stmt = stmt.where(LkcRecord.session_id.in_(session_ids))
     if record_type:
-        stmt = stmt.where(LkcRecord.record_type == record_type)
+        if isinstance(record_type, str):
+            stmt = stmt.where(LkcRecord.record_type == record_type)
+        else:
+            stmt = stmt.where(LkcRecord.record_type.in_(record_type))
     if since_unix is not None:
         stmt = stmt.where(LkcRecord.timestamp_unix > since_unix)
 
@@ -149,11 +156,33 @@ async def read_sessions(session_ids: Optional[list[str]] = None) -> list[dict]:
     ]
 
 
-async def session_text_corpus(session_id: str) -> list[dict]:
+async def session_text_corpus(
+    session_id: str,
+    record_type: Optional[str | list[str]] = ("transcript", "session_summary"),
+) -> list[dict]:
+    """
+    record_type defaults to including BOTH transcript lines and the
+    session's own generated summary, not just "transcript" — this feeds
+    _get_session_entry's single-session-scope fallback in lkc_retrieval.py
+    (used when a session's owner can't be resolved), and that fallback was
+    silently invisible to "summarize the last meeting"-style questions
+    otherwise, for the same reason the multi-session/global corpora were:
+    the `session_summary` record type was excluded at the query level.
+    Pass a narrower record_type explicitly (e.g. "transcript") if a caller
+    ever needs the old transcript-only behaviour.
+
+    `type` is included in each returned dict (not just timestamp/speaker/
+    text) so callers can tell a summary hit apart from a transcript line
+    without re-deriving it from the presence/absence of `speaker`.
+    """
+    types = [record_type] if isinstance(record_type, str) else list(record_type)
     stmt = (
-        select(LkcRecord.timestamp_iso, LkcRecord.speaker, LkcRecord.text)
+        select(
+            LkcRecord.timestamp_iso, LkcRecord.speaker,
+            LkcRecord.text, LkcRecord.record_type,
+        )
         .where(LkcRecord.session_id == session_id)
-        .where(LkcRecord.record_type == "transcript")
+        .where(LkcRecord.record_type.in_(types))
         .where(LkcRecord.text.isnot(None))
         .where(LkcRecord.text != "")
         .order_by(LkcRecord.timestamp_unix.asc())
@@ -164,7 +193,12 @@ async def session_text_corpus(session_id: str) -> list[dict]:
         rows = result.all()
 
     return [
-        {"timestamp_iso": r.timestamp_iso, "speaker": r.speaker, "text": r.text}
+        {
+            "timestamp_iso": r.timestamp_iso,
+            "speaker":       r.speaker,
+            "text":          r.text,
+            "type":          r.record_type,
+        }
         for r in rows
     ]
 
