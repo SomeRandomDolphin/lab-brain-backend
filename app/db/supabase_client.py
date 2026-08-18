@@ -600,6 +600,23 @@ async def export_report(
 # Public read API
 # ═══════════════════════════════════════════════════════════════════════════════
 
+async def get_session_owner(session_id: str) -> Optional[str]:
+    """
+    Return the user_id who owns *session_id* (the account that created it —
+    see Session.user_id, NOT NULL as of migration 0007), or None if the
+    session row doesn't exist yet.
+
+    Used by the LKC pipeline to scope cross-session retrieval to "this
+    session owner's past meetings" (see lkc_retrieval.LKCRetriever's
+    user-scoped index and session_pipeline.py's livekit_pipeline) rather
+    than either a single session or every session in the table.
+    """
+    stmt = select(SessionModel.user_id).where(SessionModel.session_id == session_id)
+    async with get_session_factory()() as db:
+        result = await db.execute(stmt)
+        return result.scalar_one_or_none()
+
+
 async def get_sessions(user_id: str, limit: int = 50) -> list[dict]:
     """
     Return sessions the given user owns OR has participated in — replacing

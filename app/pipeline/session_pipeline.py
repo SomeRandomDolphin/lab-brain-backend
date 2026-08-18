@@ -113,7 +113,10 @@ def _log_late_kg_result(session_id: str, task: asyncio.Task) -> None:
         )
 
 
-async def _handle_qa_sse(session_id, dlg, full_text, retriever, mode, tts_queue):
+async def _handle_qa_sse(
+    session_id, dlg, full_text, retriever, mode, tts_queue,
+    user_id: Optional[str] = None, user_session_ids: Optional[list[str]] = None,
+):
     # Fire both retrieval paths concurrently: kg-agent (literature, over
     # citi-condor's network — can take up to ~13s cold, ~2-4s warm) and the
     # local transcript retriever (in-process, fast). They answer different
@@ -121,8 +124,14 @@ async def _handle_qa_sse(session_id, dlg, full_text, retriever, mode, tts_queue)
     # docstring — so this isn't a redundant double-call, it's a race to see
     # which one is actually relevant to what was asked.
     kg_task = asyncio.create_task(kg_agent_client.query(full_text))
+    # user_id/user_session_ids given → scoped to this session's owner's
+    # entire accessible history (all their past meetings, not just this
+    # one — see LKCRetriever.query's scoping precedence). Falls back to
+    # session_id-only scoping automatically when the owner couldn't be
+    # resolved at pipeline startup (both None in that case).
     lkc_context = await retriever.query(
-        full_text, top_k=cfg.lkc.retrieval_top_k, session_id=session_id
+        full_text, top_k=cfg.lkc.retrieval_top_k, session_id=session_id,
+        user_id=user_id, user_session_ids=user_session_ids,
     )
 
     kg_result = None
@@ -262,6 +271,25 @@ async def livekit_pipeline(
     segment_index = 0
     _known_speakers: set[str] = set()
     _wx_align_cache: dict     = {}
+
+    # Resolved once at pipeline startup — the session's owner doesn't
+    # change mid-session. Used to scope QA retrieval to this user's own
+    # past meetings (see _handle_qa_sse below), not just the current one.
+    # None on lookup failure (e.g. the sessions row hasn't landed yet, or
+    # a DB hiccup) — every downstream use treats that as "fall back to
+    # single-session scoping" rather than raising, so a resolution failure
+    # degrades retrieval scope instead of breaking QA entirely.
+    session_owner_user_id: Optional[str] = None
+    try:
+        session_owner_user_id = await supabase_client.get_session_owner(session_id)
+        if session_owner_user_id is None:
+            log.warning(
+                f"[pipeline:{session_id}] no owner found for session — "
+                f"QA retrieval will be scoped to this session only, not "
+                f"the user's past meetings."
+            )
+    except Exception as exc:
+        log.warning(f"[pipeline:{session_id}] failed to resolve session owner: {exc}")
 
     # _process_audio runs on every raw LiveKit audio frame (~50/sec at a
     # typical 20ms Opus frame size). Both "still buffering" and "segment
@@ -602,8 +630,34 @@ async def livekit_pipeline(
                 )
             else:
                 _qa_in_flight.add(session_id)
+
+                # Resolved fresh on every QA turn (a cheap indexed SELECT,
+                # not the expensive part — see _get_user_entry's caching
+                # for what actually gets rebuilt only on change). This
+                # means a session this user starts *during* the current
+                # meeting is picked up automatically on the very next
+                # question, with no explicit cache-invalidation wiring
+                # needed. None when session_owner_user_id is None (owner
+                # couldn't be resolved at startup) — _handle_qa_sse and
+                # LKCRetriever.query both treat that as "fall back to
+                # single-session scoping".
+                qa_user_session_ids: Optional[list[str]] = None
+                if session_owner_user_id is not None:
+                    try:
+                        accessible = await supabase_client.get_sessions(session_owner_user_id)
+                        qa_user_session_ids = [s["session_id"] for s in accessible]
+                    except Exception as exc:
+                        log.warning(
+                            f"[pipeline:{session_id}] failed to resolve accessible "
+                            f"sessions for user {session_owner_user_id}: {exc} — "
+                            f"falling back to single-session QA retrieval scope"
+                        )
+
                 qa_task = asyncio.create_task(
-                    _handle_qa_sse(session_id, dlg, full_text, retriever, new_mode, tts_queue)
+                    _handle_qa_sse(
+                        session_id, dlg, full_text, retriever, new_mode, tts_queue,
+                        user_id=session_owner_user_id, user_session_ids=qa_user_session_ids,
+                    )
                 )
                 qa_task.add_done_callback(
                     lambda _t, sid=session_id: _qa_in_flight.discard(sid)

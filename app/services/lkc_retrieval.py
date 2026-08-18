@@ -226,6 +226,12 @@ class _IndexEntry:
 class LKCRetriever:
     def __init__(self) -> None:
         self._sessions: dict[str, _IndexEntry] = {}
+        # Keyed by user_id. Scopes retrieval to one user's own accessible
+        # sessions (owned + participated-in, per supabase_client.get_sessions)
+        # instead of either a single session or every session in the table —
+        # this is what lets the agent draw on a user's past meetings, not
+        # just the one currently live. See _get_user_entry below.
+        self._users: dict[str, _IndexEntry] = {}
         self._global: Optional[_IndexEntry] = None
         self._global_record_count: int = 0
 
@@ -234,8 +240,25 @@ class LKCRetriever:
         question: str,
         top_k: int = 4,
         session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        user_session_ids: Optional[list[str]] = None,
     ) -> str:
-        if session_id is not None:
+        """
+        Scoping precedence:
+          1. user_id + user_session_ids given → search across all of that
+             user's accessible sessions (owned + participated-in). This is
+             a superset of any single session of theirs, including the
+             current one — the caller is expected to include the live
+             session_id in user_session_ids, not pass both scopes at once.
+          2. session_id alone → single-session scope (unchanged behaviour
+             for any caller that doesn't have a user_id to resolve).
+          3. neither → global scope, across every session in the table
+             regardless of owner. Unscoped by user; only appropriate for
+             an org-wide or admin context, not a normal per-user QA turn.
+        """
+        if user_id is not None and user_session_ids is not None:
+            entry = await self._get_user_entry(user_id, user_session_ids)
+        elif session_id is not None:
             entry = await self._get_session_entry(session_id)
         else:
             entry = await self._get_global_entry()
@@ -271,6 +294,34 @@ class LKCRetriever:
             self._sessions[session_id] = entry
         return self._sessions.get(session_id)
 
+    async def _get_user_entry(self, user_id: str, session_ids: list[str]) -> Optional[_IndexEntry]:
+        """
+        Same rebuild-on-count-change caching as _get_session_entry, keyed
+        on user_id instead of session_id. `session_ids` is recomputed by
+        the caller on every call (see session_pipeline.py) — that's a
+        cheap indexed query, so it's fine to re-resolve "which sessions
+        can this user see" every QA turn even though the embedding index
+        itself is only rebuilt when the underlying record count changes.
+        This also means a brand-new session this user just started gets
+        picked up automatically, without any explicit cache invalidation.
+        """
+        if not session_ids:
+            return None
+        records = await lkc_graph.read_lkc(session_ids=session_ids, record_type="transcript")
+        cached = self._users.get(user_id)
+        if cached is None or len(records) != cached.record_count:
+            # Same cost caveat as _get_session_entry: this re-embeds the
+            # user's ENTIRE cross-session corpus from scratch whenever the
+            # total record count across their sessions changes, not just
+            # the new records. Fine for a single active session's worth of
+            # transcript growth; would need to become incremental if a
+            # user's total history across many sessions gets large enough
+            # that re-embedding on every new segment becomes a real cost.
+            entry = _IndexEntry(records)
+            await entry.build()
+            self._users[user_id] = entry
+        return self._users.get(user_id)
+
     async def _get_global_entry(self) -> Optional[_IndexEntry]:
         all_records = await lkc_graph.read_lkc(record_type="transcript")
         if len(all_records) == self._global_record_count and self._global is not None:
@@ -290,6 +341,12 @@ class LKCRetriever:
     def invalidate(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)
         self._global = None
+        # A cheap blanket clear rather than figuring out which cached users'
+        # session_ids sets included this session_id — user-scoped indexes
+        # rebuild lazily and cheaply from the DB on next query anyway (see
+        # _get_user_entry), so there's no real cost to just dropping them
+        # all here.
+        self._users.clear()
 
     def stats(self) -> dict:
         backend = (
@@ -302,6 +359,7 @@ class LKCRetriever:
             "ollama_embed_url":  _OLLAMA_EMBED_URL,
             "sklearn_available": SKLEARN_AVAILABLE,
             "cached_sessions":   len(self._sessions),
+            "cached_users":      len(self._users),
             "global_index_size": self._global_record_count,
         }
 
