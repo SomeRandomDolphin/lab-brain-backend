@@ -1,4 +1,4 @@
-# Lab Brain — Module 5 Multimodal Conversational Agent
+# Lab Brain — Backend
 
 FastAPI backend with an LKC graph, LiveKit WebRTC media layer,
 SSE event streaming, Supabase persistence with Alembic-managed schema migrations,
