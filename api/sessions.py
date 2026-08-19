@@ -1,5 +1,5 @@
 """
-app/api/v1/endpoints/sessions.py — Session-level endpoints.
+app/api/sessions.py — Session-level endpoints.
 
 POST   /summary/{sid}         — generate + persist LLM summary (owner or participant)
 GET    /mode/{sid}            — current dialogue mode + summon flag (owner or participant)
@@ -8,18 +8,24 @@ GET    /config/client         — frontend config (camera fps, tts hide ms, lk_u
 GET    /metrics               — session metric summaries, scoped to the caller's own sessions
 GET    /metrics/csv           — CSV export of raw metric samples, same scoping
 POST   /eval/wer              — compute WER for a reference/hypothesis pair (owner or participant)
+
+get_current_user() / require_session_access()
+    Formerly shared from api/deps.py (now removed). Duplicated here — see
+    api/auth.py for get_current_user's canonical docstring/behaviour notes
+    (identical here).
 """
 
 import csv
 import io
+import os
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from api.deps import get_current_user, require_session_access
-from db import lkc_graph, supabase_client
+from db import lkc_graph, supabase_auth, supabase_client
 from services import vision, eval_metrics
 from services.capture import is_summoned
 from schemas.eval import WerRequest
@@ -31,7 +37,6 @@ def _get_dialogue_module():
 
 router = APIRouter(tags=["sessions"])
 
-import os
 DIALOGUE_CONTEXT_WINDOW   = int(os.environ.get("DIALOGUE_CONTEXT_WINDOW", "12"))
 DIALOGUE_TTS_AUTO_HIDE_MS = int(os.environ.get("DIALOGUE_TTS_AUTO_HIDE_MS", "8000"))
 VISION_CAMERA_FPS         = int(os.environ.get("VISION_CAMERA_FPS", "5"))
@@ -39,6 +44,48 @@ VISION_CAMERA_QUALITY     = float(os.environ.get("VISION_CAMERA_QUALITY", "0.6")
 LIVEKIT_PUBLIC_URL = os.environ.get("LIVEKIT_PUBLIC_URL") or os.environ.get(
     "LIVEKIT_URL", "ws://host.docker.internal:7880"
 )
+
+_bearer = HTTPBearer(auto_error=False)
+
+_401 = HTTPException(
+    status_code=status.HTTP_401_UNAUTHORIZED,
+    detail="Invalid or expired token.",
+    headers={"WWW-Authenticate": "Bearer"},
+)
+
+_404_SESSION = HTTPException(
+    status_code=status.HTTP_404_NOT_FOUND,
+    detail="Session not found.",
+)
+
+
+def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    token: Optional[str] = Query(
+        default=None,
+        description="Access token fallback for clients that can't set headers (SSE/EventSource only).",
+    ),
+) -> dict:
+    raw = credentials.credentials if credentials is not None else token
+    if raw is None:
+        raise _401
+    user = supabase_auth.verify_session_token(raw)
+    if user is None:
+        raise _401
+    return user
+
+
+async def require_session_access(
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> str:
+    """Owner OR participant. Returns 404 (not 403) on mismatch."""
+    owner, participants = await supabase_client.get_session_access(session_id)
+    if owner is None:
+        raise _404_SESSION
+    if current_user["id"] != owner and current_user["id"] not in participants:
+        raise _404_SESSION
+    return session_id
 
 
 @router.post("/summary/{session_id}")

@@ -1,5 +1,5 @@
 """
-app/api/v1/endpoints/websockets.py — Legacy WebSocket endpoints.
+app/api/websockets.py — Legacy WebSocket endpoints.
 
 Kept for backward compatibility with the Month 5 index.html client.
 New frontend uses POST /livekit/room + GET /events/{sid} (SSE) instead.

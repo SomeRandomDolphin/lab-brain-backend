@@ -4,7 +4,7 @@ main.py — Lab Brain FastAPI app + entry point.
 Creates and configures the FastAPI app:
   - CORS middleware
   - Static files
-  - All API routers (v1)
+  - All API routers
   - Startup: warm models, run Alembic migrations
   - Root HTML redirect
 
@@ -40,24 +40,44 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from core.logging import setup_logging
 
-# setup_logging() must run BEFORE importing api.v1.router, not after.
-# That import chain pulls in pipeline (asr.py's WhisperX/VAD loading,
-# dialogue_service's diarization pipeline loading, etc.), which does real
-# work and logs INFO-level progress messages ("Loading WhisperX...",
-# "WhisperX ready.", ...) at MODULE IMPORT TIME — i.e. the moment this
-# import statement runs, not later. If that import happens before
-# setup_logging() has attached a handler to the root logger, those INFO
-# calls aren't delayed or buffered — the root logger has no handler yet and
-# defaults to WARNING, so they're silently dropped and gone for good. This
-# was invisible for a long time because asr.py's import used to fail (for
-# unrelated reasons, since fixed) before ever reaching its "WhisperX
-# ready." log line; now that it succeeds, the missing output became a real
-# gap. Moving setup_logging() up here, before api_router is imported,
-# closes it.
+# setup_logging() must run BEFORE importing the api.* router modules below,
+# not after. That import chain pulls in pipeline (asr.py's WhisperX/VAD
+# loading, dialogue_service's diarization pipeline loading, etc.), which
+# does real work and logs INFO-level progress messages ("Loading
+# WhisperX...", "WhisperX ready.", ...) at MODULE IMPORT TIME — i.e. the
+# moment those import statements run, not later. If that import happens
+# before setup_logging() has attached a handler to the root logger, those
+# INFO calls aren't delayed or buffered — the root logger has no handler
+# yet and defaults to WARNING, so they're silently dropped and gone for
+# good. This was invisible for a long time because asr.py's import used to
+# fail (for unrelated reasons, since fixed) before ever reaching its
+# "WhisperX ready." log line; now that it succeeds, the missing output
+# became a real gap. Moving setup_logging() up here, before the api
+# router imports, closes it.
 setup_logging()
 log = logging.getLogger(__name__)
 
-from api.v1.router import api_router
+# ── API routers ──────────────────────────────────────────────────────────────
+# Flattened from api/v1/endpoints/ into api/ directly (api/v1/router.py and
+# api/deps.py are gone — each endpoint module now owns its own auth
+# dependencies; see the module docstrings in api/auth.py etc. for why).
+# capture.py exports 4 routers, livekit.py exports 2 — same shape as the
+# old api_router aggregator, just imported straight from their flattened
+# module paths and registered on `app` directly below instead of going
+# through an intermediate api_router object.
+from api.auth import router as auth_router
+from api.livekit import router as livekit_router, sse_router
+from api.privacy import router as privacy_router
+from api.lkc import router as lkc_router
+from api.capture import (
+    capture_router,
+    agent_router,
+    ner_router,
+    retrieval_router,
+)
+from api.sessions import router as sessions_router
+from api.supabase import router as supabase_router
+from api.websockets import router as ws_router
 
 
 @asynccontextmanager
@@ -231,7 +251,20 @@ def create_app() -> FastAPI:
         app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
     # ── API routers ───────────────────────────────────────────────────────────
-    app.include_router(api_router)
+    # Auth first so /auth/... routes take priority (same ordering the old
+    # api/v1/router.py aggregator used).
+    app.include_router(auth_router)
+    app.include_router(livekit_router)
+    app.include_router(sse_router)
+    app.include_router(privacy_router)
+    app.include_router(lkc_router)
+    app.include_router(capture_router)
+    app.include_router(agent_router)
+    app.include_router(ner_router)
+    app.include_router(retrieval_router)
+    app.include_router(sessions_router)
+    app.include_router(supabase_router)
+    app.include_router(ws_router)
 
     # ── Root ──────────────────────────────────────────────────────────────────
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)

@@ -1,5 +1,5 @@
 """
-app/api/v1/endpoints/livekit.py — LiveKit room management endpoints.
+app/api/livekit.py — LiveKit room management endpoints.
 
 POST   /livekit/room          — create room, return session_id + signed token (login required)
 GET    /livekit/token         — join an existing room (login required — no more anonymous guests)
@@ -10,6 +10,12 @@ GET    /events/{sid}          — SSE stream (replaces WebSocket endpoints)
 Confirmed decisions this file implements:
   - Creating a room requires login; the session is owned by that account.
   - Joining a room requires login too — no anonymous guests.
+
+get_current_user() / require_session_access() / require_session_owner()
+    Formerly shared from api/deps.py (now removed). Duplicated here rather
+    than imported, since each endpoint file now owns its own copy of the
+    auth dependencies it needs — see api/auth.py for the canonical version
+    of get_current_user's docstring/behaviour notes (identical here).
 """
 
 import time
@@ -17,13 +23,13 @@ import uuid
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from api.deps import get_current_user, require_session_access, require_session_owner
 from schemas.livekit import RoomCreateRequest, RoomCreateResponse
 from pipeline import livekit_rooms
-from db import supabase_client
+from db import supabase_auth, supabase_client
 from services import vision, eval_metrics
 from services.capture import clear_summon
 from pipeline.dialogue_service import clear_dialogue
@@ -42,6 +48,59 @@ LIVEKIT_PUBLIC_URL = os.environ.get("LIVEKIT_PUBLIC_URL") or os.environ.get(
 
 router = APIRouter(prefix="/livekit", tags=["livekit"])
 sse_router = APIRouter(tags=["events"])
+
+_bearer = HTTPBearer(auto_error=False)
+
+_401 = HTTPException(
+    status_code=status.HTTP_401_UNAUTHORIZED,
+    detail="Invalid or expired token.",
+    headers={"WWW-Authenticate": "Bearer"},
+)
+
+_404_SESSION = HTTPException(
+    status_code=status.HTTP_404_NOT_FOUND,
+    detail="Session not found.",
+)
+
+
+def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    token: Optional[str] = Query(
+        default=None,
+        description="Access token fallback for clients that can't set headers (SSE/EventSource only).",
+    ),
+) -> dict:
+    raw = credentials.credentials if credentials is not None else token
+    if raw is None:
+        raise _401
+    user = supabase_auth.verify_session_token(raw)
+    if user is None:
+        raise _401
+    return user
+
+
+async def require_session_access(
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> str:
+    """Owner OR participant. Returns 404 (not 403) on mismatch."""
+    owner, participants = await supabase_client.get_session_access(session_id)
+    if owner is None:
+        raise _404_SESSION
+    if current_user["id"] != owner and current_user["id"] not in participants:
+        raise _404_SESSION
+    return session_id
+
+
+async def require_session_owner(
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> str:
+    """Owner only — for destructive/management actions."""
+    owner, _participants = await supabase_client.get_session_access(session_id)
+    if owner is None or current_user["id"] != owner:
+        raise _404_SESSION
+    return session_id
 
 
 # ── Deferred import to avoid circular: pipeline module imports this router ────

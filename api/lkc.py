@@ -1,5 +1,5 @@
 """
-app/api/v1/endpoints/lkc.py — LKC graph read endpoints.
+app/api/lkc.py — LKC graph read endpoints.
 
 GET    /lkc                           — HTML viewer, recent records (admin only — full graph dump)
 GET    /lkc/stats                     — graph statistics (any authenticated user — aggregate only)
@@ -10,7 +10,7 @@ DELETE /lkc/sessions/{sid}            — wipe one session (owner only)
 POST   /lkc/kg-query                  — ask the shared kg-agent literature KG directly (any authenticated user)
 
 Confirmed decision: admin-gate the operator-only routes (full dump, full
-wipe) rather than leaving them open. See api.deps.require_admin.
+wipe) rather than leaving them open.
 
 POST /lkc/kg-query is NOT a query over the session records above — it's a
 separate corpus (a fixed 8-paper Neo4j knowledge graph on citi-condor, see
@@ -19,23 +19,94 @@ directly (e.g. a "search the literature" UI action), independent of the
 live-session hybrid QA path in session_pipeline.py. Not session-scoped —
 kg-agent's corpus doesn't vary by session — so no session ownership check,
 just standard auth.
+
+get_current_user() / require_admin() / require_session_access() /
+require_session_owner()
+    Formerly shared from api/deps.py (now removed). Duplicated here — see
+    api/auth.py for get_current_user's canonical docstring/behaviour notes
+    (identical here).
 """
 
 import json
+import os
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import HTMLResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from api.deps import get_current_user, require_admin, require_session_access, require_session_owner
-from db import lkc_graph, supabase_client
+from db import lkc_graph, supabase_auth, supabase_client
 from schemas.kg_agent import KgQueryRequest, KgQueryResponse
 from services import kg_agent_client
 
 router = APIRouter(prefix="/lkc", tags=["lkc"])
 
-import os
 KG_AGENT_FAITHFULNESS_THRESHOLD = float(os.environ.get("KG_AGENT_FAITHFULNESS_THRESHOLD", "0.7"))
+
+_bearer = HTTPBearer(auto_error=False)
+
+_401 = HTTPException(
+    status_code=status.HTTP_401_UNAUTHORIZED,
+    detail="Invalid or expired token.",
+    headers={"WWW-Authenticate": "Bearer"},
+)
+
+_404_SESSION = HTTPException(
+    status_code=status.HTTP_404_NOT_FOUND,
+    detail="Session not found.",
+)
+
+_403_ADMIN = HTTPException(
+    status_code=status.HTTP_403_FORBIDDEN,
+    detail="Admin access required.",
+)
+
+
+def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    token: Optional[str] = Query(
+        default=None,
+        description="Access token fallback for clients that can't set headers (SSE/EventSource only).",
+    ),
+) -> dict:
+    raw = credentials.credentials if credentials is not None else token
+    if raw is None:
+        raise _401
+    user = supabase_auth.verify_session_token(raw)
+    if user is None:
+        raise _401
+    return user
+
+
+async def require_session_access(
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> str:
+    """Owner OR participant. Returns 404 (not 403) on mismatch."""
+    owner, participants = await supabase_client.get_session_access(session_id)
+    if owner is None:
+        raise _404_SESSION
+    if current_user["id"] != owner and current_user["id"] not in participants:
+        raise _404_SESSION
+    return session_id
+
+
+async def require_session_owner(
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> str:
+    """Owner only — for destructive/management actions."""
+    owner, _participants = await supabase_client.get_session_access(session_id)
+    if owner is None or current_user["id"] != owner:
+        raise _404_SESSION
+    return session_id
+
+
+def require_admin(current_user: dict = Depends(get_current_user)) -> dict:
+    """Operator-only routes not scoped to a single session."""
+    if not current_user.get("isAdmin"):
+        raise _403_ADMIN
+    return current_user
 
 
 @router.get("", response_class=HTMLResponse)

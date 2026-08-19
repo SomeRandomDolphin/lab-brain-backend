@@ -1,5 +1,5 @@
 """
-app/api/v1/endpoints/capture.py — Capture, agent summon, NER, retrieval endpoints.
+app/api/capture.py — Capture, agent summon, NER, retrieval endpoints.
 
 POST   /capture/ingest                — Rifqi Module 2 ingest
 GET    /capture/confirmations/{sid}   — poll agent confirmation queue

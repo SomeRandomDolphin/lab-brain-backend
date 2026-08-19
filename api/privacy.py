@@ -1,5 +1,5 @@
 """
-app/api/v1/endpoints/privacy.py — Privacy & Consent endpoints.
+app/api/privacy.py — Privacy & Consent endpoints.
 
 GET    /privacy/status              — registry overview + default policy (any authenticated user)
 POST   /privacy/consent             — register / update local consent only (any authenticated user)
@@ -25,20 +25,70 @@ diarization label. It's keyed by current_user["id"] — the Supabase user
 id — rather than a display name, specifically to avoid two people sharing
 a display name colliding in _privacy._registry. This is guaranteed to
 match participant.identity as seen by session_pipeline.py's
-check_consent(identity) call: api.v1.endpoints.livekit's create_room
-and get_token both pass identity=current_user["id"] to create_token()
-(display names go through the separate display_name param instead) — see
-the fix there for why this didn't hold before.
+check_consent(identity) call: api.livekit's create_room and get_token both
+pass identity=current_user["id"] to create_token() (display names go
+through the separate display_name param instead) — see the fix there for
+why this didn't hold before.
+
+get_current_user() / require_session_access()
+    Formerly shared from api/deps.py (now removed). Duplicated here — see
+    api/auth.py for get_current_user's canonical docstring/behaviour notes
+    (identical here).
 """
 
-from fastapi import APIRouter, Depends
-from api.deps import get_current_user, require_session_access
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
 from schemas.privacy import ConsentRequest, ConsentSyncRequest
 from schemas.auth import TosConsentRequest
 from services import privacy as _privacy
 from db import supabase_client, supabase_auth
 
 router = APIRouter(prefix="/privacy", tags=["privacy"])
+
+_bearer = HTTPBearer(auto_error=False)
+
+_401 = HTTPException(
+    status_code=status.HTTP_401_UNAUTHORIZED,
+    detail="Invalid or expired token.",
+    headers={"WWW-Authenticate": "Bearer"},
+)
+
+_404_SESSION = HTTPException(
+    status_code=status.HTTP_404_NOT_FOUND,
+    detail="Session not found.",
+)
+
+
+def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    token: Optional[str] = Query(
+        default=None,
+        description="Access token fallback for clients that can't set headers (SSE/EventSource only).",
+    ),
+) -> dict:
+    raw = credentials.credentials if credentials is not None else token
+    if raw is None:
+        raise _401
+    user = supabase_auth.verify_session_token(raw)
+    if user is None:
+        raise _401
+    return user
+
+
+async def require_session_access(
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> str:
+    """Owner OR participant. Returns 404 (not 403) on mismatch."""
+    owner, participants = await supabase_client.get_session_access(session_id)
+    if owner is None:
+        raise _404_SESSION
+    if current_user["id"] != owner and current_user["id"] not in participants:
+        raise _404_SESSION
+    return session_id
 
 
 @router.get("/status")
@@ -63,7 +113,6 @@ async def sync_consent(req: ConsentSyncRequest, _current_user: dict = Depends(ge
     # same owner-or-participant rule as every other per-session route.
     owner, participants = await supabase_client.get_session_access(req.session_id)
     if owner is None or (_current_user["id"] != owner and _current_user["id"] not in participants):
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Session not found.")
 
     entry = _privacy.register_consent(req.speaker, req.consented, req.real_name)

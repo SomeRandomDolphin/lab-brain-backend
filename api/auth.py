@@ -1,5 +1,5 @@
 """
-app/api/v1/endpoints/auth.py — Authentication endpoints.
+app/api/auth.py — Authentication endpoints.
 
 POST   /auth/register         — create account, return user + tokens
 POST   /auth/login            — verify credentials, return user + tokens
@@ -13,15 +13,31 @@ POST   /auth/reset-password   — consume reset token, set new password
 All session tokens are Supabase JWTs.  The frontend should store both
 access_token (short-lived, ~1 hour) and refresh_token (long-lived) and
 call POST /auth/refresh before the access_token expires.
+
+get_current_user() / get_optional_user()
+    Formerly lived in api/deps.py (now removed — each endpoint file that
+    needs an auth dependency defines its own copy locally). get_current_user
+    lives here since this is the auth module; get_optional_user isn't
+    currently used by any endpoint file but is kept here for the same
+    reason. If another endpoint file needs either of these, copy the
+    definition into that file rather than importing it from here.
+
+    Query-param token fallback: Browser `EventSource` (used by the SSE
+    stream) cannot set custom headers, so it can't send
+    `Authorization: Bearer <token>` like every other request.
+    get_current_user accepts the access token via `?token=` as a fallback
+    specifically for that case. Every other route continues to
+    authenticate via the header.
 """
 
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from api.deps import get_current_user
 from db import supabase_auth
 from schemas.auth import (
     AuthResponse,
@@ -38,6 +54,48 @@ from schemas.auth import (
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+_bearer = HTTPBearer(auto_error=False)
+
+_401 = HTTPException(
+    status_code=status.HTTP_401_UNAUTHORIZED,
+    detail="Invalid or expired token.",
+    headers={"WWW-Authenticate": "Bearer"},
+)
+
+
+def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    token: Optional[str] = Query(
+        default=None,
+        description="Access token fallback for clients that can't set headers (SSE/EventSource only).",
+    ),
+) -> dict:
+    """
+    Require a valid Supabase JWT. Raises 401 if missing or invalid.
+
+    Prefers the Authorization header; falls back to ?token= only when no
+    header is present (see module docstring — this exists for the SSE
+    route). Every non-SSE call site continues to use the header as before.
+    """
+    raw = credentials.credentials if credentials is not None else token
+    if raw is None:
+        raise _401
+    user = supabase_auth.verify_session_token(raw)
+    if user is None:
+        raise _401
+    return user
+
+
+def get_optional_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    token: Optional[str] = Query(default=None),
+) -> Optional[dict]:
+    """Return user dict or None — does not raise on missing/invalid token."""
+    raw = credentials.credentials if credentials is not None else token
+    if raw is None:
+        return None
+    return supabase_auth.verify_session_token(raw)
 
 
 # ── POST /auth/register ───────────────────────────────────────────────────────
