@@ -95,6 +95,20 @@ async def lifespan(app: FastAPI):
     import services.capture as _capture  # noqa: F401
     log.info("[startup] services.capture imported (spaCy NER warm)")
 
+    # Same trick for pipeline.asr: WhisperX (and its alignment model, when
+    # WHISPER_LANGUAGE is pinned) loads at MODULE IMPORT TIME inside
+    # asr.py's top-level try/except — see that file. But asr.py isn't on
+    # the router import chain the way services.capture now is, so nothing
+    # actually imports it until the first LiveKit room connects and
+    # session_pipeline.py pulls it in. That's the ~5min gap in the docker
+    # logs between "Application startup complete" (09:46:08) and "Loading
+    # WhisperX..." (09:51:04) — the first real meeting's connect pays the
+    # full WhisperX + wav2vec2 alignment-model cold-load cost synchronously,
+    # the same class of problem the dialogue/vision Ollama warmups below
+    # exist to avoid. Force the import here so it happens once, at boot.
+    import pipeline.asr as _asr  # noqa: F401
+    log.info("[startup] pipeline.asr imported (WhisperX warm)")
+
     # Surface Supabase misconfiguration at boot time rather than on the
     # first request. Replaces the old _get_admin()/_get_anon() warm-up
     # (removed — supabase_auth.py no longer exposes those; auth is now
