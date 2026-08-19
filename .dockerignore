@@ -1,0 +1,52 @@
+# .dockerignore — keeps the build context (and final `COPY . .` layer in the
+# Dockerfile's runtime stage) small, and keeps secrets/dev-only files out of
+# the image entirely.
+
+# ── Git ──────────────────────────────────────────────────────────────────
+.git
+.gitignore
+.github
+
+# ── Python ───────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# ── Secrets / local env — never bake these into an image ───────────────────
+.env
+.env.*
+!.env.example
+
+# ── Editors ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+
+# ── Local Supabase / dev-only state (matches .gitignore) ───────────────────
+supabase-local/
+supabase-project/
+.supabase-repo/
+
+# ── Docker itself ────────────────────────────────────────────────────────
+Dockerfile
+docker-compose.yml
+docker-compose.yaml
+.dockerignore
+
+# ── Docs / misc — not needed at runtime ─────────────────────────────────────
+README.md
+*.md
+.DS_Store
+
+# ── Local runtime artifacts (LKC SQLite DB, recordings, logs) ──────────────
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.log
+recordings/

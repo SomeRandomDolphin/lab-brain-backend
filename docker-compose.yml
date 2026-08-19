@@ -15,45 +15,39 @@ services:
       - "8000:8000"
     env_file:
       # Injected as real container env vars (not a file copied into the
-      # image) — see app/core/env.py / config.py notes below for why that
-      # distinction matters here.
+      # image). There is no core/config.py / config.json anymore — every
+      # pipeline/, services/, api/, and db/ module reads its own env vars
+      # directly from os.environ at import time (see core/env.py /
+      # README.md's Environment Variables section for the full list), so
+      # .env is now the single source of truth for all of it, not just a
+      # handful of values.
       - .env
     environment:
-      # ── These 5 are the ONLY values app/core/config.py overrides from
-      # env vars at runtime (see load() in config.py) — everything else
-      # (local_llm.base_url, whisper.*, vad.*, etc.) is read from
-      # config.json only, with no env-var override path. Put those in the
-      # mounted config.json below instead of here.
+      # ── Host-reachability overrides ─────────────────────────────────────
+      # Everything else needed by the app comes from .env above. These two
+      # are called out separately because they're a special case: .env
+      # typically points at a LAN/Tailscale address for LiveKit/Ollama (so
+      # the same file works for `python main.py` run directly on the host),
+      # but from *inside* this container that address may not be routable.
+      # host.docker.internal always reaches the host here (see extra_hosts
+      # below), since start_services.sh publishes both LiveKit and Ollama
+      # on the host's network with -p flags. If your .env's LIVEKIT_URL /
+      # LOCAL_LLM_BASE_URL already resolve from inside a container as-is
+      # (e.g. real hostnames, not a Tailscale IP tied to the host machine),
+      # you can drop these two overrides and let .env's values pass through
+      # unmodified.
       #
-      # SUPABASE_URL / SUPABASE_SERVICE_KEY: put the real values in .env,
-      # not here, since they're secrets. Listed here only as a reminder of
-      # what config.py actually reads:
-      #   - SUPABASE_URL
-      #   - SUPABASE_SERVICE_KEY
-      #
-      # LiveKit: same story — real values belong in .env. start_services.sh
-      # runs LiveKit bound to all host interfaces (-p 7880:7880 etc.), so
-      # host.docker.internal reaches it from inside this container. Swap in
-      # LIVEKIT_API_KEY / LIVEKIT_API_SECRET matching whatever
-      # start_services.sh's LiveKit container was started with (check
-      # config.json's livekit.api_key/api_secret — they must match).
+      # LIVEKIT_API_KEY / LIVEKIT_API_SECRET are NOT overridden here — they
+      # come from .env as secrets, and must match whatever start_services.sh's
+      # LiveKit container was actually started with.
       - LIVEKIT_URL=ws://host.docker.internal:7880
+      - LOCAL_LLM_BASE_URL=http://host.docker.internal:11434/v1
     volumes:
-      # REQUIRED, not optional: local_llm.base_url (Ollama) has no env-var
-      # override in config.py — it's only ever read from config.json. If
-      # config.json's local_llm.base_url still points at a Tailscale IP
-      # (e.g. 100.122.56.39) that this container can't route to, change it
-      # here to http://host.docker.internal:11434/v1 — since start_services.sh
-      # publishes Ollama with -p 11434:11434 on the host, that address reaches
-      # it from inside the container. Same applies if livekit.url /
-      # supabase.url/key are left in config.json instead of .env: env vars
-      # above take precedence, but only for those 5 keys.
-      - ./config.json:/app/config.json
       # Shared with the lab-brain-egress container (see start_services.sh's
       # start_egress()) — egress writes finished recordings here instead of
       # uploading via S3 directly (self-hosted Supabase Storage's S3
       # protocol has an unresolved signature-verification bug; see the
-      # comment above RECORDINGS_MOUNT in app/pipeline/livekit_rooms.py).
+      # comment above RECORDINGS_MOUNT in pipeline/livekit_rooms.py).
       # This app picks the file up from here and uploads it via the JWT
       # Storage API instead. `external: true` below because
       # start_services.sh creates this volume (`docker volume create`), not
