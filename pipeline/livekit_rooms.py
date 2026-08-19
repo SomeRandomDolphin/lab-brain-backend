@@ -20,9 +20,15 @@ from datetime import timedelta
 from typing import AsyncIterator, Optional
 from PIL import Image
 
-from core.config import cfg
+import os
 
 log = logging.getLogger(__name__)
+
+LIVEKIT_URL            = os.environ.get("LIVEKIT_URL", "ws://host.docker.internal:7880")
+LIVEKIT_API_KEY        = os.environ.get("LIVEKIT_API_KEY", "devkey")
+LIVEKIT_API_SECRET     = os.environ.get("LIVEKIT_API_SECRET", "devsecret")
+LIVEKIT_EGRESS_ENABLED = os.environ.get("LIVEKIT_EGRESS_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+VISION_FRAME_INTERVAL  = int(os.environ.get("VISION_FRAME_INTERVAL", "5"))
 
 LIVEKIT_AVAILABLE = False
 try:
@@ -98,7 +104,7 @@ def create_token(session_id: str, identity: str, ttl_seconds: int = 3600, displa
         can_subscribe=True,
     )
     return (
-        AccessToken(cfg.livekit.api_key, cfg.livekit.api_secret)
+        AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
         .with_identity(identity)
         .with_name(display_name or identity)
         .with_grants(grants)
@@ -113,9 +119,9 @@ async def create_room(session_id: str) -> dict:
     if not LIVEKIT_AVAILABLE:
         raise RuntimeError("livekit-api package not installed")
     async with LiveKitAPI(
-        url=cfg.livekit.url,
-        api_key=cfg.livekit.api_key,
-        api_secret=cfg.livekit.api_secret,
+        url=LIVEKIT_URL,
+        api_key=LIVEKIT_API_KEY,
+        api_secret=LIVEKIT_API_SECRET,
     ) as api:
         room = await api.room.create_room(
             CreateRoomRequest(name=session_id, empty_timeout=300)
@@ -128,9 +134,9 @@ async def get_room(session_id: str) -> Optional[dict]:
         return None
     try:
         async with LiveKitAPI(
-            url=cfg.livekit.url,
-            api_key=cfg.livekit.api_key,
-            api_secret=cfg.livekit.api_secret,
+            url=LIVEKIT_URL,
+            api_key=LIVEKIT_API_KEY,
+            api_secret=LIVEKIT_API_SECRET,
         ) as api:
             rooms = await api.room.list_rooms(ListRoomsRequest(names=[session_id]))
             if not rooms.rooms:
@@ -155,9 +161,9 @@ async def delete_room(session_id: str) -> bool:
         return False
     try:
         async with LiveKitAPI(
-            url=cfg.livekit.url,
-            api_key=cfg.livekit.api_key,
-            api_secret=cfg.livekit.api_secret,
+            url=LIVEKIT_URL,
+            api_key=LIVEKIT_API_KEY,
+            api_secret=LIVEKIT_API_SECRET,
         ) as api:
             await api.room.delete_room(DeleteRoomRequest(room=session_id))
         log.info(f"[livekit] room {session_id} deleted")
@@ -198,12 +204,12 @@ async def delete_room(session_id: str) -> bool:
 # JWT-authenticated Supabase Storage API — the same path report.md/
 # summary.md already use successfully (see app/db/supabase_client.py).
 #
-# NOTE ON CONFIG: this still expects the following to exist on `cfg`:
-#   cfg.livekit.egress_enabled     (bool)
+# NOTE ON CONFIG: this still expects LIVEKIT_EGRESS_ENABLED to be set in
+# the environment/.env (see LIVEKIT_EGRESS_ENABLED module constant above).
 #
-# The cfg.supabase.s3_* fields added for the old S3 upload path are no
-# longer read here — they can stay in config.py/​.env harmlessly (unused)
-# or be removed once you're confident nothing else references them.
+# The S3_* env vars added for the old S3 upload path are no longer read
+# here — they can stay in .env harmlessly (unused) or be removed once
+# you're confident nothing else references them.
 
 # Must match the volume mount point used for the egress container in
 # start_services.sh's start_egress() AND the `backend` service in
@@ -225,7 +231,7 @@ async def start_egress(session_id: str) -> Optional[str]:
     local disk on the shared RECORDINGS_MOUNT volume. Returns the egress_id
     (used to stop it later) or None if egress is disabled/unavailable.
     """
-    if not LIVEKIT_AVAILABLE or not getattr(cfg.livekit, "egress_enabled", False):
+    if not LIVEKIT_AVAILABLE or not LIVEKIT_EGRESS_ENABLED:
         return None
 
     relative_path = f"{session_id}/{session_id}-{int(time.time())}.mp3"
@@ -235,9 +241,9 @@ async def start_egress(session_id: str) -> Optional[str]:
     )
     try:
         async with LiveKitAPI(
-            url=cfg.livekit.url,
-            api_key=cfg.livekit.api_key,
-            api_secret=cfg.livekit.api_secret,
+            url=LIVEKIT_URL,
+            api_key=LIVEKIT_API_KEY,
+            api_secret=LIVEKIT_API_SECRET,
         ) as api:
             info = await api.egress.start_room_composite_egress(
                 RoomCompositeEgressRequest(
@@ -294,9 +300,9 @@ async def stop_egress(session_id: str) -> None:
     info = None
     try:
         async with LiveKitAPI(
-            url=cfg.livekit.url,
-            api_key=cfg.livekit.api_key,
-            api_secret=cfg.livekit.api_secret,
+            url=LIVEKIT_URL,
+            api_key=LIVEKIT_API_KEY,
+            api_secret=LIVEKIT_API_SECRET,
         ) as api:
             await api.egress.stop_egress(StopEgressRequest(egress_id=egress_id))
             log.info(f"[livekit:{session_id}] egress stopped: egress_id={egress_id}")
@@ -569,9 +575,9 @@ async def _subscriber_loop(session_id: str, pipeline_fn) -> None:
             try:
                 log.info(
                     f"[livekit:{session_id}] room.connect attempt {attempt}/{_MAX_CONNECT_ATTEMPTS} "
-                    f"→ {cfg.livekit.url!r}"
+                    f"→ {LIVEKIT_URL!r}"
                 )
-                await room.connect(cfg.livekit.url, server_token)
+                await room.connect(LIVEKIT_URL, server_token)
                 log.info(
                     f"[livekit:{session_id}] *** CONNECTED *** "
                     f"sid={room.local_participant.sid}"
@@ -652,7 +658,7 @@ async def _drain_video(participant_identity: str, track, q: asyncio.Queue) -> No
         # was pure wasted contention against the audio pipeline. Only frames
         # that will actually be used ever get encoded now.
         frame_counter += 1
-        if frame_counter % cfg.vision.frame_interval != 0:
+        if frame_counter % VISION_FRAME_INTERVAL != 0:
             continue
 
         frame = event.frame

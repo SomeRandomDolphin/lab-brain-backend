@@ -28,12 +28,14 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
 
 from api.deps import get_current_user, require_admin, require_session_access, require_session_owner
-from core.config import cfg
 from db import lkc_graph, supabase_client
 from schemas.kg_agent import KgQueryRequest, KgQueryResponse
 from services import kg_agent_client
 
 router = APIRouter(prefix="/lkc", tags=["lkc"])
+
+import os
+KG_AGENT_FAITHFULNESS_THRESHOLD = float(os.environ.get("KG_AGENT_FAITHFULNESS_THRESHOLD", "0.7"))
 
 
 @router.get("", response_class=HTMLResponse)
@@ -93,7 +95,7 @@ async def kg_query(
             status_code=503,
             detail="kg-agent is unavailable right now — check citi-condor/Tailscale, or try again shortly.",
         )
-    grounded = result.in_corpus and result.faithfulness >= cfg.kg_agent.faithfulness_threshold
+    grounded = result.in_corpus and result.faithfulness >= KG_AGENT_FAITHFULNESS_THRESHOLD
     return KgQueryResponse(
         answer=result.answer,
         grounded=grounded,

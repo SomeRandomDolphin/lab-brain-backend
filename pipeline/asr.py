@@ -9,9 +9,18 @@ from typing import Optional
 
 import numpy as np
 
-from core.config import cfg
+import os
 import torch
-torch.set_num_threads(cfg.whisper.cpu_threads)
+
+WHISPER_MODEL_SIZE   = os.environ.get("WHISPER_MODEL_SIZE", "large-v3-turbo")
+WHISPER_DEVICE       = os.environ.get("WHISPER_DEVICE", "cpu")
+WHISPER_COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "int8")
+WHISPER_BEAM_SIZE    = int(os.environ.get("WHISPER_BEAM_SIZE", "1"))
+WHISPER_LANGUAGE     = os.environ.get("WHISPER_LANGUAGE") or None
+WHISPER_CPU_THREADS  = int(os.environ.get("WHISPER_CPU_THREADS", "8"))
+WHISPER_NUM_WORKERS  = int(os.environ.get("WHISPER_NUM_WORKERS", "2"))
+
+torch.set_num_threads(WHISPER_CPU_THREADS)
 
 # PyTorch 2.6 changed torch.load's default from weights_only=False to
 # weights_only=True. The pyannote VAD checkpoint that whisperx.load_model()
@@ -49,10 +58,10 @@ torch.load = _patched_torch_load
 
 log = logging.getLogger(__name__)
 
-SAMPLE_RATE        = cfg.vad.sample_rate
-SILENCE_THRESHOLD  = cfg.vad.silence_threshold
-VAD_SILENCE_CHUNKS = cfg.vad.silence_chunks
-MAX_SEGMENT_CHUNKS = cfg.vad.max_segment_chunks
+SAMPLE_RATE        = int(os.environ.get("VAD_SAMPLE_RATE", "16000"))
+SILENCE_THRESHOLD  = float(os.environ.get("VAD_SILENCE_THRESHOLD", "0.03"))
+VAD_SILENCE_CHUNKS = int(os.environ.get("VAD_SILENCE_CHUNKS", "40"))
+MAX_SEGMENT_CHUNKS = int(os.environ.get("VAD_MAX_SEGMENT_CHUNKS", "1000"))
 MIN_FLUSH_CHUNKS = 5  # ~50ms; just prevents flushing a near-empty buffer
 
 # Minimum audio length before we attempt transcription.
@@ -99,22 +108,22 @@ try:
     _pa_vad.Inference = _CompatVadInference
 
     WHISPERX_AVAILABLE = True
-    log.info(f"Loading WhisperX '{cfg.whisper.model_size}' on {cfg.whisper.device}…")
+    log.info(f"Loading WhisperX '{WHISPER_MODEL_SIZE}' on {WHISPER_DEVICE}…")
     _wx_model = whisperx.load_model(
-        cfg.whisper.model_size,
-        device=cfg.whisper.device,
-        compute_type=cfg.whisper.compute_type,
-        language=cfg.whisper.language,
-        asr_options={"beam_size": cfg.whisper.beam_size},
+        WHISPER_MODEL_SIZE,
+        device=WHISPER_DEVICE,
+        compute_type=WHISPER_COMPUTE_TYPE,
+        language=WHISPER_LANGUAGE,
+        asr_options={"beam_size": WHISPER_BEAM_SIZE},
     )
     _wx_align_cache: dict = {}
     log.info("WhisperX ready.")
-    if cfg.whisper.language:
-        log.info(f"Pre-loading alignment model for '{cfg.whisper.language}'…")
+    if WHISPER_LANGUAGE:
+        log.info(f"Pre-loading alignment model for '{WHISPER_LANGUAGE}'…")
         _align_model, _align_meta = whisperx.load_align_model(
-            language_code=cfg.whisper.language, device=cfg.whisper.device
+            language_code=WHISPER_LANGUAGE, device=WHISPER_DEVICE
         )
-        _wx_align_cache[cfg.whisper.language] = (_align_model, _align_meta)
+        _wx_align_cache[WHISPER_LANGUAGE] = (_align_model, _align_meta)
         log.info("Alignment model ready.")
 except ImportError as e:
     # NOTE: this except clause fires for the literal "whisperx isn't
@@ -129,11 +138,11 @@ except ImportError as e:
     from faster_whisper import WhisperModel
     log.warning(f"whisperx unavailable ({e!r}) — falling back to faster-whisper")
     _fw_model = WhisperModel(
-        cfg.whisper.model_size,
-        device=cfg.whisper.device,
-        compute_type=cfg.whisper.compute_type,
-        cpu_threads=cfg.whisper.cpu_threads,
-        num_workers=cfg.whisper.num_workers,
+        WHISPER_MODEL_SIZE,
+        device=WHISPER_DEVICE,
+        compute_type=WHISPER_COMPUTE_TYPE,
+        cpu_threads=WHISPER_CPU_THREADS,
+        num_workers=WHISPER_NUM_WORKERS,
     )
     log.info("faster-whisper ready.")
 
@@ -194,23 +203,23 @@ async def transcribe(
             f"{len(segment_audio) / SAMPLE_RATE:.2f}s < "
             f"{MIN_SEGMENT_SAMPLES / SAMPLE_RATE:.2f}s min); skipping transcription."
         )
-        return "", cfg.whisper.language or "en", []
+        return "", WHISPER_LANGUAGE or "en", []
 
     if WHISPERX_AVAILABLE:
         wx_result = await loop.run_in_executor(
             None,
             lambda: _wx_model.transcribe(
-                segment_audio, batch_size=8, language=cfg.whisper.language
+                segment_audio, batch_size=8, language=WHISPER_LANGUAGE
             )
         )
-        detected_lang = wx_result.get("language", cfg.whisper.language or "en")
+        detected_lang = wx_result.get("language", WHISPER_LANGUAGE or "en")
         cache = align_cache if align_cache is not None else _wx_align_cache
 
         if detected_lang not in cache:
             align_model, align_meta = await loop.run_in_executor(
                 None,
                 lambda: whisperx.load_align_model(
-                    language_code=detected_lang, device=cfg.whisper.device
+                    language_code=detected_lang, device=WHISPER_DEVICE
                 )
             )
             cache[detected_lang] = (align_model, align_meta)
@@ -220,7 +229,7 @@ async def transcribe(
             None,
             lambda: whisperx.align(
                 wx_result["segments"], align_model, align_meta,
-                segment_audio, cfg.whisper.device, return_char_alignments=False
+                segment_audio, WHISPER_DEVICE, return_char_alignments=False
             )
         )
         wx_segments = aligned.get("segments", wx_result.get("segments", []))
@@ -258,9 +267,9 @@ async def transcribe(
         def _fw_transcribe() -> tuple[str, str]:
             segs, info = _fw_model.transcribe(
                 segment_audio,
-                language=cfg.whisper.language,
+                language=WHISPER_LANGUAGE,
                 vad_filter=False,
-                beam_size=cfg.whisper.beam_size,
+                beam_size=WHISPER_BEAM_SIZE,
             )
             return " ".join(seg.text for seg in segs).strip(), info.language
 

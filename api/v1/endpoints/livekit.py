@@ -21,7 +21,6 @@ from fastapi import APIRouter, Depends, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from api.deps import get_current_user, require_session_access, require_session_owner
-from core.config import cfg
 from schemas.livekit import RoomCreateRequest, RoomCreateResponse
 from pipeline import livekit_rooms
 from db import supabase_client
@@ -30,6 +29,16 @@ from services.capture import clear_summon
 from pipeline.dialogue_service import clear_dialogue
 
 log = logging.getLogger(__name__)
+
+# The browser-facing LiveKit URL. Falls back to LIVEKIT_URL if
+# LIVEKIT_PUBLIC_URL isn't set (mirrors the old core.config.py behaviour) —
+# fine for same-host local dev, but a real deployment where the browser
+# reaches this server over a LAN/Tailscale/public address needs
+# LIVEKIT_PUBLIC_URL set explicitly.
+import os
+LIVEKIT_PUBLIC_URL = os.environ.get("LIVEKIT_PUBLIC_URL") or os.environ.get(
+    "LIVEKIT_URL", "ws://host.docker.internal:7880"
+)
 
 router = APIRouter(prefix="/livekit", tags=["livekit"])
 sse_router = APIRouter(tags=["events"])
@@ -98,7 +107,7 @@ async def create_room(
         log.error(f"[livekit] upsert_session failed (non-fatal): {exc}", exc_info=True)
 
     log.info(f"[livekit] room created: {session_id} host={req.display_name} owner={current_user['id']}")
-    return RoomCreateResponse(session_id=session_id, token=token, lk_url=cfg.livekit.public_url)
+    return RoomCreateResponse(session_id=session_id, token=token, lk_url=LIVEKIT_PUBLIC_URL)
 
 
 @router.get("/token")
@@ -160,7 +169,7 @@ async def get_token(
     except Exception as exc:
         log.error(f"[livekit] add_session_participant failed (non-fatal): {exc}", exc_info=True)
 
-    return {"session_id": session_id, "token": token, "lk_url": cfg.livekit.public_url}
+    return {"session_id": session_id, "token": token, "lk_url": LIVEKIT_PUBLIC_URL}
 
 
 @router.get("/room/{session_id}")

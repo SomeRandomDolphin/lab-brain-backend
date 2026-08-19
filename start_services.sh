@@ -5,7 +5,7 @@
 # Services managed:
 #
 #   LiveKit  — WebRTC SFU for real-time audio/video routing.
-#              Reads livekit.api_key / livekit.api_secret from config.json so
+#              Reads LIVEKIT_API_KEY / LIVEKIT_API_SECRET from .env so
 #              token signing in livekit_rooms.py always stays in sync.
 #              (Credential drift was the root cause of earlier 503 /
 #              "Server disconnected" errors.)
@@ -21,13 +21,14 @@
 #   Supabase — Local Postgres + REST + Auth + Storage stack.
 #              Uses the Supabase CLI when available; falls back to Docker
 #              Compose by cloning the official supabase/supabase repo.
-#              Reads supabase.url / supabase.key from config.json.
+#              Reads SUPABASE_URL / SUPABASE_SERVICE_KEY from .env.
 #              All Compose containers are prefixed "lab-brain-supabase".
 #
 #   Ollama   — Local LLM inference server (OpenAI-compatible API).
-#              Pulls vision_model, dialogue_model, embedding_model, and
-#              extra_model (hermes3:3b) straight from config.json into a
-#              shared Docker volume so models survive restarts.
+#              Pulls LOCAL_LLM_VISION_MODEL, LOCAL_LLM_DIALOGUE_MODEL,
+#              LOCAL_LLM_EMBEDDING_MODEL, and LOCAL_LLM_EXTRA_MODEL
+#              (hermes3:3b) straight from .env into a shared Docker volume
+#              so models survive restarts.
 #              GPU passthrough is enabled automatically when the NVIDIA
 #              container runtime is detected.
 #
@@ -81,7 +82,7 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
-CONFIG_FILE="config.json"
+ENV_FILE="${SCRIPT_DIR}/.env"
 
 # ── Docker guard ──────────────────────────────────────────────────────────────
 
@@ -90,31 +91,10 @@ if ! docker info >/dev/null 2>&1; then
   die "Docker daemon isn't running. Start Docker Desktop (or 'sudo systemctl start docker') and re-run."
 fi
 
-# ── read_config <python-subscript> [default] ──────────────────────────────────
-# Reads a value from config.json via python3 (no jq required).
-# Example: read_config "['livekit']['api_key']" "devkey"
-read_config() {
-  local expr="$1"
-  local default="${2:-}"
-  if [[ -f "$CONFIG_FILE" ]]; then
-    python3 -c "
-import json
-try:
-    d = json.load(open('${CONFIG_FILE}'))
-    v = d${expr}
-    print('' if v is None else v)
-except (KeyError, TypeError):
-    print('${default}')
-" 2>/dev/null || echo "$default"
-  else
-    echo "$default"
-  fi
-}
-
 # ── read_env_var <file> <key> [default] ────────────────────────────────────
-# Reads KEY=VALUE from a plain .env file (not config.json). Used to check
-# the app's own .env (app/core/env.py's file) for LIVEKIT_EGRESS_ENABLED,
-# since that flag lives there, not in config.json.
+# Reads KEY=VALUE from a plain .env file — the app's own .env (core/env.py's
+# file). Used for every setting this script needs (LiveKit credentials,
+# node_ip, Ollama model names, etc.) now that config.json is gone.
 read_env_var() {
   local file="$1" key="$2" default="${3:-}"
   if [[ -f "$file" ]]; then
@@ -277,11 +257,11 @@ RECORDINGS_VOLUME="lab-brain-recordings"
 start_livekit() {
   info "Setting up LiveKit..."
 
-  # Read credentials from config.json — same source livekit_rooms.py uses,
+  # Read credentials from .env — same source livekit_rooms.py uses,
   # so token signing always matches the server's expected key/secret pair.
   local api_key api_secret
-  api_key=$(read_config    "['livekit']['api_key']"    "devkey")
-  api_secret=$(read_config "['livekit']['api_secret']" "devsecret")
+  api_key=$(read_env_var    "$ENV_FILE" "LIVEKIT_API_KEY"    "devkey")
+  api_secret=$(read_env_var "$ENV_FILE" "LIVEKIT_API_SECRET" "devsecret")
   echo "    api_key=${api_key}  api_secret=${api_secret}"
 
   # --node-ip tells LiveKit which address to advertise in its WebRTC ICE
@@ -292,11 +272,11 @@ start_livekit() {
   # this server over a LAN/Tailscale/public address instead (e.g.
   # ws://100.x.x.x:7880), 127.0.0.1 resolves to the browser's own machine
   # and ICE negotiation fails ("ICE failed, add a TURN server") even though
-  # signaling connects fine. Set livekit.node_ip in config.json to whatever
+  # signaling connects fine. Set LIVEKIT_NODE_IP in .env to whatever
   # address your clients actually use to reach LIVEKIT_URL — falls back to
   # 127.0.0.1 for same-host local dev.
   local node_ip
-  node_ip=$(read_config "['livekit']['node_ip']" "127.0.0.1")
+  node_ip=$(read_env_var "$ENV_FILE" "LIVEKIT_NODE_IP" "127.0.0.1")
   echo "    node_ip=${node_ip}  (advertised WebRTC media address — must match how clients reach LIVEKIT_URL)"
 
   # Egress needs a shared Redis to receive recording jobs from LiveKit —
@@ -361,7 +341,7 @@ EOF
     # media address, and clients get signaling-connects-but-ICE-fails
     # ("could not establish pc connection" / "ICE failed, add a TURN
     # server"). Defaults to 127.0.0.1 for same-host local dev; set
-    # livekit.node_ip in config.json if clients reach this server over a
+    # LIVEKIT_NODE_IP in .env if clients reach this server over a
     # LAN/Tailscale/public address instead (see node_ip resolution above).
     #
     # --network attached even though egress is off, so nothing else has to
@@ -446,8 +426,8 @@ start_egress() {
   ensure_recordings_volume
 
   local api_key api_secret
-  api_key=$(read_config    "['livekit']['api_key']"    "devkey")
-  api_secret=$(read_config "['livekit']['api_secret']" "devsecret")
+  api_key=$(read_env_var    "$ENV_FILE" "LIVEKIT_API_KEY"    "devkey")
+  api_secret=$(read_env_var "$ENV_FILE" "LIVEKIT_API_SECRET" "devsecret")
 
   local egress_config="${SCRIPT_DIR}/egress-config.yaml"
   cat > "$egress_config" <<EOF
@@ -488,8 +468,8 @@ EOF
   # governed by the (already-open) u:: entry instead of o::, so delete just
   # works regardless of what mode bits mkdir happened to request. Must match
   # the backend image's appuser uid exactly, or this swaps one mismatch for
-  # another — override via config.json if your backend Dockerfile ever
-  # changes appuser's uid/gid.
+  # another — override via RECORDINGS_APPUSER_UID / RECORDINGS_APPUSER_GID
+  # in .env if your backend Dockerfile ever changes appuser's uid/gid.
   # --tmpfs "/home/egress/tmp:...": separate issue from the --user fix
   # above. /home/egress/tmp lives inside the image itself (not a mounted
   # volume) and is owned by root from the image build — the entrypoint's
@@ -501,8 +481,8 @@ EOF
   # in. Bonus: Chrome's temp/profile writes during compositing land on
   # RAM-backed tmpfs instead of the container's disk layer.
   local appuser_uid appuser_gid
-  appuser_uid=$(read_config "['recordings']['appuser_uid']" "1000")
-  appuser_gid=$(read_config "['recordings']['appuser_gid']" "1000")
+  appuser_uid=$(read_env_var "$ENV_FILE" "RECORDINGS_APPUSER_UID" "1000")
+  appuser_gid=$(read_env_var "$ENV_FILE" "RECORDINGS_APPUSER_GID" "1000")
   # --user "${appuser_uid}:0": gid is 0 (root), NOT appuser_gid. The
   # livekit/egress image's own /home/egress is owned by egress:root, mode
   # 750 (owner rwx, group r-x, other ---). Using appuser_gid here landed us
@@ -595,7 +575,8 @@ EOF
 #   4. Pull images
 #   5. Start via `sh run.sh start`  (wraps `docker compose up -d --wait`)
 #   6. Health-check via `docker compose ps`
-#   7. Write supabase.url + supabase.key back into config.json
+#   7. Print the resolved SUPABASE_URL / SUPABASE_SERVICE_KEY so you can
+#      copy them into your .env (no longer auto-written — see Step 7 below)
 #
 # All Compose-managed containers are prefixed with the project name
 # "lab-brain-supabase" (set via COMPOSE_PROJECT_NAME) so they appear as
@@ -818,11 +799,11 @@ set_storage_port() {
 # ERR_CONNECTION_REFUSED, even though `curl localhost:8080` on the server
 # itself looks perfectly fine. This is the exact same class of problem
 # start_livekit()'s `node_ip` already solves for WebRTC media, so it reuses
-# that same config.json value (livekit.node_ip) as the browser-reachable
-# host instead of hardcoding "localhost". Set livekit.node_ip in
-# config.json to whatever address you actually type into the browser (e.g.
-# your Tailscale IP) and both LiveKit media AND Supabase download links
-# pick it up together — one knob, no more drift between the two.
+# that same env value (LIVEKIT_NODE_IP) as the browser-reachable host
+# instead of hardcoding "localhost". Set LIVEKIT_NODE_IP in .env to
+# whatever address you actually type into the browser (e.g. your Tailscale
+# IP) and both LiveKit media AND Supabase download links pick it up
+# together — one knob, no more drift between the two.
 set_public_url() {
   local env_file="$1"
   local url="$2"
@@ -890,11 +871,11 @@ start_supabase() {
   # ── Step 2c-2: keep Studio/GoTrue's public URLs in sync with that move ───
   # Must come right after set_kong_port() — see set_public_url()'s comment
   # for why leaving these on the upstream default breaks Studio downloads,
-  # and why the host is read from livekit.node_ip rather than hardcoded to
+  # and why the host is read from LIVEKIT_NODE_IP rather than hardcoded to
   # "localhost" (same browser-reachable-address problem as LiveKit's WebRTC
   # media, same fix).
   local public_host
-  public_host=$(read_config "['livekit']['node_ip']" "localhost")
+  public_host=$(read_env_var "$ENV_FILE" "LIVEKIT_NODE_IP" "localhost")
   set_public_url "$env_file" "http://${public_host}:${SUPABASE_API_PORT}"
 
   # ── Step 2d: publish storage-api directly, bypassing Kong ────────────────
@@ -1030,26 +1011,32 @@ start_supabase() {
       || die "docker compose up failed. Check logs: cd ${SUPABASE_PROJECT_DIR} && COMPOSE_PROJECT_NAME=${SUPABASE_COMPOSE_PROJECT} docker compose logs"
   fi
 
-  # ── Step 7: extract keys and update config.json ──────────────────────────
-  local anon_key publishable_key api_url
+  # ── Step 7: extract keys and print them for .env ──────────────────────────
+  local service_role_key publishable_key api_url
+  # NOTE: the app needs the SERVICE_ROLE_KEY (bypasses RLS — see
+  # SUPABASE_SERVICE_KEY in .env.example), not the anon/publishable key.
+  # A previous version of this script only ever looked up
+  # SUPABASE_PUBLISHABLE_KEY/ANON_KEY here and wrote *that* into
+  # config.json's supabase.key — which is the wrong key for backend use.
+  # Preferring SERVICE_ROLE_KEY (falling back to the anon key with a loud
+  # warning, so this never silently hands you the wrong key type) fixes
+  # that.
+  service_role_key=$(grep -E '^SERVICE_ROLE_KEY=' "$env_file" \
+    | head -1 | cut -d= -f2- | tr -d '"' || true)
   publishable_key=$(grep -E '^(SUPABASE_PUBLISHABLE_KEY|ANON_KEY)=' "$env_file" \
     | head -1 | cut -d= -f2- | tr -d '"' || true)
-  anon_key="$publishable_key"
   api_url="http://localhost:${SUPABASE_API_PORT}"
 
-  if [[ -f "$CONFIG_FILE" ]] && [[ -n "$anon_key" ]]; then
-    python3 -c "
-import json, sys
-with open('${CONFIG_FILE}', 'r') as f:
-    cfg = json.load(f)
-cfg.setdefault('supabase', {})
-cfg['supabase']['url'] = '${api_url}'
-cfg['supabase']['key'] = '${anon_key}'
-with open('${CONFIG_FILE}', 'w') as f:
-    json.dump(cfg, f, indent=2)
-print('config.json updated.')
-" && success "config.json updated: supabase.url=${api_url}" \
-  || warn "Could not auto-update config.json — set supabase.url and supabase.key manually."
+  if [[ -n "$service_role_key" ]]; then
+    success "Resolved Supabase credentials — add these to your .env:"
+    echo "    SUPABASE_URL=${api_url}/"
+    echo "    SUPABASE_SERVICE_KEY=${service_role_key}"
+  elif [[ -n "$publishable_key" ]]; then
+    warn "Could not find SERVICE_ROLE_KEY in ${env_file} — falling back to the anon/publishable key, which is NOT what the backend needs (it bypasses RLS with SERVICE_ROLE_KEY, not the anon key). Add these to your .env and replace the key with the real service_role key from ${env_file} once you locate it:"
+    echo "    SUPABASE_URL=${api_url}/"
+    echo "    SUPABASE_SERVICE_KEY=${publishable_key}  # <-- anon key, NOT service_role — replace this"
+  else
+    warn "Could not resolve any Supabase key from ${env_file} — set SUPABASE_URL and SUPABASE_SERVICE_KEY in your .env manually."
   fi
 
   echo ""
@@ -1089,18 +1076,18 @@ OLLAMA_PORT=11434
 start_ollama() {
   info "Setting up Ollama..."
 
-  # Model names come directly from config.json — stays in sync with the backend
+  # Model names come directly from .env — stays in sync with the backend
   local vision_model dialogue_model embedding_model extra_model
-  vision_model=$(read_config    "['local_llm']['vision_model']"    "qwen3-vl:4b")
-  dialogue_model=$(read_config  "['local_llm']['dialogue_model']"  "qwen3:4b")
-  embedding_model=$(read_config "['local_llm']['embedding_model']" "qwen3-embedding:0.6b")
-  extra_model=$(read_config     "['local_llm']['extra_model']"     "hermes3:3b")
+  vision_model=$(read_env_var    "$ENV_FILE" "LOCAL_LLM_VISION_MODEL"    "qwen3-vl:4b")
+  dialogue_model=$(read_env_var  "$ENV_FILE" "LOCAL_LLM_DIALOGUE_MODEL"  "qwen3:4b")
+  embedding_model=$(read_env_var "$ENV_FILE" "LOCAL_LLM_EMBEDDING_MODEL" "qwen3-embedding:0.6b")
+  extra_model=$(read_env_var     "$ENV_FILE" "LOCAL_LLM_EXTRA_MODEL"     "hermes3:3b")
   echo "  vision_model    = ${vision_model}"
   echo "  dialogue_model  = ${dialogue_model}"
   echo "  embedding_model = ${embedding_model}"
   echo "  extra_model     = ${extra_model}"
 
-  # GUARD: if config.json points both roles at the same model tag, every
+  # GUARD: if .env points both roles at the same model tag, every
   # dialogue/QA call queues behind vision calls on the same model-runner
   # (and vice versa) regardless of OLLAMA_MAX_LOADED_MODELS/NUM_PARALLEL —
   # there's only one distinct model to load, so nothing here can help.
@@ -1108,9 +1095,9 @@ start_ollama() {
   # ASR/QA in earlier sessions — catch it here instead of re-discovering it
   # from a frozen frontend.
   if [[ "$vision_model" == "$dialogue_model" ]]; then
-    die "config.json: local_llm.vision_model and local_llm.dialogue_model are both '${vision_model}'. \
-They must be different models — a VL model for vision_model, a text-only model (e.g. qwen3:4b) for \
-dialogue_model — or dialogue/QA calls will queue behind every vision call. Fix config.json and re-run."
+    die ".env: LOCAL_LLM_VISION_MODEL and LOCAL_LLM_DIALOGUE_MODEL are both '${vision_model}'. \
+They must be different models — a VL model for LOCAL_LLM_VISION_MODEL, a text-only model (e.g. qwen3:4b) for \
+LOCAL_LLM_DIALOGUE_MODEL — or dialogue/QA calls will queue behind every vision call. Fix .env and re-run."
   fi
 
   # GPU passthrough — auto-detected, never required.
@@ -1285,9 +1272,9 @@ echo ""
 echo -e "${BOLD}Lab Brain — Service Launcher${NC}"
 echo "────────────────────────────────────────────"
 echo "  Services: LiveKit=$(${RUN_LIVEKIT} && echo on || echo off)  Supabase=$(${RUN_SUPABASE} && echo on || echo off)  Ollama=$(${RUN_OLLAMA} && echo on || echo off)"
-[[ -f "$CONFIG_FILE" ]] \
-  && echo "  Config:   ${SCRIPT_DIR}/${CONFIG_FILE}" \
-  || warn "config.json not found in ${SCRIPT_DIR} — using defaults for all services."
+[[ -f "$ENV_FILE" ]] \
+  && echo "  Config:   ${ENV_FILE}" \
+  || warn ".env not found in ${SCRIPT_DIR} — using defaults for all services."
 echo ""
 
 $RUN_LIVEKIT  && start_livekit

@@ -17,10 +17,12 @@ import re
 from datetime import datetime
 from typing import Optional
 
+import os
 from db import lkc_graph
-from core.config import cfg
 
 log = logging.getLogger(__name__)
+
+SPACY_MODEL = os.environ.get("SPACY_MODEL", "en_core_web_sm")
 
 # ── spaCy NER ─────────────────────────────────────────────────────────────────
 # Loaded eagerly at import time (mirrors asr.py's WhisperX load) so the model
@@ -35,15 +37,15 @@ _nlp = None
 
 try:
     import spacy
-    log.info(f"[capture] loading spaCy NER model '{cfg.spacy.model}'…")
+    log.info(f"[capture] loading spaCy NER model '{SPACY_MODEL}'…")
     try:
-        _nlp = spacy.load(cfg.spacy.model)
+        _nlp = spacy.load(SPACY_MODEL)
         SPACY_AVAILABLE = True
         log.info("[capture] spaCy NER loaded.")
     except OSError:
         log.warning(
-            f"[capture] spaCy model '{cfg.spacy.model}' not found. "
-            f"Run: python -m spacy download {cfg.spacy.model}"
+            f"[capture] spaCy model '{SPACY_MODEL}' not found. "
+            f"Run: python -m spacy download {SPACY_MODEL}"
         )
 except ImportError:
     log.warning("[capture] spaCy not installed — using regex NER.")

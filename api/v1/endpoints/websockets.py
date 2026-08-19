@@ -19,7 +19,7 @@ import uuid
 import numpy as np
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from core.config import cfg
+import os
 from db import lkc_graph
 from services import vision, eval_metrics
 from services import capture as _capture
@@ -30,9 +30,10 @@ log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["websockets_legacy"])
 
-SAMPLE_RATE       = cfg.vad.sample_rate
-SILENCE_THRESHOLD = cfg.vad.silence_threshold
-VISION_FRAME_INTERVAL = cfg.vision.frame_interval
+SAMPLE_RATE           = int(os.environ.get("VAD_SAMPLE_RATE", "16000"))
+SILENCE_THRESHOLD     = float(os.environ.get("VAD_SILENCE_THRESHOLD", "0.03"))
+VISION_FRAME_INTERVAL = int(os.environ.get("VISION_FRAME_INTERVAL", "5"))
+LKC_RETRIEVAL_TOP_K   = int(os.environ.get("LKC_RETRIEVAL_TOP_K", "4"))
 
 # Per-session TTS queues (fed by both WS and LiveKit pipelines)
 _tts_queues: dict[str, asyncio.Queue] = {}
@@ -200,7 +201,7 @@ async def asr_endpoint(ws: WebSocket):
 
 async def _handle_qa_ws(session_id, ws, dlg, full_text, retriever, metrics, mode):
     from pipeline.dialogue_service import generate_response, ConvMode
-    lkc_context = await retriever.query(full_text, top_k=cfg.lkc.retrieval_top_k, session_id=session_id)
+    lkc_context = await retriever.query(full_text, top_k=LKC_RETRIEVAL_TOP_K, session_id=session_id)
     reply = await generate_response(dlg, full_text, lkc_context)
     if reply:
         ts = time.time()

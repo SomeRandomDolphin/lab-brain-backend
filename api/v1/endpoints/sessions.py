@@ -19,7 +19,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from api.deps import get_current_user, require_session_access
-from core.config import cfg
 from db import lkc_graph, supabase_client
 from services import vision, eval_metrics
 from services.capture import is_summoned
@@ -31,6 +30,15 @@ def _get_dialogue_module():
     return dialogue_service
 
 router = APIRouter(tags=["sessions"])
+
+import os
+DIALOGUE_CONTEXT_WINDOW   = int(os.environ.get("DIALOGUE_CONTEXT_WINDOW", "12"))
+DIALOGUE_TTS_AUTO_HIDE_MS = int(os.environ.get("DIALOGUE_TTS_AUTO_HIDE_MS", "8000"))
+VISION_CAMERA_FPS         = int(os.environ.get("VISION_CAMERA_FPS", "5"))
+VISION_CAMERA_QUALITY     = float(os.environ.get("VISION_CAMERA_QUALITY", "0.6"))
+LIVEKIT_PUBLIC_URL = os.environ.get("LIVEKIT_PUBLIC_URL") or os.environ.get(
+    "LIVEKIT_URL", "ws://host.docker.internal:7880"
+)
 
 
 @router.post("/summary/{session_id}")
@@ -78,7 +86,7 @@ async def post_summary(session_id: str = Depends(require_session_access)):
             f"{r.get('speaker', 'Unknown')}: {r.get('text', '')}"
             for r in records if r.get("text")
         ]
-        transcript_text = "\n".join(transcript_lines[-cfg.dialogue.context_window:])
+        transcript_text = "\n".join(transcript_lines[-DIALOGUE_CONTEXT_WINDOW:])
 
         try:
             summary_md = await dialogue.generate_summary(session_id, transcript_text, tags)
@@ -157,10 +165,10 @@ async def get_perception(session_id: str = Depends(require_session_access)):
 @router.get("/config/client")
 async def client_config():
     return {
-        "camera_fps":       cfg.vision.camera_fps,
-        "camera_quality":   cfg.vision.camera_quality,
-        "tts_auto_hide_ms": cfg.dialogue.tts_auto_hide_ms,
-        "lk_url":           cfg.livekit.public_url,
+        "camera_fps":       VISION_CAMERA_FPS,
+        "camera_quality":   VISION_CAMERA_QUALITY,
+        "tts_auto_hide_ms": DIALOGUE_TTS_AUTO_HIDE_MS,
+        "lk_url":           LIVEKIT_PUBLIC_URL,
     }
 
 

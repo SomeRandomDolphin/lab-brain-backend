@@ -14,9 +14,10 @@ import time
 from datetime import datetime
 from typing import Optional
 
+import os
+
 import numpy as np
 
-from core.config import cfg
 from db import lkc_graph, supabase_client
 from services import vision, eval_metrics, capture as _capture, privacy as _privacy
 from services import lkc_retrieval, kg_agent_client
@@ -30,10 +31,15 @@ from pipeline.livekit_rooms import broadcast, get_known_identity
 
 log = logging.getLogger(__name__)
 
-SAMPLE_RATE       = cfg.vad.sample_rate
-SILENCE_THRESHOLD = cfg.vad.silence_threshold
+SAMPLE_RATE       = int(os.environ.get("VAD_SAMPLE_RATE", "16000"))
+SILENCE_THRESHOLD = float(os.environ.get("VAD_SILENCE_THRESHOLD", "0.03"))
+LKC_RETRIEVAL_TOP_K              = int(os.environ.get("LKC_RETRIEVAL_TOP_K", "4"))
+KG_AGENT_SOFT_DEADLINE_SECONDS   = float(os.environ.get("KG_AGENT_SOFT_DEADLINE_SECONDS", "6.0"))
+KG_AGENT_FAITHFULNESS_THRESHOLD  = float(os.environ.get("KG_AGENT_FAITHFULNESS_THRESHOLD", "0.7"))
+SUPABASE_STORE_AUDIO  = os.environ.get("SUPABASE_STORE_AUDIO", "true").strip().lower() in ("1", "true", "yes", "on")
+SUPABASE_STORE_VISION = os.environ.get("SUPABASE_STORE_VISION", "false").strip().lower() in ("1", "true", "yes", "on")
 # VISION_FRAME_INTERVAL decimation now happens in livekit_rooms.py's
-# _drain_video (before the JPEG encode), which reads cfg.vision.frame_interval
+# _drain_video (before the JPEG encode), which reads VISION_FRAME_INTERVAL
 # directly — see _process_video below.
 
 # Sessions with a QA reply currently generating. generate_response() is a
@@ -130,13 +136,13 @@ async def _handle_qa_sse(
     # session_id-only scoping automatically when the owner couldn't be
     # resolved at pipeline startup (both None in that case).
     lkc_context = await retriever.query(
-        full_text, top_k=cfg.lkc.retrieval_top_k, session_id=session_id,
+        full_text, top_k=LKC_RETRIEVAL_TOP_K, session_id=session_id,
         user_id=user_id, user_session_ids=user_session_ids,
     )
 
     kg_result = None
     done, _pending = await asyncio.wait(
-        {kg_task}, timeout=cfg.kg_agent.soft_deadline_seconds
+        {kg_task}, timeout=KG_AGENT_SOFT_DEADLINE_SECONDS
     )
     if kg_task in done:
         try:
@@ -154,7 +160,7 @@ async def _handle_qa_sse(
     use_kg = (
         kg_result is not None
         and kg_result.in_corpus  # empty documents_used == outside the 8-paper corpus
-        and kg_result.faithfulness >= cfg.kg_agent.faithfulness_threshold
+        and kg_result.faithfulness >= KG_AGENT_FAITHFULNESS_THRESHOLD
     )
 
     if use_kg:
@@ -360,7 +366,7 @@ async def livekit_pipeline(
         # chunk-level gate that already ran — real speech segments in the
         # 0.04-0.05 range (normal speaking volume / quieter mic) were passing
         # VadChunker but then getting silently thrown away here. Use the
-        # configured threshold directly; tune cfg.vad.silence_threshold if
+        # configured threshold directly; tune VAD_SILENCE_THRESHOLD if
         # you need this looser/stricter rather than re-multiplying here.
         seg_rms = float(np.sqrt(np.mean(segment_audio ** 2)))
         if seg_rms < SILENCE_THRESHOLD:
@@ -593,7 +599,7 @@ async def livekit_pipeline(
                     asr_latency_ms=asr_latency, e2e_latency_ms=e2e,
                     segment_index=seg_idx,
                 )
-                if cfg.supabase.store_audio:
+                if SUPABASE_STORE_AUDIO:
                     await supabase_client.upload_audio_segment(
                         session_id, seg_idx, segment_audio
                     )
@@ -724,7 +730,7 @@ async def livekit_pipeline(
                     state.present_speakers, state.engagement_cues, state.environment_state,
                 )
             )
-            if cfg.supabase.store_vision:
+            if SUPABASE_STORE_VISION:
                 await supabase_client.insert_vision_frame(
                     session_id=session_id, timestamp_unix=ts,
                     scene_summary=state.scene_summary,
@@ -804,7 +810,7 @@ async def livekit_pipeline(
                 log.exception(f"[pipeline:{session_id}] _process_video raised unexpectedly")
 
     # Minimum time between successive vision dispatches (start-to-start).
-    # The previous version derived this from cfg.vision.camera_fps (5),
+    # The previous version derived this from VISION_CAMERA_FPS (5),
     # giving a 0.2s floor — meaningless, since every real call already
     # takes 4-8s on its own, so `remaining` was always negative and
     # asyncio.sleep() never actually fired. This is a real, deliberate cap:

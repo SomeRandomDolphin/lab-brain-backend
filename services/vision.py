@@ -18,10 +18,15 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional
 
-from core.config import cfg
+import os
+
 from services import privacy as _privacy
 
 log = logging.getLogger(__name__)
+
+LOCAL_LLM_BASE_URL     = os.environ.get("LOCAL_LLM_BASE_URL", "http://host.docker.internal:11434/v1")
+LOCAL_LLM_API_KEY      = os.environ.get("LOCAL_LLM_API_KEY", "ollama")
+LOCAL_LLM_VISION_MODEL = os.environ.get("LOCAL_LLM_VISION_MODEL", "qwen3-vl:4b")
 
 # Dedicated executor for vision LLM calls. Previously these went through
 # run_in_executor(None, ...) — the shared default ThreadPoolExecutor also
@@ -37,11 +42,11 @@ _vision_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="vision-
 try:
     from openai import OpenAI
     _client = OpenAI(
-        base_url=cfg.local_llm.base_url,
-        api_key=cfg.local_llm.api_key,
+        base_url=LOCAL_LLM_BASE_URL,
+        api_key=LOCAL_LLM_API_KEY,
     )
     LOCAL_LLM_AVAILABLE = True
-    log.info(f"Vision model ready ({cfg.local_llm.vision_model} @ {cfg.local_llm.base_url}).")
+    log.info(f"Vision model ready ({LOCAL_LLM_VISION_MODEL} @ {LOCAL_LLM_BASE_URL}).")
 except ImportError:
     LOCAL_LLM_AVAILABLE = False
     log.warning("openai package not installed — vision stub mode active.")
@@ -139,7 +144,7 @@ async def analyse_frame(session_id: str, jpeg_bytes: bytes, known_identity: Opti
     if not LOCAL_LLM_AVAILABLE:
         state.present_speakers = ["Person A"]
         state.engagement_cues  = {"Person A": "focused"}
-        state.scene_summary    = "[Vision stub — configure local_llm in config.json]"
+        state.scene_summary    = "[Vision stub — configure LOCAL_LLM_* in your .env]"
         state.last_updated     = time.time()
         return state
 
@@ -154,13 +159,13 @@ async def analyse_frame(session_id: str, jpeg_bytes: bytes, known_identity: Opti
     # to resolve instead of a log read. call_id + explicit elapsed time
     # means the next one won't need that.
     call_id = uuid.uuid4().hex[:8]
-    log.info(f"[vision:{session_id}] LLM dispatch frame call_id={call_id} model={cfg.local_llm.vision_model}")
+    log.info(f"[vision:{session_id}] LLM dispatch frame call_id={call_id} model={LOCAL_LLM_VISION_MODEL}")
     t0 = time.perf_counter()
     try:
         response = await loop.run_in_executor(
             _vision_executor,
             lambda: _client.chat.completions.create(
-                model=cfg.local_llm.vision_model,
+                model=LOCAL_LLM_VISION_MODEL,
                 messages=[{
                     "role": "user",
                     "content": [

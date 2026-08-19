@@ -19,11 +19,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from api.deps import get_current_user, require_admin, require_session_access
-from core.config import cfg
 from db import supabase_client
 from db.migrations import get_migration_status, run_migrations_async
 
 router = APIRouter(prefix="/supabase", tags=["supabase"])
+
+import os
+SUPABASE_STORE_AUDIO = os.environ.get("SUPABASE_STORE_AUDIO", "true").strip().lower() in ("1", "true", "yes", "on")
 
 
 # ── Read endpoints ────────────────────────────────────────────────────────────
@@ -85,10 +87,10 @@ async def get_audio_url(
     segment_index: int,
     session_id: str = Depends(require_session_access),
 ):
-    if not cfg.supabase.store_audio:
+    if not SUPABASE_STORE_AUDIO:
         return JSONResponse(
             status_code=404,
-            content={"error": "Audio storage disabled. Set store_audio=true in config.json."},
+            content={"error": "Audio storage disabled. Set SUPABASE_STORE_AUDIO=true in your .env."},
         )
     url = supabase_client.get_audio_segment_url(session_id, segment_index)
     if url is None:

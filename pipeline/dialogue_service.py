@@ -16,11 +16,18 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+import os
+
 import numpy as np
 
-from core.config import cfg
-
 log = logging.getLogger(__name__)
+
+LOCAL_LLM_BASE_URL       = os.environ.get("LOCAL_LLM_BASE_URL", "http://host.docker.internal:11434/v1")
+LOCAL_LLM_API_KEY        = os.environ.get("LOCAL_LLM_API_KEY", "ollama")
+LOCAL_LLM_DIALOGUE_MODEL = os.environ.get("LOCAL_LLM_DIALOGUE_MODEL", "qwen3:4b")
+LOCAL_LLM_VISION_MODEL   = os.environ.get("LOCAL_LLM_VISION_MODEL", "qwen3-vl:4b")
+LOCAL_LLM_HF_TOKEN       = os.environ.get("LOCAL_LLM_HF_TOKEN", "")
+DIALOGUE_CONTEXT_WINDOW  = int(os.environ.get("DIALOGUE_CONTEXT_WINDOW", "12"))
 
 # ── pyannote diarization ──────────────────────────────────────────────────────
 try:
@@ -69,9 +76,8 @@ def _get_diarization_pipeline():
     try:
         import os
         hf_token = (
-            cfg.local_llm.hf_token
-            or os.environ.get("HF_TOKEN")
-            or os.environ.get("HUGGINGFACE_TOKEN")
+            LOCAL_LLM_HF_TOKEN
+            or os.environ.get("LOCAL_LLM_HF_TOKEN")
         )
         # pyannote.audio 4.x's Pipeline.from_pretrained() takes `token=`
         # (use_auth_token was renamed in the 4.x line, and the requirements.txt
@@ -109,8 +115,8 @@ if PYANNOTE_AVAILABLE:
 try:
     from openai import OpenAI
     _dialogue_client = OpenAI(
-        base_url=cfg.local_llm.base_url,
-        api_key=cfg.local_llm.api_key,
+        base_url=LOCAL_LLM_BASE_URL,
+        api_key=LOCAL_LLM_API_KEY,
     )
     LOCAL_LLM_AVAILABLE = True
 except ImportError:
@@ -171,12 +177,12 @@ def warmup() -> None:
     t0 = time.perf_counter()
     try:
         _dialogue_client.chat.completions.create(
-            model=cfg.local_llm.dialogue_model,
+            model=LOCAL_LLM_DIALOGUE_MODEL,
             messages=[{"role": "user", "content": "Hi"}],
             max_tokens=1,
         )
         log.info(
-            f"[dialogue] local LLM warmed: {cfg.local_llm.dialogue_model} "
+            f"[dialogue] local LLM warmed: {LOCAL_LLM_DIALOGUE_MODEL} "
             f"({time.perf_counter() - t0:.1f}s)"
         )
     except Exception as exc:
@@ -223,7 +229,7 @@ def warmup_vision() -> None:
     t0 = time.perf_counter()
     try:
         _dialogue_client.chat.completions.create(
-            model=cfg.local_llm.vision_model,
+            model=LOCAL_LLM_VISION_MODEL,
             messages=[{
                 "role": "user",
                 "content": [
@@ -237,7 +243,7 @@ def warmup_vision() -> None:
             max_tokens=1,
         )
         log.info(
-            f"[dialogue] local vision model warmed: {cfg.local_llm.vision_model} "
+            f"[dialogue] local vision model warmed: {LOCAL_LLM_VISION_MODEL} "
             f"({time.perf_counter() - t0:.1f}s)"
         )
     except Exception as exc:
@@ -297,7 +303,7 @@ class DialogueState:
     greeted_speakers:     set[str]      = field(default_factory=set)
     _chat_history:        list          = field(default_factory=list, repr=False)
     transcript_context:   list[str]     = field(default_factory=list)
-    CONTEXT_WINDOW:       int           = field(default_factory=lambda: cfg.dialogue.context_window)
+    CONTEXT_WINDOW:       int           = field(default_factory=lambda: DIALOGUE_CONTEXT_WINDOW)
     confirmation_pending: Optional[str] = None
     _speaker_counter:     int           = field(default=0, repr=False)
     _speaker_map:         dict          = field(default_factory=dict, repr=False)
@@ -620,7 +626,7 @@ async def generate_response(
             response = await loop.run_in_executor(
                 _dialogue_executor,
                 lambda: _dialogue_client.chat.completions.create(
-                    model=cfg.local_llm.dialogue_model,
+                    model=LOCAL_LLM_DIALOGUE_MODEL,
                     messages=[{"role": "system", "content": _SYSTEM_PROMPT}] + history,
                     # 120 was sized for the visible ≤2-sentence answer only.
                     # Qwen3 thinks by default and was silently spending the
@@ -752,7 +758,7 @@ async def generate_summary(session_id: str, transcript_text: str, session_tags: 
         response = await loop.run_in_executor(
             _dialogue_executor,
             lambda: _dialogue_client.chat.completions.create(
-                model=cfg.local_llm.dialogue_model,
+                model=LOCAL_LLM_DIALOGUE_MODEL,
                 messages=[
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user",   "content": user_message},

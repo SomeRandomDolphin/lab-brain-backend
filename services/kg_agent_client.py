@@ -48,14 +48,21 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-import httpx
+import os
 
-from core.config import cfg
+import httpx
 
 log = logging.getLogger(__name__)
 
 _EMPTY_RESPONSE_SENTINEL = "The model did not produce an answer for this query (empty response)"
 _DISCLAIMER_MARKER = "\n\n[!] Unverified:"
+
+KG_AGENT_ENABLED                          = os.environ.get("KG_AGENT_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+KG_AGENT_BASE_URL                         = os.environ.get("KG_AGENT_BASE_URL", "http://100.122.56.39:8003")
+KG_AGENT_REQUEST_TIMEOUT_SECONDS          = float(os.environ.get("KG_AGENT_REQUEST_TIMEOUT_SECONDS", "300.0"))  # server-side ceiling — do not lower
+KG_AGENT_SOFT_DEADLINE_SECONDS            = float(os.environ.get("KG_AGENT_SOFT_DEADLINE_SECONDS", "6.0"))
+KG_AGENT_FAITHFULNESS_THRESHOLD           = float(os.environ.get("KG_AGENT_FAITHFULNESS_THRESHOLD", "0.7"))
+KG_AGENT_CIRCUIT_BREAKER_COOLDOWN_SECONDS = float(os.environ.get("KG_AGENT_CIRCUIT_BREAKER_COOLDOWN_SECONDS", "30.0"))
 
 _http_client: Optional[httpx.AsyncClient] = None
 _health_client: Optional[httpx.AsyncClient] = None
@@ -91,7 +98,7 @@ class KgAgentAnswer:
 def _get_http_client() -> httpx.AsyncClient:
     global _http_client
     if _http_client is None:
-        _http_client = httpx.AsyncClient(timeout=cfg.kg_agent.request_timeout_seconds)
+        _http_client = httpx.AsyncClient(timeout=KG_AGENT_REQUEST_TIMEOUT_SECONDS)
     return _http_client
 
 
@@ -105,7 +112,7 @@ def _get_health_client() -> httpx.AsyncClient:
 def _circuit_open() -> bool:
     if _last_failure_at == 0.0:
         return False
-    return (time.time() - _last_failure_at) < cfg.kg_agent.circuit_breaker_cooldown_seconds
+    return (time.time() - _last_failure_at) < KG_AGENT_CIRCUIT_BREAKER_COOLDOWN_SECONDS
 
 
 def _mark_failure(reason: str) -> None:
@@ -114,7 +121,7 @@ def _mark_failure(reason: str) -> None:
     if KG_AGENT_AVAILABLE:
         log.warning(
             f"[kg-agent] marking unavailable ({reason}) — cooling down "
-            f"{cfg.kg_agent.circuit_breaker_cooldown_seconds:.0f}s before retrying"
+            f"{KG_AGENT_CIRCUIT_BREAKER_COOLDOWN_SECONDS:.0f}s before retrying"
         )
     KG_AGENT_AVAILABLE = False
 
@@ -128,11 +135,11 @@ def _mark_success() -> None:
 
 async def health() -> Optional[dict]:
     """GET /health. Cheap — safe to poll. Returns None on any failure."""
-    if not cfg.kg_agent.enabled:
+    if not KG_AGENT_ENABLED:
         return None
     try:
         client = _get_health_client()
-        resp = await client.get(f"{cfg.kg_agent.base_url}/health")
+        resp = await client.get(f"{KG_AGENT_BASE_URL}/health")
         resp.raise_for_status()
         data = resp.json()
         if data.get("status") == "degraded":
@@ -147,20 +154,20 @@ async def health() -> Optional[dict]:
 
 async def warmup() -> None:
     """Call once at startup, same spirit as lkc_retrieval.warmup()."""
-    if not cfg.kg_agent.enabled:
+    if not KG_AGENT_ENABLED:
         log.info("[kg-agent] disabled via config — skipping warmup")
         return
     data = await health()
     if data is None:
         log.warning(
-            f"[kg-agent] unreachable at {cfg.kg_agent.base_url} at startup "
+            f"[kg-agent] unreachable at {KG_AGENT_BASE_URL} at startup "
             f"(check Tailscale / citi-condor) — hybrid QA will fall back to "
             f"transcript-only until it recovers"
         )
     elif data.get("status") != "ok":
         log.warning(f"[kg-agent] unhealthy at startup: {data}")
     else:
-        log.info(f"[kg-agent] healthy at {cfg.kg_agent.base_url}")
+        log.info(f"[kg-agent] healthy at {KG_AGENT_BASE_URL}")
 
 
 async def query(question: str) -> Optional[KgAgentAnswer]:
@@ -170,7 +177,7 @@ async def query(question: str) -> Optional[KgAgentAnswer]:
     treat None exactly like "no literature answer available" and fall back
     to transcript-grounded QA. Never raises.
     """
-    if not cfg.kg_agent.enabled:
+    if not KG_AGENT_ENABLED:
         return None
     if _circuit_open():
         return None
@@ -178,7 +185,7 @@ async def query(question: str) -> Optional[KgAgentAnswer]:
     try:
         client = _get_http_client()
         resp = await client.post(
-            f"{cfg.kg_agent.base_url}/query",
+            f"{KG_AGENT_BASE_URL}/query",
             headers={"Content-Type": "application/json"},
             # agentic explicitly pinned False — see module docstring.
             json={"query": question, "agentic": False},
@@ -220,9 +227,9 @@ async def query(question: str) -> Optional[KgAgentAnswer]:
 
 def stats() -> dict:
     return {
-        "enabled":            cfg.kg_agent.enabled,
-        "base_url":           cfg.kg_agent.base_url,
+        "enabled":            KG_AGENT_ENABLED,
+        "base_url":           KG_AGENT_BASE_URL,
         "available":          KG_AGENT_AVAILABLE,
         "circuit_open":       _circuit_open(),
-        "faithfulness_threshold": cfg.kg_agent.faithfulness_threshold,
+        "faithfulness_threshold": KG_AGENT_FAITHFULNESS_THRESHOLD,
     }

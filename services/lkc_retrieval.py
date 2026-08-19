@@ -3,13 +3,13 @@ app/services/lkc_retrieval.py — Dense LKC Retrieval Service.
 
 Sources documents from the SQLite LKC graph (supports cross-session Q&A).
 Embeddings are served by the same local Ollama instance the app already
-runs for dialogue/vision (see config.json → local_llm), instead of a
-separately-downloaded sentence-transformers model. This removes the
-`sentence-transformers==3.3.1` pin and the Windows/FFmpeg dependency
-issues that pin existed for entirely.
+runs for dialogue/vision (see LOCAL_LLM_BASE_URL / LOCAL_LLM_EMBEDDING_MODEL
+in your .env), instead of a separately-downloaded sentence-transformers
+model. This removes the `sentence-transformers==3.3.1` pin and the
+Windows/FFmpeg dependency issues that pin existed for entirely.
 
 Primary:  Ollama embedding model, via /api/embed
-          (config: local_llm.embedding_model, default "qwen3-embedding:0.6b")
+          (env: LOCAL_LLM_EMBEDDING_MODEL, default "qwen3-embedding:0.6b")
 Fallback: TF-IDF (scikit-learn), used only if Ollama is unreachable —
           e.g. the container hasn't finished starting, the host is down,
           or embedding_model was never pulled.
@@ -18,10 +18,9 @@ Fallback: TF-IDF (scikit-learn), used only if Ollama is unreachable —
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import os
 import re
-from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -37,34 +36,21 @@ _DEFAULT_EMBED_MODEL     = "qwen3-embedding:0.6b"
 
 def _load_llm_config() -> tuple[str, str]:
     """
-    Resolve (ollama_base_url, embedding_model) from config.json, walking
-    upward from this file's location rather than assuming a fixed relative
-    path — keeps this working if the service module ever moves. Falls back
-    to hardcoded defaults on a missing or malformed config.json so a bad
-    config degrades gracefully at import time instead of crashing the 
+    Resolve (ollama_base_url, embedding_model) from the environment
+    (LOCAL_LLM_BASE_URL / LOCAL_LLM_EMBEDDING_MODEL — same env vars
+    dialogue_service.py and vision.py read). Falls back to hardcoded
+    defaults if unset, so a missing .env degrades gracefully at import
+    time instead of crashing the app.
     """
-    here = Path(__file__).resolve()
-    for parent in (here.parent, *here.parents):
-        candidate = parent / "config.json"
-        if not candidate.is_file():
-            continue
-        try:
-            cfg = json.loads(candidate.read_text())
-            llm_cfg  = cfg.get("local_llm", {})
-            base_url = llm_cfg.get("base_url", _DEFAULT_OLLAMA_BASE_URL).rstrip("/")
-            # config.json's base_url is the OpenAI-compat path (".../v1")
-            # used by the dialogue/vision clients. Ollama's native
-            # embeddings endpoint lives one level up, at ".../api/embed" —
-            # strip a trailing "/v1" if present rather than requiring a
-            # second base_url entry in config.json to stay in sync.
-            if base_url.endswith("/v1"):
-                base_url = base_url[: -len("/v1")]
-            model = llm_cfg.get("embedding_model", _DEFAULT_EMBED_MODEL)
-            return base_url, model
-        except (json.JSONDecodeError, OSError) as exc:
-            log.warning(f"[retrieval] could not parse {candidate}: {exc} — using defaults.")
-            break
-    return _DEFAULT_OLLAMA_BASE_URL, _DEFAULT_EMBED_MODEL
+    base_url = (os.environ.get("LOCAL_LLM_BASE_URL") or _DEFAULT_OLLAMA_BASE_URL).rstrip("/")
+    # LOCAL_LLM_BASE_URL is the OpenAI-compat path (".../v1") used by the
+    # dialogue/vision clients. Ollama's native embeddings endpoint lives one
+    # level up, at ".../api/embed" — strip a trailing "/v1" if present
+    # rather than requiring a second base-url env var to stay in sync.
+    if base_url.endswith("/v1"):
+        base_url = base_url[: -len("/v1")]
+    model = os.environ.get("LOCAL_LLM_EMBEDDING_MODEL") or _DEFAULT_EMBED_MODEL
+    return base_url, model
 
 
 _OLLAMA_BASE_URL, _EMBED_MODEL = _load_llm_config()

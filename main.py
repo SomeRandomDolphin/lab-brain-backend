@@ -9,9 +9,10 @@ Creates and configures the FastAPI app:
   - Root HTML redirect
 
 Also runnable directly (`python main.py`) to start uvicorn locally, using
-core.config's host/port. In Docker, uvicorn is invoked directly against
-this file's `app` object (`uvicorn main:app`) — the `if __name__ == "__main__"`
-block below never runs in that path; see the Dockerfile CMD.
+SERVER_HOST / SERVER_PORT from the environment. In Docker, uvicorn is
+invoked directly against this file's `app` object (`uvicorn main:app`) —
+the `if __name__ == "__main__"` block below never runs in that path; see
+the Dockerfile CMD.
 
 Auth is fully delegated to Supabase Auth (GoTrue).
 Schema migrations run via Alembic (app/db/migrations.py).
@@ -21,12 +22,15 @@ from __future__ import annotations
 
 import logging
 import traceback
+from contextlib import asynccontextmanager
 from pathlib import Path
 
-# Load .env into os.environ first — before core.config (or anything else
-# that reads os.environ at import time) gets imported below. Real environment
-# variables (shell, Docker, your deploy platform) always take precedence;
-# .env only fills in what isn't already set. See app/core/env.py.
+# Load .env into os.environ first — before anything else that reads
+# os.environ at import time gets imported below (pipeline/, services/,
+# api/, db/ all read env vars directly at module import time now that
+# core/config.py is gone). Real environment variables (shell, Docker, your
+# deploy platform) always take precedence; the .env file only fills in
+# what isn't already set. See core/env.py.
 from core.env import load_env
 load_env()
 
@@ -56,6 +60,119 @@ log = logging.getLogger(__name__)
 from api.v1.router import api_router
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    from db import lkc_graph  # noqa: F401
+
+    # Force services.capture to import now, not on first pipeline run.
+    # capture.py loads spaCy's NER model at module level (mirroring how
+    # asr.py loads WhisperX), but unlike asr.py it isn't on the router's
+    # import chain — nothing touches it until the first meeting's first
+    # segment reaches process_segment(). That deferred import was causing
+    # a ~60s synchronous spaCy load mid-meeting, during which incoming
+    # audio piled up in the queue and got dropped. Importing it here runs
+    # that load during startup instead, before any room connects.
+    import services.capture as _capture  # noqa: F401
+    log.info("[startup] services.capture imported (spaCy NER warm)")
+
+    # Surface Supabase misconfiguration at boot time rather than on the
+    # first request. Replaces the old _get_admin()/_get_anon() warm-up
+    # (removed — supabase_auth.py no longer exposes those; auth is now
+    # fully delegated to Supabase Auth/GoTrue and this module only
+    # covers Postgres via SQLAlchemy + Storage via supabase-py).
+    from db.supabase_client import connectivity_status
+    try:
+        status = await connectivity_status()
+        log.info(f"[startup] Supabase connectivity: {status}")
+    except Exception as exc:
+        log.error(f"[startup] Supabase connectivity check failed: {exc}")
+
+    # Warm the LKC retrieval embedding model now so the first `mode=qa`
+    # segment of a meeting doesn't pay a cold-start on the embedding
+    # call. This used to be a synchronous ~420MB sentence-transformers
+    # download+load, wrapped in run_in_executor to keep it off the
+    # event loop (that's what fired mid-summon in a previous log —
+    # modules.json, model.safetensors, etc. downloading while a live
+    # segment was in flight).
+    #
+    # Since the qwen3-embedding switch, warmup() is a small async HTTP
+    # call to Ollama's /api/embed — not a blocking local load — so it's
+    # awaited directly here instead. Wrapping an async function in
+    # run_in_executor(None, _warmup_retrieval) would schedule the
+    # coroutine on a thread without ever awaiting it: it returns
+    # immediately with an unawaited coroutine object, "[startup] LKC
+    # retrieval embedding model warmed" logs regardless of whether the
+    # embed call actually happened, and Ollama never actually receives
+    # the warmup request — so it's important this isn't run_in_executor
+    # any more, not just unnecessary.
+    import asyncio
+    from services.lkc_retrieval import warmup as _warmup_retrieval
+    try:
+        await _warmup_retrieval()
+        log.info("[startup] LKC retrieval embedding model warmed")
+    except Exception as exc:
+        log.error(f"[startup] LKC retrieval warmup failed: {exc}")
+
+    # Check the kg-agent literature service the same way — this is just
+    # a GET /health (cheap, ~5s client timeout), not a model load, so it
+    # doesn't need run_in_executor either. Unlike the warmups below,
+    # failure here is expected/non-fatal in normal operation (e.g. off
+    # the Tailscale network, citi-condor down) — the hybrid QA path in
+    # session_pipeline.py already falls back to transcript-only when
+    # kg-agent is unavailable, so this just gets that fact into the
+    # startup log instead of surfacing silently on the first live query.
+    from services.kg_agent_client import warmup as _warmup_kg_agent
+    try:
+        await _warmup_kg_agent()
+    except Exception as exc:
+        log.error(f"[startup] kg-agent warmup failed: {exc}")
+
+    # Warm the local dialogue LLM (Ollama) the same way — otherwise the
+    # first chat.completions.create() call of the process's life is
+    # whichever user's first real summon happens to be, and that call
+    # pays the full cost of Ollama loading the model off disk before it
+    # can generate anything. Measured at 259s cold vs. ~2s warm in one
+    # session's logs. Same run_in_executor reasoning as above: this is a
+    # blocking network call and must not run directly on the event loop.
+    from pipeline import dialogue_service
+    try:
+        await asyncio.get_event_loop().run_in_executor(None, dialogue_service.warmup)
+    except Exception as exc:
+        log.error(f"[startup] Dialogue LLM warmup failed: {exc}")
+
+    # Warm the vision model (Ollama) too — separately from the dialogue
+    # warmup above, since Ollama loads/evicts each model independently.
+    # Without this, the first frame session_pipeline.py's _vision_worker
+    # sends to vision.analyse_frame() pays the same cold-load cost the
+    # dialogue warmup above exists to avoid — and worse, it can then
+    # evict the already-warmed dialogue model to make room, so a QA
+    # reply mid-meeting silently pays a second cold-load it should never
+    # have had to (see the 147s "warm" QA reply this was chasing down).
+    # Its own try/except so a vision warmup failure never blocks startup
+    # or masks the dialogue warmup above having already succeeded.
+    try:
+        await asyncio.get_event_loop().run_in_executor(None, dialogue_service.warmup_vision)
+    except Exception as exc:
+        log.error(f"[startup] Vision LLM warmup failed: {exc}")
+
+    # Run pending Alembic migrations on every startup (idempotent).
+    # Replaces the old custom exec_sql-based SQL-file runner.
+    # Uses run_migrations_async() (not run_migrations()) because we're
+    # inside an async startup hook — see app/db/migrations.py for why.
+    from db.migrations import run_migrations_async, MigrationsNotConfigured
+    try:
+        await run_migrations_async()
+        log.info("[startup] Alembic migrations applied (or already up to date).")
+    except MigrationsNotConfigured as exc:
+        log.warning(f"[startup] Skipping migrations: {exc}")
+    except Exception as exc:
+        log.error(f"[startup] Migration run failed: {exc}")
+
+    # Nothing to clean up on shutdown today; the yield is what makes this
+    # a lifespan context manager rather than a one-shot startup function.
+    yield
+
+
 def create_app() -> FastAPI:
     app = FastAPI(
         title="Lab Brain — Module 5",
@@ -66,6 +183,7 @@ def create_app() -> FastAPI:
         version="7.0.0",
         docs_url="/docs",
         redoc_url="/redoc",
+        lifespan=lifespan,
     )
 
     # ── CORS ──────────────────────────────────────────────────────────────────
@@ -123,115 +241,6 @@ def create_app() -> FastAPI:
             return FileResponse(str(index_file))
         return HTMLResponse("<h2>Lab Brain API running. See <a href='/docs'>/docs</a>.</h2>")
 
-    # ── Startup ───────────────────────────────────────────────────────────────
-    @app.on_event("startup")
-    async def startup() -> None:
-        from db import lkc_graph  # noqa: F401
-
-        # Force services.capture to import now, not on first pipeline run.
-        # capture.py loads spaCy's NER model at module level (mirroring how
-        # asr.py loads WhisperX), but unlike asr.py it isn't on the router's
-        # import chain — nothing touches it until the first meeting's first
-        # segment reaches process_segment(). That deferred import was causing
-        # a ~60s synchronous spaCy load mid-meeting, during which incoming
-        # audio piled up in the queue and got dropped. Importing it here runs
-        # that load during startup instead, before any room connects.
-        import services.capture as _capture  # noqa: F401
-        log.info("[startup] services.capture imported (spaCy NER warm)")
-
-        # Surface Supabase misconfiguration at boot time rather than on the
-        # first request. Replaces the old _get_admin()/_get_anon() warm-up
-        # (removed — supabase_auth.py no longer exposes those; auth is now
-        # fully delegated to Supabase Auth/GoTrue and this module only
-        # covers Postgres via SQLAlchemy + Storage via supabase-py).
-        from db.supabase_client import connectivity_status
-        try:
-            status = await connectivity_status()
-            log.info(f"[startup] Supabase connectivity: {status}")
-        except Exception as exc:
-            log.error(f"[startup] Supabase connectivity check failed: {exc}")
-
-        # Warm the LKC retrieval embedding model now so the first `mode=qa`
-        # segment of a meeting doesn't pay a cold-start on the embedding
-        # call. This used to be a synchronous ~420MB sentence-transformers
-        # download+load, wrapped in run_in_executor to keep it off the
-        # event loop (that's what fired mid-summon in a previous log —
-        # modules.json, model.safetensors, etc. downloading while a live
-        # segment was in flight).
-        #
-        # Since the qwen3-embedding switch, warmup() is a small async HTTP
-        # call to Ollama's /api/embed — not a blocking local load — so it's
-        # awaited directly here instead. Wrapping an async function in
-        # run_in_executor(None, _warmup_retrieval) would schedule the
-        # coroutine on a thread without ever awaiting it: it returns
-        # immediately with an unawaited coroutine object, "[startup] LKC
-        # retrieval embedding model warmed" logs regardless of whether the
-        # embed call actually happened, and Ollama never actually receives
-        # the warmup request — so it's important this isn't run_in_executor
-        # any more, not just unnecessary.
-        import asyncio
-        from services.lkc_retrieval import warmup as _warmup_retrieval
-        try:
-            await _warmup_retrieval()
-            log.info("[startup] LKC retrieval embedding model warmed")
-        except Exception as exc:
-            log.error(f"[startup] LKC retrieval warmup failed: {exc}")
-
-        # Check the kg-agent literature service the same way — this is just
-        # a GET /health (cheap, ~5s client timeout), not a model load, so it
-        # doesn't need run_in_executor either. Unlike the warmups below,
-        # failure here is expected/non-fatal in normal operation (e.g. off
-        # the Tailscale network, citi-condor down) — the hybrid QA path in
-        # session_pipeline.py already falls back to transcript-only when
-        # kg-agent is unavailable, so this just gets that fact into the
-        # startup log instead of surfacing silently on the first live query.
-        from services.kg_agent_client import warmup as _warmup_kg_agent
-        try:
-            await _warmup_kg_agent()
-        except Exception as exc:
-            log.error(f"[startup] kg-agent warmup failed: {exc}")
-
-        # Warm the local dialogue LLM (Ollama) the same way — otherwise the
-        # first chat.completions.create() call of the process's life is
-        # whichever user's first real summon happens to be, and that call
-        # pays the full cost of Ollama loading the model off disk before it
-        # can generate anything. Measured at 259s cold vs. ~2s warm in one
-        # session's logs. Same run_in_executor reasoning as above: this is a
-        # blocking network call and must not run directly on the event loop.
-        from pipeline import dialogue_service
-        try:
-            await asyncio.get_event_loop().run_in_executor(None, dialogue_service.warmup)
-        except Exception as exc:
-            log.error(f"[startup] Dialogue LLM warmup failed: {exc}")
-
-        # Warm the vision model (Ollama) too — separately from the dialogue
-        # warmup above, since Ollama loads/evicts each model independently.
-        # Without this, the first frame session_pipeline.py's _vision_worker
-        # sends to vision.analyse_frame() pays the same cold-load cost the
-        # dialogue warmup above exists to avoid — and worse, it can then
-        # evict the already-warmed dialogue model to make room, so a QA
-        # reply mid-meeting silently pays a second cold-load it should never
-        # have had to (see the 147s "warm" QA reply this was chasing down).
-        # Its own try/except so a vision warmup failure never blocks startup
-        # or masks the dialogue warmup above having already succeeded.
-        try:
-            await asyncio.get_event_loop().run_in_executor(None, dialogue_service.warmup_vision)
-        except Exception as exc:
-            log.error(f"[startup] Vision LLM warmup failed: {exc}")
-
-        # Run pending Alembic migrations on every startup (idempotent).
-        # Replaces the old custom exec_sql-based SQL-file runner.
-        # Uses run_migrations_async() (not run_migrations()) because we're
-        # inside an async startup hook — see app/db/migrations.py for why.
-        from db.migrations import run_migrations_async, MigrationsNotConfigured
-        try:
-            await run_migrations_async()
-            log.info("[startup] Alembic migrations applied (or already up to date).")
-        except MigrationsNotConfigured as exc:
-            log.warning(f"[startup] Skipping migrations: {exc}")
-        except Exception as exc:
-            log.error(f"[startup] Migration run failed: {exc}")
-
     return app
 
 
@@ -242,14 +251,14 @@ if __name__ == "__main__":
     # Local dev entrypoint (`python main.py`). In Docker, uvicorn is invoked
     # directly against this module (`uvicorn main:app`) — see the Dockerfile
     # CMD — so this block never runs in that path; host/port there come from
-    # uvicorn's own --host/--port flags instead of cfg.server.*.
+    # uvicorn's own --host/--port flags instead of SERVER_HOST/SERVER_PORT.
+    import os
     import uvicorn
-    from core.config import cfg
 
     uvicorn.run(
         app,
-        host=cfg.server.host,
-        port=cfg.server.port,
+        host=os.environ.get("SERVER_HOST", "0.0.0.0"),
+        port=int(os.environ.get("SERVER_PORT", "8000")),
         reload=False,
         log_config=None,   # don't let uvicorn's dictConfig override setup_logging()
     )
