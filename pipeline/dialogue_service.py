@@ -412,6 +412,22 @@ async def assign_speaker_words(
         fallback = await assign_speaker(state, audio_segment)
         return [{**w, "speaker": fallback} for w in word_timestamps]
 
+    # Same floor assign_speaker() already enforces before calling pyannote
+    # (see the min_samples check there) — this function was missing it,
+    # letting sub-0.5s segments straight through to pipeline(). Below that
+    # length pyannote's embedding pooling gets a degenerate (near-empty)
+    # window to compute statistics over, which is what the recurring
+    # "std(): degrees of freedom <= 0" / "Mean of empty slice" numpy
+    # warnings on short utterances (e.g. "Testing, testing.") trace back
+    # to — not a real code bug, just pyannote being fed audio too short to
+    # produce a meaningful embedding. Skip straight to the same round-robin
+    # fallback assign_speaker() uses instead of running (and wasting CPU
+    # on) inference that was never going to be reliable anyway.
+    min_samples = int(0.5 * _SAMPLE_RATE)
+    if audio_segment.size < min_samples:
+        fallback = await assign_speaker(state, None)
+        return [{**w, "speaker": fallback} for w in word_timestamps]
+
     try:
         import torch
         wav = audio_segment.astype(np.float32)

@@ -173,6 +173,25 @@ async def _handle_qa_sse(
             f"docs={[d.get('name') for d in kg_result.documents_used]})"
         )
     else:
+        # use_kg was False for one of three distinct reasons that were
+        # previously indistinguishable from the logs alone: the kg-agent
+        # call itself failed/timed out (kg_result is None — already logged
+        # separately above or via _log_late_kg_result), the query was
+        # judged outside the literature corpus (in_corpus False), or an
+        # answer came back but wasn't trusted enough (faithfulness below
+        # threshold). Log which one it was so a transcript-fallback turn
+        # like this can actually be diagnosed after the fact.
+        if kg_result is None:
+            fallback_reason = "no kg-agent result (see error/timeout log above)"
+        elif not kg_result.in_corpus:
+            fallback_reason = "query judged outside kg-agent's corpus"
+        else:
+            fallback_reason = (
+                f"faithfulness {kg_result.faithfulness:.2f} "
+                f"< threshold {KG_AGENT_FAITHFULNESS_THRESHOLD:.2f}"
+            )
+        log.info(f"[dialogue:{session_id}] falling back to transcript ({fallback_reason})")
+
         reply  = await generate_response(dlg, full_text, lkc_context)
         source = "transcript"
         grounded = bool(lkc_context.strip())
